@@ -1,0 +1,829 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>실행 모델: workload, transport, proxy</title>
+<link rel="stylesheet" href="../assets/learn.css">
+</head>
+<body>
+<div class="masthead"><div class="bar"><a class="brand" href="../index.html">learn</a><span class="crumb"><a href="index.html">ToolHive</a></span></div></div>
+<div class="wrap">
+
+<header>
+  <h1>실행 모델: workload, transport, proxy</h1>
+  <p class="kicker">ToolHive 학습 02편 · 2026-10-14 작성</p>
+  <p>이 문서는 ToolHive가 MCP 서버 하나를 띄우고 관리하는 방식을 다룬다. 앞부분에서는 workload 수명 주기와 RunConfig를 보고, 뒷부분에서는 transport, proxy 구현, 원격 MCP 서버, protocol build를 본다. 끝에서는 middleware 순서, API 서버, 소스 지도를 정리한다.</p>
+  <p>기준 버전은 ToolHive v0.63.0(2026-11-06)이다. 2026-10-14에 v0.53.0 기준으로 썼고, 2026-11-07에 v0.63.0 기준으로 갱신했다. 공식 문서는 2026-11-07 상태를 읽었는데, ToolHive는 자주 바뀌므로 실제로 쓰기 전에 공식 문서를 다시 확인해야 한다.</p>
+</header>
+
+<div class="box key">
+  <span class="label">한 문장 요약</span>
+  <p>ToolHive는 MCP 서버마다 proxy 프로세스를 하나 띄우고, proxy는 transport에 맞는 전달 구현 앞에 middleware 체인을 둔다. workload 설정은 RunConfig 하나에 모두 담기고, 상태는 디스크 파일로 남는다.</p>
+</div>
+
+<div class="box key">
+  <span class="label">v0.63.0 갱신 요약</span>
+  <p>v0.53.0과 견줘 이 문서의 주제에서 바뀐 것을 모았는데, 큰 구조는 그대로다.</p>
+  <ul>
+    <li>mcp-parser middleware는 POST가 아닌 요청에 body가 있으면 400으로 거부하고, body 없는 GET, DELETE, OPTIONS는 그대로 넘긴다(7장, 10장).</li>
+    <li>transparent proxy는 <code>Connection</code> 헤더에 hop-by-hop이 아닌 헤더 이름을 적은 요청을 400으로 거부한다. 이 검사는 middleware 체인보다 먼저 돌고, <code>--stateless</code>와 2026-07-28 revision의 405 검사도 같은 자리에서 돈다(6장, 7장, 8장).</li>
+    <li>health check를 켠 transparent proxy의 <code>/health</code>는 요청마다 MCP 서버를 찌르지 않고 마지막 검사 결과를 답한다(6장).</li>
+    <li>streamable HTTP 쪽 stdio 변환기는 요청 ID를 세션 ID와 요청마다 만든 무작위 토큰으로 바꾸는데, 전에는 세션 ID와 원래 ID를 합쳤다(6장, 자가 점검 Q7).</li>
+    <li>proxy는 OAuth refresh token이나 client 정보를 저장할 때 디스크의 RunConfig를 다시 읽고, secret 값을 지운 뒤 쓴다(5장, 8장).</li>
+    <li>CLI의 <code>--thv-ca-bundle</code>, <code>--jwks-auth-token-file</code>, <code>--jwks-allow-private-ip</code>, <code>--oidc-insecure-allow-http</code> 값이 auth middleware 설정에 들어간다(5장).</li>
+    <li>내장 인가 서버의 TLS listener 포트가 proxy 포트와 겹치면 실행을 멈춘다. operator는 전체 기본 Redis 설정을 세션 저장소로 쓴다(7장).</li>
+  </ul>
+</div>
+
+<nav class="toc">
+  <b>목차</b>
+  <ol>
+    <li><a href="#s0">용어집</a></li>
+    <li><a href="#s1">큰 그림: thv run이 만드는 것</a></li>
+    <li><a href="#s2">workload 상태와 전이</a></li>
+    <li><a href="#s3">수명 주기 명령</a></li>
+    <li><a href="#s4">상태가 남는 곳, 두 종류의 workload</a></li>
+    <li><a href="#s5">RunConfig</a></li>
+    <li><a href="#s6">transport와 proxy 구현</a></li>
+    <li><a href="#s7">포트, 세션, 오류, 성능</a></li>
+    <li><a href="#s8">원격 MCP 서버</a></li>
+    <li><a href="#s9">protocol build</a></li>
+    <li><a href="#s10">middleware 순서</a></li>
+    <li><a href="#s11">API 서버</a></li>
+    <li><a href="#s12">소스 지도</a></li>
+    <li><a href="#sQ">자가 점검 문제</a></li>
+    <li><a href="#sR">참고 자료</a></li>
+  </ol>
+</nav>
+
+<h2 id="s0">0. 용어집</h2>
+<p>이 문서는 아래 용어를 아래 뜻으로만 쓴다.</p>
+<div class="tbl"><table>
+<tr><th>용어</th><th>이 문서에서의 뜻</th></tr>
+<tr><td>MCP 서버 / MCP 클라이언트 / tool</td><td>MCP 명세의 뜻과 같다. tool은 영어로 쓴다.</td></tr>
+<tr><td>workload</td><td>ToolHive가 관리하는 MCP 서버 하나다. 컨테이너 workload와 원격 workload가 있다.</td></tr>
+<tr><td>컨테이너 workload</td><td>ToolHive가 컨테이너 런타임으로 컨테이너를 띄우는 workload다.</td></tr>
+<tr><td>원격 workload</td><td>컨테이너 없이 원격 URL 앞에 proxy만 두는 workload다. RunConfig의 <code>remote_url</code>이 비어 있지 않다.</td></tr>
+<tr><td>proxy</td><td>ToolHive가 MCP 서버마다 앞에 두는 프로세스다. 로컬에서는 thv 프로세스이고, Kubernetes에서는 <code>thv-proxyrunner</code>다.</td></tr>
+<tr><td>transport</td><td>MCP 서버가 쓰는 통신 방식이다. stdio, SSE, streamable HTTP 세 가지다.</td></tr>
+<tr><td>proxy mode</td><td>stdio workload에서 proxy가 MCP 클라이언트 쪽에 여는 HTTP 방식이다. <code>streamable-http</code>(기본) 또는 <code>sse</code>다.</td></tr>
+<tr><td>transparent proxy</td><td>proxy 안의 전달 구현이다. HTTP로 말하는 MCP 서버에 요청을 그대로 넘긴다. 코드 이름은 <code>TransparentProxy</code>다.</td></tr>
+<tr><td>stdio 변환기</td><td>proxy 안의 전달 구현이다. HTTP 요청을 JSON-RPC 한 줄로 바꿔 컨테이너 stdin에 쓴다. proxy mode에 따라 streamable HTTP 쪽과 SSE 쪽 두 구현이 있다.</td></tr>
+<tr><td>StdioBridge</td><td><code>thv proxy stdio</code> 명령이 여는 연결이다. stdio만 쓰는 MCP 클라이언트를 실행 중인 workload에 잇는다.</td></tr>
+<tr><td>workload 관리자</td><td>workload의 실행, 정지, 재시작, 삭제를 맡는 코드다. <code>pkg/workloads</code>의 <code>Manager</code>다.</td></tr>
+<tr><td>정책 검사</td><td>서버를 만들기 전에 부르는 확장 지점(policy gate)이다. 기본 구현은 모두 허용한다(source <code>pkg/runner/policy_gate.go:38</code>).</td></tr>
+<tr><td>RunConfig</td><td>workload 하나를 실행하는 설정 전체다. JSON 파일로 저장한다.</td></tr>
+<tr><td>저장된 RunConfig</td><td>디스크의 <code>runconfigs/&lt;이름&gt;.json</code> 파일이다.</td></tr>
+<tr><td>상태</td><td>workload의 status 값이다. <code>running</code>, <code>stopped</code> 같은 값이다.</td></tr>
+<tr><td>상태 파일</td><td>상태와 proxy PID를 담는 <code>statuses/&lt;이름&gt;.json</code> 파일이다.</td></tr>
+<tr><td>자동 재시작</td><td>컨테이너가 예기치 않게 끝났을 때 workload 관리자가 다시 실행하는 동작이다.</td></tr>
+<tr><td>proxy 포트</td><td>proxy가 호스트에서 듣는 포트다. RunConfig의 <code>port</code>다.</td></tr>
+<tr><td>target 포트</td><td>컨테이너 안 MCP 서버가 듣는 포트다. RunConfig의 <code>target_port</code>다.</td></tr>
+<tr><td>세션</td><td>proxy가 추적하는 MCP 세션이다. <code>Mcp-Session-Id</code> 헤더나 <code>session_id</code> 값으로 구분한다.</td></tr>
+<tr><td>middleware</td><td>proxy가 요청을 MCP 서버에 넘기기 전후에 실행하는 처리 단계다.</td></tr>
+<tr><td>health check</td><td>proxy가 MCP 서버의 응답을 주기적으로 확인하는 동작이다.</td></tr>
+<tr><td>protocol build</td><td><code>npx://</code>, <code>uvx://</code>, <code>go://</code> 주소로 이미지를 만드는 기능이다.</td></tr>
+<tr><td>build 설정</td><td>protocol build의 기반 이미지와 추가 패키지 설정이다. RunConfig의 <code>runtime_config</code>다.</td></tr>
+<tr><td>라벨</td><td>컨테이너와 workload에 붙는 <code>key=value</code> 쌍이다.</td></tr>
+<tr><td>API 서버</td><td><code>thv serve</code>가 여는 서버다. REST API를 제공한다.</td></tr>
+<tr><td>컨테이너 런타임</td><td>Docker, Podman, Colima 같은 컨테이너 실행 환경이다.</td></tr>
+<tr><td>이미지 / 이미지 저장소</td><td>컨테이너 이미지 / ghcr.io 같은 컨테이너 이미지 저장소다.</td></tr>
+<tr><td>registry</td><td>ToolHive가 읽는 MCP 서버 목록이다. 이미지 저장소와 다르다.</td></tr>
+<tr><td>그룹</td><td>ToolHive 그룹이다. 04편이 다룬다.</td></tr>
+<tr><td>secret</td><td>ToolHive가 관리하는 비밀 값이다. 03편이 다룬다.</td></tr>
+<tr><td>클라이언트 설정</td><td>ToolHive가 고치는 MCP 클라이언트의 설정 파일이다.</td></tr>
+<tr><td>들어오는 인증 / 나가는 인증</td><td>MCP 클라이언트가 ToolHive에 하는 인증 / ToolHive가 MCP 서버에 하는 인증이다.</td></tr>
+<tr><td>access token</td><td>인증에 쓰는 자격 증명이다. 이 문서는 "토큰"만 따로 쓰지 않는다.</td></tr>
+</table></div>
+<p>아래 이름은 용어집의 단어를 포함하지만 뜻이 달라서, 이 문서에서는 아래처럼 구분한다.</p>
+<ul>
+  <li><code>thv proxy</code> 명령: transparent proxy만 띄우는 별도 명령이고 workload를 만들지 않는다(source <code>cmd/thv/app/proxy.go:34</code>). 이 문서의 proxy와 다르다.</li>
+  <li>egress proxy: 네트워크 격리에서 나가는 연결을 거르는 프로세스다. <a href="03-isolation-secret.html">03편</a>이 다룬다.</li>
+  <li><code>StdioTransport</code>, <code>HTTPTransport</code>: proxy 안에서 전달 구현을 띄우고 감시하는 Go 객체다. 이 문서는 "transport 객체"라고 쓰고, transport(통신 방식)와 구분한다.</li>
+  <li><code>templates.TransportType</code>: 이름과 달리 protocol build 종류(npx, uvx, go)를 뜻한다. transport가 아니다.</li>
+  <li><code>pkg/state</code>, <code>SaveState</code>: 코드는 저장된 RunConfig를 state라고 부른다. 이 문서는 "저장된 RunConfig"라고 쓴다.</li>
+  <li><code>--runtime-image</code>, <code>runtime_config</code>: build 설정이다. 컨테이너 런타임과 다르다.</li>
+  <li>backend: ToolHive 설계 문서는 proxy 뒤의 MCP 서버를 backend라고 부르기도 한다. 이 시리즈에서 backend는 vMCP가 묶는 MCP 서버만 뜻하므로, 이 문서는 "MCP 서버"라고 쓴다.</li>
+</ul>
+
+<h2 id="s1">1. 큰 그림: thv run이 만드는 것</h2>
+<p><code>thv run</code>은 MCP 서버 하나를 workload로 만들고, 이때 ToolHive는 다음을 남긴다.</p>
+<ul>
+  <li>저장된 RunConfig 파일 하나(5장)</li>
+  <li>상태 파일 하나(4장)</li>
+  <li>proxy 프로세스 하나</li>
+  <li>MCP 서버 컨테이너 하나. 원격 workload에는 컨테이너가 없다.</li>
+  <li>네트워크 격리가 켜져 있으면 DNS, egress proxy 같은 보조 컨테이너(<a href="03-isolation-secret.html">03편</a>)</li>
+  <li>클라이언트 설정 안의 항목 하나(<a href="04-registry-group-client.html">04편</a>)</li>
+</ul>
+<p><code>thv run</code>의 기본 동작은 detached 실행이다. 터미널의 thv 프로세스는 설정을 저장하고 바로 끝나고, 실제 proxy 일은 따로 떼어 낸 자식 프로세스가 맡는다.</p>
+
+<h3>detached 실행 순서</h3>
+<p>기본 실행에서 터미널의 thv 프로세스(부모)는 다음 순서로 일한다.</p>
+<ol>
+  <li>RunConfig를 만들고 정책 검사(policy gate)를 한다(source <code>cmd/thv/app/run.go:249</code>).</li>
+  <li>RunConfig를 디스크에 저장한다. secret 값을 풀기 전에 저장하므로 값은 파일에 들어가지 않는다(source <code>cmd/thv/app/run.go:254</code>).</li>
+  <li>상태를 <code>starting</code>으로 쓴다(source <code>pkg/workloads/manager.go:788</code>).</li>
+  <li>자기 실행 파일을 <code>start &lt;이름&gt; --foreground</code> 인자로 다시 실행한다(source <code>pkg/workloads/manager.go:747</code>).</li>
+  <li>자식 프로세스의 PID를 상태 파일에 적고 끝난다(source <code>pkg/workloads/manager.go:698</code>).</li>
+</ol>
+<p>자식 프로세스는 <code>setsid</code>로 터미널에서 분리되고(source <code>pkg/workloads/sysproc_unix.go:15</code>), 표준 출력과 표준 오류는 proxy 로그 파일로 간다(source <code>pkg/workloads/manager.go:727</code>). 자식에는 환경 변수 <code>TOOLHIVE_DETACHED=1</code>도 붙는다(source <code>pkg/process/detached.go:12</code>).</p>
+<p>이 자식 프로세스가 proxy이고, <code>--foreground</code>를 주면 터미널의 thv 프로세스가 직접 proxy가 된다.</p>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 280" width="760" height="280" role="img" aria-label="thv run 기본 실행이 만드는 프로세스와 파일">
+    <defs>
+      <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+      <marker id="w1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head-w" d="M0,0 L10,5 L0,10 z"/></marker>
+    </defs>
+    <rect class="d-box" x="16" y="30" width="180" height="64" rx="10"/>
+    <text x="106" y="57" font-size="14" font-weight="600" text-anchor="middle">thv run (부모)</text>
+    <text class="d-m" x="106" y="78" font-size="11" text-anchor="middle">저장하고 바로 끝난다</text>
+
+    <rect class="d-acc" x="290" y="30" width="190" height="64" rx="10"/>
+    <text x="385" y="57" font-size="14" font-weight="600" text-anchor="middle">proxy 프로세스</text>
+    <text class="d-m" x="385" y="78" font-size="11" text-anchor="middle">thv start 이름 --foreground</text>
+
+    <rect class="d-box" x="574" y="30" width="170" height="64" rx="10"/>
+    <text x="659" y="57" font-size="14" font-weight="600" text-anchor="middle">MCP 서버 컨테이너</text>
+    <text class="d-m" x="659" y="78" font-size="11" text-anchor="middle">컨테이너 런타임이 실행</text>
+
+    <line class="d-line" x1="196" y1="62" x2="288" y2="62" marker-end="url(#a1)"/>
+    <text class="d-m" x="242" y="52" font-size="11" text-anchor="middle">분리 실행</text>
+    <line class="d-line" x1="480" y1="62" x2="572" y2="62" marker-end="url(#a1)"/>
+    <text class="d-m" x="526" y="52" font-size="11" text-anchor="middle">만들고 붙는다</text>
+
+    <rect class="d-box" x="16" y="180" width="220" height="58" rx="10"/>
+    <text x="126" y="204" font-size="13" font-weight="600" text-anchor="middle">runconfigs/이름.json</text>
+    <text class="d-m" x="126" y="224" font-size="11" text-anchor="middle">저장된 RunConfig</text>
+
+    <rect class="d-box" x="270" y="180" width="220" height="58" rx="10"/>
+    <text x="380" y="204" font-size="13" font-weight="600" text-anchor="middle">statuses/이름.json</text>
+    <text class="d-m" x="380" y="224" font-size="11" text-anchor="middle">상태 파일, PID 포함</text>
+
+    <rect class="d-box" x="524" y="180" width="220" height="58" rx="10"/>
+    <text x="634" y="204" font-size="13" font-weight="600" text-anchor="middle">logs/이름.log</text>
+    <text class="d-m" x="634" y="224" font-size="11" text-anchor="middle">proxy 로그</text>
+
+    <line class="d-line" x1="80" y1="94" x2="80" y2="178" marker-end="url(#a1)"/>
+    <text class="d-m" x="88" y="140" font-size="11">쓴다</text>
+    <line class="d-dash" x1="200" y1="180" x2="318" y2="96" marker-end="url(#w1)"/>
+    <text class="d-w" x="268" y="152" font-size="11">읽는다</text>
+    <line class="d-line" x1="385" y1="94" x2="385" y2="178" marker-end="url(#a1)"/>
+    <text class="d-m" x="393" y="140" font-size="11">상태와 PID를 쓴다</text>
+    <line class="d-line" x1="460" y1="94" x2="600" y2="178" marker-end="url(#a1)"/>
+    <text class="d-m" x="562" y="128" font-size="11">출력</text>
+
+    <text class="d-m" x="380" y="266" font-size="11" text-anchor="middle">proxy는 준비를 마치면 클라이언트 설정에 주소를 쓴다(04편)</text>
+  </svg>
+  </div>
+  <figcaption>그림 1. 기본 실행의 프로세스와 파일. 부모 thv는 RunConfig를 저장하고 끝나고, 자식 thv가 proxy가 되어 저장된 RunConfig를 읽는다.</figcaption>
+</figure>
+
+<h3>proxy 안에서 일어나는 일</h3>
+<p>proxy 프로세스에서 <code>Runner.Run</code>은 다음 순서로 일한다(source <code>pkg/runner/runner.go:220</code>).</p>
+<ol>
+  <li>secret 참조를 실제 값으로 푼다.</li>
+  <li>middleware 목록을 채운다. 맨 앞에는 body 크기 제한과 Origin 검사를 차례로 둔다(source <code>pkg/runner/runner.go:350</code>, <code>pkg/runner/runner.go:359</code>).</li>
+  <li>정책 검사를 한 번 더 한다(source <code>pkg/runner/runner.go:480</code>).</li>
+  <li>컨테이너 workload면 <code>runtime.Setup</code>으로 컨테이너를 만든다(source <code>pkg/runner/runner.go:492</code>).</li>
+  <li>transport 팩토리로 transport 객체를 만들고 시작한다(source <code>pkg/runner/runner.go:556</code>).</li>
+  <li>HTTP 계열이면 <code>initialize</code>가 성공할 때까지 최대 5분 기다린다(source <code>pkg/runner/runner.go:679</code>).</li>
+  <li>클라이언트 설정에 proxy 주소를 쓴다(source <code>pkg/runner/runner.go:694</code>).</li>
+  <li>상태를 <code>running</code>으로 바꾼다. 이후 1초마다 transport 객체가 살아 있는지 본다(source <code>pkg/runner/runner.go:772</code>).</li>
+</ol>
+<p>HTTP 계열에서 5분이 지나도 실패하면 경고만 남기고 다음 단계로 간다(source <code>pkg/runner/runner.go:680</code>). stdio workload는 6단계를 건너뛰는데, stdio MCP 서버는 <code>initialize</code>를 여러 번 받으면 거부할 가능성이 있기 때문이다(source <code>pkg/runner/runner.go:659</code>).</p>
+
+<h2 id="s2">2. workload 상태와 전이</h2>
+<p>workload의 상태 값은 11가지다(source <code>pkg/container/runtime/types.go:25</code>). 그림 2는 주요 전이만 보여 주고, 모든 상태는 그림 뒤의 표에 정리했다.</p>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 420" width="760" height="420" role="img" aria-label="workload 상태 전이">
+    <defs>
+      <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+      <marker id="w2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head-w" d="M0,0 L10,5 L0,10 z"/></marker>
+    </defs>
+    <rect class="d-outer" x="210" y="8" width="536" height="88" rx="10"/>
+    <text class="d-m" x="224" y="28" font-size="12">running 중에 바뀌는 상태</text>
+    <text class="d-m" x="732" y="28" font-size="11" text-anchor="end">오른쪽 둘은 원격 workload만</text>
+    <rect class="d-warn" x="226" y="44" width="150" height="36" rx="8"/>
+    <text x="301" y="67" font-size="13" text-anchor="middle">unhealthy</text>
+    <rect class="d-warn" x="396" y="44" width="150" height="36" rx="8"/>
+    <text x="471" y="67" font-size="13" text-anchor="middle">auth_retrying</text>
+    <rect class="d-warn" x="566" y="44" width="164" height="36" rx="8"/>
+    <text x="648" y="67" font-size="13" text-anchor="middle">unauthenticated</text>
+    <line class="d-line" x1="546" y1="62" x2="564" y2="62" marker-end="url(#a2)"/>
+
+    <text class="d-m" x="120" y="104" font-size="12" text-anchor="middle">thv run</text>
+    <line class="d-line" x1="120" y1="110" x2="120" y2="128" marker-end="url(#a2)"/>
+
+    <rect class="d-box" x="60" y="130" width="120" height="44" rx="8"/>
+    <text x="120" y="157" font-size="14" font-weight="600" text-anchor="middle">starting</text>
+    <rect class="d-ok" x="320" y="130" width="120" height="44" rx="8"/>
+    <text x="380" y="157" font-size="14" font-weight="600" text-anchor="middle">running</text>
+    <rect class="d-box" x="580" y="130" width="120" height="44" rx="8"/>
+    <text x="640" y="157" font-size="14" font-weight="600" text-anchor="middle">stopping</text>
+
+    <line class="d-line" x1="180" y1="146" x2="318" y2="146" marker-end="url(#a2)"/>
+    <text class="d-m" x="250" y="124" font-size="12" text-anchor="middle">준비 완료</text>
+    <line class="d-line" x1="320" y1="162" x2="182" y2="162" marker-end="url(#a2)"/>
+    <text class="d-m" x="250" y="190" font-size="11" text-anchor="middle">컨테이너 종료 시</text>
+    <text class="d-m" x="250" y="204" font-size="11" text-anchor="middle">자동 재시작(최대 10회)</text>
+    <line class="d-line" x1="440" y1="152" x2="578" y2="152" marker-end="url(#a2)"/>
+    <text class="d-m" x="510" y="124" font-size="12" text-anchor="middle">thv stop</text>
+    <line class="d-dash" x1="380" y1="128" x2="380" y2="98" marker-end="url(#w2)"/>
+
+    <line class="d-line" x1="640" y1="174" x2="640" y2="268" marker-end="url(#a2)"/>
+    <text class="d-m" x="648" y="226" font-size="12">정지 완료</text>
+
+    <rect class="d-no" x="60" y="270" width="120" height="44" rx="8"/>
+    <text x="120" y="297" font-size="14" font-weight="600" text-anchor="middle">error</text>
+    <rect class="d-box" x="580" y="270" width="120" height="44" rx="8"/>
+    <text x="640" y="297" font-size="14" font-weight="600" text-anchor="middle">stopped</text>
+
+    <line class="d-line" x1="100" y1="176" x2="100" y2="268" marker-end="url(#a2)"/>
+    <text class="d-m" x="92" y="226" font-size="11" text-anchor="end">실패</text>
+    <text class="d-m" x="120" y="334" font-size="11" text-anchor="middle">thv start, thv rm으로 나간다</text>
+
+    <path class="d-line" d="M580,292 H240 V230 H150 V178" marker-end="url(#a2)"/>
+    <text class="d-m" x="420" y="284" font-size="12" text-anchor="middle">thv start (별칭 restart)</text>
+
+    <line class="d-line" x1="640" y1="316" x2="640" y2="358" marker-end="url(#a2)"/>
+    <text class="d-m" x="648" y="342" font-size="12">thv rm</text>
+    <rect class="d-box" x="580" y="360" width="120" height="44" rx="8"/>
+    <text x="640" y="387" font-size="14" font-weight="600" text-anchor="middle">removing</text>
+    <text class="d-m" x="566" y="386" font-size="11" text-anchor="end">끝나면 상태 파일과 RunConfig를 지운다</text>
+  </svg>
+  </div>
+  <figcaption>그림 2. 주요 상태 전이. 점선 화살표는 running 중에 생기는 상태로 간다. 그림에 없는 전이(running에서 바로 thv rm 등)는 아래 표가 다룬다.</figcaption>
+</figure>
+
+<div class="tbl"><table>
+<tr><th>상태</th><th>뜻</th><th>들어가는 경우</th></tr>
+<tr><td><code>starting</code></td><td>실행 직전이다</td><td>thv run, thv start, 자동 재시작</td></tr>
+<tr><td><code>running</code></td><td>proxy가 요청을 받는다</td><td><code>Runner.Run</code>이 준비를 마쳤다</td></tr>
+<tr><td><code>stopping</code></td><td>멈추는 중이다</td><td>thv stop</td></tr>
+<tr><td><code>stopped</code></td><td>멈췄다. 컨테이너와 저장된 RunConfig는 남는다</td><td>thv stop 완료</td></tr>
+<tr><td><code>removing</code></td><td>지우는 중이다</td><td>thv rm. running에서 바로 들어가는 경우도 있다</td></tr>
+<tr><td><code>error</code></td><td>실행이나 정지에 실패했다</td><td>실행 실패, 자동 재시작 10회 소진, 컨테이너 정지 실패</td></tr>
+<tr><td><code>unhealthy</code></td><td>실행 중이지만 정상으로 동작하지 못한다</td><td>상태 파일은 running인데 컨테이너나 proxy가 없다. 원격 health check가 실패했다</td></tr>
+<tr><td><code>unauthenticated</code></td><td>원격 MCP 서버에 인증하지 못한다</td><td>원격 서버가 401을 돌려줬다. access token 갱신이 끝내 실패했다</td></tr>
+<tr><td><code>auth_retrying</code></td><td>access token 갱신을 다시 시도하는 중이다</td><td>갱신이 일시적으로 실패했다. 이 동안 요청은 503으로 바로 실패한다</td></tr>
+<tr><td><code>policy_stopped</code></td><td>정책이 시작을 막았다</td><td>thv start 때 정책 검사에 걸렸다</td></tr>
+<tr><td><code>unknown</code></td><td>컨테이너 런타임이 상태를 모른다</td><td>컨테이너 런타임이 알 수 없는 값을 돌려줬다</td></tr>
+</table></div>
+<p>표의 근거는 다음 위치에 있다. (source <code>pkg/workloads/manager.go:535</code>, <code>pkg/workloads/statuses/file_status.go:950</code>, <code>pkg/runner/runner.go:609</code>, <code>pkg/container/runtime/types.go:47</code>)</p>
+<p><code>auth_retrying</code>은 10분마다 갱신을 다시 시도하고, 24시간이 지나면 <code>unauthenticated</code>로 바뀐다(source <code>pkg/auth/monitored_token_source.go:48</code>). proxy 프로세스의 환경 변수로 두 값을 바꾸는 기능도 있다(source <code>docs/arch/08-workloads-lifecycle.md:51</code>).</p>
+
+<h3>자동 재시작</h3>
+<p>컨테이너가 예기치 않게 끝나면 proxy의 <code>Runner.Run</code>이 먼저 판단한다. workload가 지워졌으면 재시작 없이 끝내고, 남아 있으면 재시작이 필요하다는 오류를 돌려준다(source <code>pkg/runner/runner.go:810</code>).</p>
+<p>workload 관리자는 이 오류를 받으면 아래 규칙으로 다시 실행한다(source <code>pkg/workloads/manager.go:535</code>).</p>
+<ul>
+  <li>최대 10회 시도한다.</li>
+  <li>대기 시간은 5초에서 시작해 두 배씩 늘고, 60초에서 더 늘지 않는다.</li>
+  <li>재시작 전에 클라이언트 설정에서 항목을 뺀다(source <code>pkg/workloads/manager.go:577</code>).</li>
+  <li>30초 이상 돌다 끝났으면 횟수를 처음부터 다시 센다(source <code>pkg/workloads/manager.go:585</code>).</li>
+  <li>10회를 다 쓰면 상태를 <code>error</code>로 바꾼다.</li>
+</ul>
+<p>ToolHive 설계 문서의 그림은 컨테이너 종료를 <code>stopped</code>로 그리지만(source <code>docs/arch/08-workloads-lifecycle.md:26</code>), v0.63.0 코드는 상태를 <code>starting</code>으로 바꾸고 다시 실행한다.</p>
+
+<h2 id="s3">3. 수명 주기 명령</h2>
+<p>수명 주기 명령은 Docker 명령과 비슷하다. 아래 표는 명령마다 실제로 하는 일을 코드 기준으로 정리한 것이다.</p>
+<div class="tbl"><table>
+<tr><th>명령</th><th>컨테이너 workload</th><th>원격 workload</th></tr>
+<tr><td><code>thv run</code></td><td>컨테이너와 proxy를 만든다</td><td>proxy만 만든다</td></tr>
+<tr><td><code>thv stop</code></td><td>proxy를 끝내고 컨테이너를 멈춘다. 클라이언트 설정 항목을 뺀다</td><td>proxy를 끝내고 클라이언트 설정 항목을 뺀다</td></tr>
+<tr><td><code>thv start</code> (별칭 <code>restart</code>)</td><td>저장된 RunConfig로 다시 실행한다</td><td>proxy를 다시 띄운다. 공식 문서는 OAuth 흐름을 다시 탄다고 적는다</td></tr>
+<tr><td><code>thv rm</code></td><td>컨테이너를 지우고 proxy를 끝낸다. 상태 파일과 저장된 RunConfig도 지운다</td><td>proxy를 끝낸다. 상태 파일과 저장된 RunConfig를 지운다</td></tr>
+<tr><td><code>thv logs</code></td><td>컨테이너 로그를 보인다. <code>--proxy</code>를 주면 proxy 로그를 보인다</td><td><code>--proxy</code>를 줘야 한다</td></tr>
+<tr><td><code>thv list</code></td><td>기본은 running과 auth_retrying만 보인다. <code>--all</code>은 모두 보인다</td><td>같다</td></tr>
+</table></div>
+<p>표의 근거는 다음 위치에 있다. (source <code>pkg/workloads/manager.go:455</code>, <code>pkg/workloads/manager.go:1648</code>, <code>pkg/workloads/manager.go:897</code>, <code>cmd/thv/app/logs.go:92</code>, <code>cmd/thv/app/list.go:55</code>, docs <code>guides-cli/manage-mcp-servers</code>)</p>
+<p><code>thv start</code>는 workload가 running이고 proxy가 살아 있으면 아무것도 하지 않고(source <code>pkg/workloads/manager.go:1462</code>), proxy가 죽어 있으면 컨테이너를 멈춘 뒤 다시 시작한다.</p>
+<p><code>thv rm</code>은 컨테이너를 먼저 지우고 proxy를 나중에 끝내는데(source <code>pkg/workloads/manager.go:960</code>), proxy가 컨테이너를 다시 만들지 못하게 하는 순서다. 설계 문서는 proxy를 먼저 끝낸다고 적지만 코드 순서는 반대다.</p>
+<p>stop과 rm은 상태 파일의 PID로 proxy를 끝낸다. PID가 없거나 PID로 끝내지 못하면 proxy 포트를 잡은 프로세스를 찾고, 그 프로세스가 이 workload의 proxy일 때만 끝낸다(source <code>pkg/workloads/manager.go:1086</code>).</p>
+
+<h3>일괄 처리</h3>
+<p><code>thv stop</code>과 <code>thv rm</code>은 이름을 여러 개 받지만 <code>thv start</code>는 이름을 하나만 받는다. 세 명령 모두 <code>--all</code>과 <code>--group</code>으로 대상을 고르는 기능이 있다(source <code>cmd/thv/app/restart.go:36</code>).</p>
+<p>workload 관리자는 이름마다 goroutine을 하나씩 띄워 병렬로 처리하고(source <code>pkg/workloads/manager.go:411</code>), 작업 하나에는 5분 제한이 있다(source <code>pkg/workloads/manager.go:216</code>). 호출한 쪽은 돌려받은 <code>CompletionFunc</code>를 불러 끝날 때까지 기다린다.</p>
+<p>관리자는 처리 전에 모든 이름을 먼저 검사하는데, 파일 경로를 벗어나는 이름을 막는 검사다(source <code>pkg/workloads/manager.go:413</code>).</p>
+
+<h3>라벨과 필터</h3>
+<p>ToolHive는 컨테이너에 아래 표준 라벨을 붙인다(source <code>pkg/labels/labels.go:47</code>).</p>
+<div class="tbl"><table>
+<tr><th>라벨</th><th>값</th></tr>
+<tr><td><code>toolhive</code></td><td><code>true</code></td></tr>
+<tr><td><code>toolhive-name</code></td><td>컨테이너 이름</td></tr>
+<tr><td><code>toolhive-basename</code></td><td>기본 이름</td></tr>
+<tr><td><code>toolhive-transport</code></td><td>transport 이름</td></tr>
+<tr><td><code>toolhive-port</code></td><td>proxy 포트</td></tr>
+</table></div>
+<p><code>thv run --label key=value</code>는 라벨을 더 붙이고, <code>thv list --label key=value</code>는 라벨로 거른다(source <code>cmd/thv/app/list.go:57</code>). 필터를 여러 개 주면 모두 맞는 workload만 남는다(source <code>pkg/workloads/types/labels.go:26</code>). 라벨 형식은 Kubernetes 라벨 규칙을 따른다(source <code>pkg/labels/labels.go:146</code>).</p>
+<p><code>thv upgrade</code>는 registry에서 온 workload의 이미지를 새 버전으로 바꾸는 명령이고, <a href="04-registry-group-client.html">04편</a>이 다룬다.</p>
+
+<h2 id="s4">4. 상태가 남는 곳, 두 종류의 workload</h2>
+<p>로컬에서 ToolHive는 XDG 디렉터리 규칙으로 파일을 둔다(source <code>pkg/state/local.go:45</code>). 아래 표는 Linux 기본 경로다.</p>
+<div class="tbl"><table>
+<tr><th>파일</th><th>Linux 기본 경로</th><th>내용</th><th>읽는 곳</th></tr>
+<tr><td>저장된 RunConfig</td><td><code>~/.local/state/toolhive/runconfigs/&lt;이름&gt;.json</code></td><td>RunConfig 전체</td><td>thv start, thv export</td></tr>
+<tr><td>상태 파일</td><td><code>~/.local/share/toolhive/statuses/&lt;이름&gt;.json</code></td><td><code>status</code>, <code>status_context</code>, <code>created_at</code>, <code>updated_at</code>, <code>process_id</code></td><td>thv list, thv stop</td></tr>
+<tr><td>proxy 로그</td><td><code>~/.local/share/toolhive/logs/&lt;이름&gt;.log</code></td><td>proxy 프로세스의 출력</td><td>thv logs --proxy</td></tr>
+<tr><td>옛 PID 파일</td><td><code>~/.local/share/toolhive/pids/toolhive-&lt;이름&gt;.pid</code></td><td>옛 버전이 쓴 proxy PID</td><td>상태 파일로 옮길 때만 읽는다</td></tr>
+</table></div>
+<p>표의 근거는 다음 위치에 있다. (source <code>pkg/state/factory.go:12</code>, <code>pkg/workloads/statuses/file_status.go:32</code>, <code>pkg/workloads/statuses/file_status.go:186</code>, <code>pkg/workloads/manager.go:832</code>)</p>
+<p>macOS에서는 표의 경로가 모두 <code>~/Library/Application Support/toolhive/</code> 아래에 있다(source <code>docs/arch/01-deployment-modes.md:140</code>).</p>
+<p>설계 문서는 stop이 PID 파일을 읽는다고 적지만(source <code>docs/arch/08-workloads-lifecycle.md:198</code>), v0.63.0 코드는 PID를 상태 파일의 <code>process_id</code>에 둔다. PID 파일 코드는 옛 PID를 옮기는 용도로만 남았다(source <code>pkg/workloads/statuses/pid.go:18</code>).</p>
+<p>Kubernetes에서는 operator가 RunConfig를 ConfigMap에 넣는다(source <code>cmd/thv-operator/controllers/mcpserver_runconfig.go:36</code>). 자세한 구조는 <a href="07-kubernetes-operator.html">07편</a>이 다룬다.</p>
+
+<h3>컨테이너 workload와 원격 workload</h3>
+<div class="tbl"><table>
+<tr><th>항목</th><th>컨테이너 workload</th><th>원격 workload</th></tr>
+<tr><td>판별</td><td><code>remote_url</code>이 비어 있다</td><td><code>remote_url</code>이 있다</td></tr>
+<tr><td>컨테이너</td><td>있다</td><td>없다</td></tr>
+<tr><td>proxy</td><td>있다</td><td>있다</td></tr>
+<tr><td>전달 구현</td><td>transport에 따라 다르다</td><td>transparent proxy</td></tr>
+<tr><td>컨테이너 로그</td><td>있다</td><td>없다. proxy 로그만 있다</td></tr>
+<tr><td>permission profile, 네트워크 격리</td><td>적용한다(03편)</td><td>없다</td></tr>
+<tr><td>health check</td><td>HTTP transport면 항상 켠다</td><td>기본으로 끈다</td></tr>
+<tr><td>상태 판정</td><td>상태 파일과 컨테이너 런타임을 대조한다</td><td>상태 파일만 쓴다</td></tr>
+<tr><td>인증 관련 상태</td><td>없다</td><td><code>unauthenticated</code>, <code>auth_retrying</code></td></tr>
+</table></div>
+<p>표의 근거는 다음 위치에 있다. (source <code>pkg/workloads/manager.go:431</code>, <code>pkg/transport/http.go:224</code>, <code>pkg/workloads/statuses/file_status.go:977</code>, <code>docs/arch/03-transport-architecture.md:371</code>)</p>
+
+<h2 id="s5">5. RunConfig</h2>
+<p>RunConfig는 workload 하나를 실행하는 설정 전체를 담는 Go 구조체다(source <code>pkg/runner/config.go:49</code>). 소스 주석은 이 형식을 API 계약의 일부로 보고(source <code>pkg/runner/config.go:47</code>), 현재 schema 버전은 <code>v0.1.0</code>이다(source <code>pkg/runner/config.go:43</code>).</p>
+
+<h3>필드 묶음</h3>
+<div class="tbl"><table>
+<tr><th>묶음</th><th>JSON 필드</th><th>자세히</th></tr>
+<tr><td>이름</td><td><code>name</code>, <code>container_name</code>, <code>base_name</code>, <code>group</code></td><td>이 장, 04편</td></tr>
+<tr><td>실행 대상</td><td><code>image</code>, <code>remote_url</code>, <code>cmd_args</code>, <code>registry_server_name</code></td><td>이 장, 04편</td></tr>
+<tr><td>transport</td><td><code>transport</code>, <code>proxy_mode</code>, <code>host</code>, <code>port</code>, <code>target_host</code>, <code>target_port</code></td><td>6장, 7장</td></tr>
+<tr><td>실행 환경</td><td><code>env_vars</code>, <code>secrets</code>, <code>volumes</code>, <code>container_labels</code></td><td>03편</td></tr>
+<tr><td>격리</td><td><code>permission_profile</code>, <code>isolate_network</code></td><td>03편</td></tr>
+<tr><td>middleware</td><td><code>middleware_configs</code>, <code>oidc_config</code>, <code>authz_config</code>, <code>audit_config</code>, <code>telemetry_config</code>, <code>tools_filter</code>, <code>tools_override</code></td><td>10장, 05편, 06편</td></tr>
+<tr><td>proxy 동작</td><td><code>session_ttl</code>, <code>max_request_body_size</code>, <code>proxy_read_timeout</code>, <code>stateless</code>, <code>trust_proxy_headers</code>, <code>endpoint_prefix</code></td><td>7장</td></tr>
+<tr><td>원격</td><td><code>remote_auth_config</code>, <code>header_forward</code></td><td>8장, 05편</td></tr>
+<tr><td>build</td><td><code>runtime_config</code></td><td>9장</td></tr>
+<tr><td>Kubernetes</td><td><code>k8s_pod_template_patch</code>, <code>scaling_config</code>, <code>mcpserver_generation</code></td><td>07편</td></tr>
+</table></div>
+<p><code>oidc_config</code>, <code>authz_config</code>, <code>tools_filter</code> 같은 필드에는 DEPRECATED 주석이 붙어 있고(source <code>pkg/runner/config.go:141</code>), 새 구조는 <code>middleware_configs</code> 목록이다(source <code>pkg/runner/config.go:274</code>). proxy는 들어오는 인증 설정을 이 목록의 <code>auth</code> 항목에서 읽기 때문에 DEPRECATED 필드에만 들어간 값은 무시된다. v0.63.0 CLI는 아래 네 플래그 값도 <code>auth</code> 항목에 넣는데(source <code>cmd/thv/app/run_flags.go:477</code>, <code>cmd/thv/app/run_flags_test.go:986</code>), 네 플래그는 <code>--thv-ca-bundle</code>, <code>--jwks-auth-token-file</code>, <code>--jwks-allow-private-ip</code>, <code>--oidc-insecure-allow-http</code>다. v0.53.0에서는 이 네 값이 DEPRECATED 필드에만 들어갔다.</p>
+
+<h3>예시</h3>
+<p>아래는 workload 하나의 저장된 RunConfig를 코드로 재구성한 예시다. 이미지와 secret 이름은 가상의 값이고, 필드 이름은 JSON 태그와 대조했으며 일부 필드는 줄였다.</p>
+<pre><code># 이 예시를 만든 명령(가정)
+thv run --name weather --transport stdio \
+  --secret weather-api-key,target=API_KEY \
+  ghcr.io/example/weather-mcp:1.2.0</code></pre>
+<pre><code>{
+  "schema_version": "v0.1.0",
+  "image": "ghcr.io/example/weather-mcp:1.2.0",
+  "name": "weather",
+  "container_name": "weather",
+  "base_name": "weather",
+  "transport": "stdio",
+  "host": "127.0.0.1",
+  "port": 41873,
+  "proxy_mode": "streamable-http",
+  "group": "default",
+  "secrets": ["weather-api-key,target=API_KEY"],
+  "container_labels": {
+    "toolhive": "true",
+    "toolhive-name": "weather",
+    "toolhive-basename": "weather",
+    "toolhive-transport": "stdio",
+    "toolhive-port": "41873"
+  },
+  "middleware_configs": [
+    { "type": "auth", "parameters": {} },
+    { "type": "mcp-parser", "parameters": {} },
+    { "type": "usagemetrics", "parameters": {} },
+    { "type": "recovery", "parameters": null }
+  ]
+}</code></pre>
+<p><code>secrets</code>에는 값이 아니라 secret 이름과 대상 환경 변수만 들어간다(source <code>pkg/runner/config.go:185</code>). <code>permission_profile</code>은 줄였는데, 이 필드는 <a href="03-isolation-secret.html">03편</a>이 다룬다.</p>
+
+<h3>수명 주기</h3>
+<p>RunConfig는 다음 단계를 거친다.</p>
+<ol>
+  <li>만들기: CLI 플래그, registry 정보, API 요청으로 builder가 만든다(source <code>pkg/runner/config_builder.go:1077</code>).</li>
+  <li>저장: 실행 전에 저장된 RunConfig 파일로 쓴다. <code>WriteJSON</code>은 2칸 들여쓰기 JSON을 쓴다(source <code>pkg/runner/config.go:367</code>).</li>
+  <li>읽기: thv start, export, list가 <code>ReadJSON</code>으로 읽는다(source <code>pkg/runner/config.go:378</code>).</li>
+  <li>실행: proxy가 읽은 RunConfig로 <code>Runner.Run</code>을 실행한다.</li>
+  <li>지우기: thv rm이 파일을 지운다(source <code>pkg/workloads/manager.go:1193</code>).</li>
+</ol>
+<p><code>ReadJSON</code>은 비어 있는 버전을 <code>v0.1.0</code>으로 채우고, 원격 인증 정보가 평문으로 남아 있으면 secret 참조로 바꾼다(source <code>pkg/runner/config.go:404</code>). 대상은 OAuth client secret과 bearer token이다. Go 기본 JSON decoder를 쓰므로 모르는 필드는 무시하고(source <code>pkg/state/runconfig.go:134</code>), 버전이 다를 때 거부하는 코드는 <code>ReadJSON</code>에 없다.</p>
+<p>proxy도 저장된 RunConfig를 고쳐 쓸 때가 있는데, 원격 workload가 OAuth refresh token이나 DCR client 정보를 받았을 때다. proxy는 그 값을 secret으로 저장하고 참조만 RunConfig에 적는다. 이때 메모리의 RunConfig를 쓰지 않고 디스크 파일을 다시 읽은 다음, secret 대상 환경 변수와 secret에서 온 헤더 값을 지우고 저장한다(source <code>pkg/runner/runner.go:952</code>, <code>pkg/runner/runner.go:1007</code>). v0.53.0은 메모리의 RunConfig를 그대로 저장했다.</p>
+
+<h3>export와 재사용</h3>
+<p><code>thv export &lt;이름&gt; &lt;경로&gt;</code>는 저장된 RunConfig를 JSON 파일로 쓴다(source <code>cmd/thv/app/export.go:87</code>). <code>--format k8s</code>를 주면 MCPServer YAML을 쓰는데, 이 YAML에는 secret, OIDC, telemetry 설정이 빠지고 명령은 경고만 낸다(source <code>cmd/thv/app/export.go:93</code>).</p>
+<p><code>thv run --from-config &lt;경로&gt;</code>는 그 파일로 workload를 다시 만든다(source <code>cmd/thv/app/run.go:447</code>). 이 플래그와 함께 쓸 수 있는 플래그는 <code>--foreground</code>와 <code>--debug</code>뿐인데(source <code>cmd/thv/app/run.go:523</code>), 공식 문서는 다른 플래그를 쓸 수 없다고만 적는다.</p>
+<p>다른 PC에서 다시 실행하려면 그 PC에도 같은 이름의 secret이 있어야 한다(docs <code>guides-cli/run-mcp-servers</code>).</p>
+<pre><code>thv export weather ./weather.json
+thv export weather ./weather.yaml --format k8s
+thv run --from-config ./weather.json</code></pre>
+
+<h2 id="s6">6. transport와 proxy 구현</h2>
+<p>transport는 MCP 서버가 쓰는 통신 방식이고, proxy는 transport를 보고 안쪽 전달 구현을 고른다(source <code>pkg/transport/factory.go:47</code>).</p>
+<div class="tbl"><table>
+<tr><th>transport</th><th>MCP 서버가 듣는 곳</th><th>proxy 안 전달 구현</th><th>MCP 클라이언트가 받는 주소</th></tr>
+<tr><td><code>stdio</code></td><td>컨테이너 stdin, stdout</td><td>stdio 변환기</td><td>proxy mode가 streamable-http면 <code>/mcp</code>, sse면 <code>/sse#&lt;컨테이너 이름&gt;</code></td></tr>
+<tr><td><code>sse</code></td><td>컨테이너 HTTP 서버</td><td>transparent proxy</td><td><code>/sse#&lt;컨테이너 이름&gt;</code></td></tr>
+<tr><td><code>streamable-http</code></td><td>컨테이너 HTTP 서버</td><td>transparent proxy</td><td><code>/mcp</code></td></tr>
+</table></div>
+<p>주소 규칙은 <code>GenerateMCPServerURL</code>에 있다(source <code>pkg/transport/url.go:21</code>). SSE transport는 MCP 명세에서 폐지 예정이고(source <code>docs/arch/03-transport-architecture.md:60</code>), ToolHive도 <code>--proxy-mode sse</code>를 받으면 폐지 경고를 낸다(source <code>cmd/thv/app/run.go:548</code>).</p>
+
+<h3>기본 transport</h3>
+<p>v0.63.0 CLI는 transport를 다음 순서로 정한다(source <code>cmd/thv/app/run_flags.go:595</code>).</p>
+<ol>
+  <li><code>--transport</code> 플래그 값</li>
+  <li>registry 항목의 transport 값</li>
+  <li>둘 다 없으면 <code>streamable-http</code></li>
+</ol>
+<p>API 서버도 같은 기본값을 쓴다(source <code>pkg/api/v1/workload_service.go:461</code>). 그런데 공식 문서 run-mcp-servers는 stdio를 기본으로 적고 있어서 코드와 문서가 다르다. 이미지나 protocol build로 실행할 때는 <code>--transport</code>를 꼭 적어야 한다.</p>
+
+<h3>전달 구현 두 가지</h3>
+<div class="tbl"><table>
+<tr><th>구분</th><th>transparent proxy</th><th>stdio 변환기</th></tr>
+<tr><td>쓰는 곳</td><td>SSE, streamable HTTP, 원격 workload</td><td>stdio workload</td></tr>
+<tr><td>하는 일</td><td>HTTP 요청을 MCP 서버로 그대로 넘긴다</td><td>HTTP 요청을 JSON-RPC 한 줄로 바꿔 stdin에 쓴다</td></tr>
+<tr><td>바탕</td><td>Go <code>httputil.ReverseProxy</code></td><td>ToolHive가 직접 만든 HTTP 서버</td></tr>
+<tr><td>메시지 검사</td><td>POST마다 MCP envelope 하나인지 확인한다. batch는 거부한다</td><td>JSON-RPC를 직접 해석한다</td></tr>
+<tr><td>세션</td><td>MCP 서버가 정한 세션 ID를 추적한다</td><td>세션을 직접 만들고 관리한다</td></tr>
+<tr><td>코드</td><td><code>pkg/transport/proxy/transparent</code></td><td><code>pkg/transport/proxy/streamable</code>, <code>pkg/transport/proxy/httpsse</code></td></tr>
+</table></div>
+<p>표의 근거는 다음 위치에 있다. (source <code>pkg/transport/proxy/transparent/transparent_proxy.go:1235</code>, <code>pkg/transport/stdio.go:233</code>, <code>docs/arch/03-transport-architecture.md:151</code>)</p>
+<p>transparent proxy는 middleware 체인을 MCP 전달 경로에만 씌우고, <code>/health</code>, <code>/metrics</code>, <code>/.well-known/</code> 경로는 체인 밖에서 처리한다(source <code>pkg/transport/proxy/transparent/transparent_proxy.go:1313</code>). <code>/.well-known/</code>은 인증을 끈 경우에도 등록하는데, 그래야 OAuth 탐색 요청이 MCP 서버로 넘어가지 않고 404 JSON을 받는다(source <code>pkg/transport/proxy/transparent/transparent_proxy.go:1338</code>). 내장 인가 서버의 <code>/oauth/token</code> 같은 경로도 체인 밖에 있다(source <code>docs/arch/03-transport-architecture.md:174</code>).</p>
+<p>MCP 전달 경로에는 middleware 체인보다 먼저 도는 검사가 두 개 있는데(source <code>pkg/transport/proxy/transparent/transparent_proxy.go:1346</code>), 둘 다 헤더만 보고 body를 읽지 않는다.</p>
+<ul>
+  <li><code>Connection</code> 헤더에 hop-by-hop이 아닌 헤더 이름이 있으면 400으로 거부한다(source <code>pkg/transport/proxy/transparent/transparent_proxy.go:1650</code>). Go <code>ReverseProxy</code>는 <code>Connection</code>에 적힌 헤더를 지우고 넘기므로, 클라이언트가 이 동작으로 middleware가 넣은 헤더를 지우지 못하게 막는 검사다.</li>
+  <li>proxy가 <code>--stateless</code>이면 GET, HEAD, DELETE에 405를 돌려주고(source <code>pkg/transport/proxy/transparent/transparent_proxy.go:1692</code>), 요청의 <code>MCP-Protocol-Version</code> 헤더가 <code>2026-07-28</code>일 때도 같다. 응답에는 <code>Allow: POST, OPTIONS</code> 헤더가 붙는다. 그 밖의 GET, HEAD, DELETE는 middleware 체인으로 들어간다.</li>
+</ul>
+<p>health check를 켠 transparent proxy는 MCP 서버를 주기마다 검사하고, <code>/health</code>는 요청마다 MCP 서버를 찌르지 않고 마지막 검사 결과를 답한다(source <code>pkg/transport/proxy/transparent/transparent_proxy.go:525</code>, <code>pkg/healthcheck/healthcheck.go:90</code>). 그래서 느린 MCP 서버가 Kubernetes probe를 제한 시간 너머로 붙잡지 못한다. 검사 실패는 MCP 서버가 initialize를 마친 뒤부터만 종료 횟수에 세고(source <code>pkg/transport/proxy/transparent/transparent_proxy.go:1486</code>), 실패한 검사는 HTTP 200에 <code>degraded</code>로 답한다(source <code>docs/arch/03-transport-architecture.md:481</code>). v0.53.0의 <code>/health</code>는 요청마다 MCP 서버를 찔렀다.</p>
+
+<h3>StdioBridge</h3>
+<p>StdioBridge는 방향이 반대라서, stdio만 쓰는 MCP 클라이언트가 HTTP 주소의 workload에 붙을 때 쓴다(source <code>pkg/transport/bridge.go:22</code>). <code>thv proxy stdio &lt;이름&gt;</code>이 이 연결을 열고(source <code>cmd/thv/app/proxy_stdio.go:18</code>), StdioBridge는 workload의 proxy 주소에 MCP 클라이언트로 붙는다.</p>
+
+<h3>stdio 컨테이너에 붙는 방법</h3>
+<p>stdio workload에서 ToolHive는 다음 순서로 컨테이너와 메시지를 주고받는다.</p>
+<ol>
+  <li><code>runtime.Setup</code>이 환경 변수 <code>MCP_TRANSPORT=stdio</code>를 넣고, stdin을 연 채로 컨테이너를 만든다(source <code>pkg/runtime/setup.go:67</code>, <code>pkg/runtime/setup.go:106</code>).</li>
+  <li>stdio transport 객체가 attach API로 컨테이너의 표준 입출력을 연다(source <code>pkg/transport/stdio.go:226</code>).</li>
+  <li>Docker 클라이언트는 스트림을 나눠 stdout만 넘기고 stderr는 버린다(source <code>pkg/container/docker/client.go:694</code>).</li>
+  <li>proxy mode에 맞는 stdio 변환기를 띄운다(source <code>pkg/transport/stdio.go:233</code>).</li>
+  <li>HTTP 쪽 메시지를 JSON-RPC로 인코딩하고 줄바꿈을 붙여 stdin에 쓴다(source <code>pkg/transport/stdio.go:720</code>).</li>
+  <li>stdout은 4096바이트씩 읽고 줄바꿈 단위로 자른다(source <code>pkg/transport/stdio.go:582</code>).</li>
+  <li>각 줄은 첫 <code>{</code>와 마지막 <code>}</code> 사이만 JSON-RPC로 해석한다(source <code>pkg/transport/stdio.go:650</code>).</li>
+</ol>
+<div class="box warn">
+  <p>MCP 서버는 stdout에 JSON-RPC 메시지만 써야 한다. proxy는 stdout의 로그 줄을 버리거나 파싱 오류 로그만 남기고 넘어가므로, fastmcp 기반 이미지라면 로그를 stderr로 보내야 한다. <code>thv logs</code>는 컨테이너 로그를 읽기 때문에 stderr도 보여 준다(source <code>pkg/container/docker/client.go:582</code>).</p>
+</div>
+<p>stdout이 닫히면 stdio transport 객체는 컨테이너가 살아 있는지 보고, 살아 있으면 다시 attach한다(source <code>pkg/transport/stdio.go:484</code>). 대기 시간은 2초에서 시작해 최대 30초이고, 10회까지 시도한다(source <code>pkg/transport/stdio.go:41</code>). 컨테이너가 끝나면 컨테이너 감시기(monitor)가 이를 알리고 stdio transport 객체가 멈추는데(source <code>pkg/container/runtime/monitor.go:36</code>, <code>pkg/transport/stdio.go:741</code>), 그 뒤는 2장의 자동 재시작 흐름이다.</p>
+
+<h3>응답을 세션에 돌려주는 방법</h3>
+<p>stdio 컨테이너 하나에서는 모든 세션이 파이프 하나를 나눠 쓰는데, 컨테이너가 내는 메시지에는 세션 정보가 없다. 그래서 stdio 변환기가 요청 ID를 바꿔 세션을 표시한다(source <code>docs/arch/03-transport-architecture.md:679</code>).</p>
+<ul>
+  <li>streamable HTTP 쪽 변환기는 요청 ID를 세션 ID와 요청마다 새로 만든 무작위 토큰을 합친 키로 바꾸고, 원래 ID는 따로 보관했다가 응답에 되돌린다(source <code>pkg/transport/proxy/streamable/streamable_proxy.go:1028</code>, <code>pkg/transport/proxy/streamable/streamable_proxy.go:1666</code>). 같은 세션이 같은 ID로 요청을 두 번 보내도 응답이 섞이지 않는 방식이고, v0.53.0은 세션 ID와 원래 ID를 합쳤다.</li>
+  <li>SSE 쪽 변환기는 숫자 ID를 <code>&lt;session_id&gt;|n:&lt;정수&gt;</code> 꼴로, 문자열 ID를 <code>&lt;session_id&gt;|s:&lt;문자열&gt;</code> 꼴로 바꾼다(source <code>pkg/transport/proxy/httpsse/routing.go:70</code>).</li>
+  <li>MCP 서버가 먼저 보내는 요청은 클라이언트에 넘기지 않고, 변환기가 <code>-32601</code> 오류로 MCP 서버에 바로 답한다(source <code>pkg/transport/proxy/streamable/dispatcher.go:63</code>).</li>
+  <li><code>list_changed</code> 알림은 모든 세션에 보내고, <code>notifications/message</code> 로그는 버린다(source <code>docs/arch/03-transport-architecture.md:707</code>).</li>
+</ul>
+<p>그래서 v0.63.0의 stdio workload에서는 <code>sampling/createMessage</code>, <code>elicitation/create</code> 요청이 MCP 클라이언트에 닿지 않는다.</p>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 290" width="760" height="290" role="img" aria-label="stdio workload와 streamable HTTP workload의 요청 경로">
+    <defs>
+      <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+    </defs>
+    <text class="d-a" x="16" y="24" font-size="13" font-weight="600">stdio workload</text>
+    <rect class="d-box" x="16" y="48" width="108" height="60" rx="10"/>
+    <text x="70" y="74" font-size="13" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <text class="d-m" x="70" y="94" font-size="11" text-anchor="middle">POST /mcp</text>
+    <rect class="d-outer" x="164" y="36" width="356" height="86" rx="10"/>
+    <text class="d-m" x="176" y="52" font-size="11">proxy 프로세스</text>
+    <rect class="d-box" x="178" y="62" width="124" height="48" rx="8"/>
+    <text x="240" y="91" font-size="13" text-anchor="middle">middleware 체인</text>
+    <rect class="d-acc" x="320" y="62" width="186" height="48" rx="8"/>
+    <text x="413" y="82" font-size="13" font-weight="600" text-anchor="middle">stdio 변환기</text>
+    <text class="d-m" x="413" y="100" font-size="11" text-anchor="middle">JSON-RPC 한 줄로 바꾼다</text>
+    <rect class="d-box" x="570" y="48" width="174" height="60" rx="10"/>
+    <text x="657" y="74" font-size="13" font-weight="600" text-anchor="middle">MCP 서버 컨테이너</text>
+    <text class="d-m" x="657" y="94" font-size="11" text-anchor="middle">stdin, stdout</text>
+    <line class="d-line" x1="124" y1="86" x2="176" y2="86" marker-end="url(#a3)"/>
+    <text class="d-m" x="143" y="78" font-size="11" text-anchor="middle">HTTP</text>
+    <line class="d-line" x1="302" y1="86" x2="318" y2="86" marker-end="url(#a3)"/>
+    <line class="d-line" x1="506" y1="80" x2="568" y2="80" marker-end="url(#a3)"/>
+    <text class="d-m" x="545" y="72" font-size="11" text-anchor="middle">stdin</text>
+    <line class="d-line" x1="570" y1="96" x2="508" y2="96" marker-end="url(#a3)"/>
+    <text class="d-m" x="545" y="114" font-size="11" text-anchor="middle">stdout</text>
+
+    <text class="d-a" x="16" y="174" font-size="13" font-weight="600">streamable HTTP workload</text>
+    <rect class="d-box" x="16" y="198" width="108" height="60" rx="10"/>
+    <text x="70" y="224" font-size="13" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <text class="d-m" x="70" y="244" font-size="11" text-anchor="middle">POST /mcp</text>
+    <rect class="d-outer" x="164" y="186" width="356" height="86" rx="10"/>
+    <text class="d-m" x="176" y="202" font-size="11">proxy 프로세스</text>
+    <rect class="d-box" x="178" y="212" width="124" height="48" rx="8"/>
+    <text x="240" y="241" font-size="13" text-anchor="middle">middleware 체인</text>
+    <rect class="d-acc" x="320" y="212" width="186" height="48" rx="8"/>
+    <text x="413" y="232" font-size="13" font-weight="600" text-anchor="middle">transparent proxy</text>
+    <text class="d-m" x="413" y="250" font-size="11" text-anchor="middle">요청을 그대로 넘긴다</text>
+    <rect class="d-box" x="570" y="198" width="174" height="60" rx="10"/>
+    <text x="657" y="224" font-size="13" font-weight="600" text-anchor="middle">MCP 서버 컨테이너</text>
+    <text class="d-m" x="657" y="244" font-size="11" text-anchor="middle">HTTP 서버, target 포트</text>
+    <line class="d-line" x1="124" y1="236" x2="176" y2="236" marker-end="url(#a3)"/>
+    <text class="d-m" x="143" y="228" font-size="11" text-anchor="middle">HTTP</text>
+    <line class="d-line" x1="302" y1="236" x2="318" y2="236" marker-end="url(#a3)"/>
+    <line class="d-line" x1="506" y1="230" x2="568" y2="230" marker-end="url(#a3)"/>
+    <text class="d-m" x="545" y="222" font-size="11" text-anchor="middle">HTTP</text>
+    <line class="d-line" x1="570" y1="246" x2="508" y2="246" marker-end="url(#a3)"/>
+    <text class="d-m" x="545" y="264" font-size="11" text-anchor="middle">응답</text>
+  </svg>
+  </div>
+  <figcaption>그림 3. 두 workload의 요청 경로. 두 경우 모두 요청은 middleware 체인을 먼저 지나고, 차이는 안쪽 전달 구현과 MCP 서버를 만나는 방식에 있다.</figcaption>
+</figure>
+
+<h2 id="s7">7. 포트, 세션, 오류, 성능</h2>
+<h3>포트</h3>
+<p>proxy 포트와 target 포트는 서로 다른 포트이고(source <code>docs/arch/03-transport-architecture.md:537</code>), 포트를 정하는 규칙은 다음과 같다.</p>
+<ul>
+  <li><code>--proxy-port</code>를 주면 그 포트가 비었는지 확인하고, 비어 있지 않으면 오류로 끝낸다(source <code>pkg/runner/config.go:599</code>).</li>
+  <li>주지 않으면 10000~65535에서 무작위로 10번 고르고, 모두 실패하면 앞에서부터 차례로 찾는다(source <code>pkg/networking/port.go:74</code>).</li>
+  <li>target 포트는 SSE와 streamable HTTP에만 있고, <code>--target-port</code>가 없으면 같은 방법으로 고른다(source <code>pkg/runner/config.go:620</code>).</li>
+  <li>ToolHive는 target 포트를 <code>MCP_PORT</code>와 <code>FASTMCP_PORT</code> 환경 변수로 알린다(source <code>pkg/runtime/setup.go:72</code>).</li>
+  <li><code>MCP_HOST</code>에는 target host를 넣고, 기본값은 <code>127.0.0.1</code>이다(source <code>cmd/thv/app/run_flags.go:198</code>).</li>
+  <li><code>runtime.Setup</code>은 target 포트와 같은 번호로 호스트 연결을 요청하고, 연결 주소는 <code>--host</code> 값이다(source <code>pkg/runtime/setup.go:116</code>).</li>
+  <li>최종 호스트 포트는 네트워크 격리에 따라 달라진다(source <code>pkg/container/docker/client.go:381</code>). <code>--isolate-network</code>의 기본값은 true이고(source <code>cmd/thv/app/run_flags.go:302</code>), 격리가 켜지면 MCP 서버 컨테이너 앞에 ingress용 보조 컨테이너가 선다(source <code>pkg/container/docker/client.go:352</code>). 이 구조는 <a href="03-isolation-secret.html">03편</a>이 다룬다.</li>
+  <li>operator 경로에서는 포트를 호스트에서 확인하지 않는다(source <code>pkg/runner/config.go:580</code>).</li>
+  <li>내장 인가 서버의 TLS listener를 켜면 그 listener는 8443 포트에 고정되고, proxy 포트나 진단 포트가 8443이면 <code>Runner.Run</code>은 오류로 끝낸다(source <code>pkg/runner/runner.go:1342</code>, <code>pkg/authserver/runner/embeddedauthserver.go:42</code>). 내장 인가 서버는 <a href="05-authn-authz.html">05편</a>이 다룬다.</li>
+</ul>
+
+<h3>세션</h3>
+<ul>
+  <li>transparent proxy는 <code>Mcp-Session-Id</code> 헤더와 SSE 응답의 <code>sessionId</code>로 세션을 추적한다(source <code>docs/arch/03-transport-architecture.md:601</code>).</li>
+  <li>streamable HTTP 쪽 stdio 변환기는 세션 ID를 직접 발급하고, <code>DELETE /mcp</code>는 세션을 닫는다(source <code>docs/arch/03-transport-architecture.md:667</code>).</li>
+  <li>세션은 2시간 동안 쓰지 않으면 만료되고, <code>--session-ttl</code>로 바꾸는 기능이 있다(source <code>pkg/transport/session/proxy_session.go:27</code>).</li>
+  <li>세션은 기본으로 proxy 메모리에 있고, Kubernetes에서 Redis를 고르면 proxy 여러 개가 세션을 나눠 쓴다(source <code>pkg/runner/runner.go:527</code>). operator에는 전체 기본 Redis 설정을 두는 기능이 있어서, 그 설정이 있으면 MCPServer spec에 Redis 세션 저장소가 없어도 그 Redis를 쓴다(source <code>cmd/thv-operator/controllers/mcpserver_runconfig.go:303</code>).</li>
+  <li>세션은 처음 인증한 사용자의 <code>iss</code>, <code>sub</code>에 묶여서 다른 사용자가 쓰면 404를 받는다(source <code>docs/arch/03-transport-architecture.md:233</code>). 자세한 내용은 <a href="05-authn-authz.html">05편</a>이 다룬다.</li>
+  <li>MCP 클라이언트가 붙어 있지 않을 때 나온 메시지는 나중에도 보내지 않는다(source <code>docs/arch/03-transport-architecture.md:613</code>).</li>
+</ul>
+
+<h3>오류 처리</h3>
+<div class="tbl"><table>
+<tr><th>상황</th><th>proxy의 응답</th><th>근거</th></tr>
+<tr><td>요청 body가 8 MiB를 넘는다</td><td>413</td><td><code>pkg/bodylimit/httplimit/middleware.go:15</code></td></tr>
+<tr><td>POST body가 MCP envelope 하나가 아니다. 요청의 <code>params</code>가 object로 해석되지 않는 경우도 같다</td><td>400</td><td><code>docs/arch/03-transport-architecture.md:186</code>, <code>pkg/mcp/message.go:63</code></td></tr>
+<tr><td>POST가 아닌 요청에 body가 있다</td><td>400. mcp-parser middleware가 거부한다. body 없는 GET, DELETE, OPTIONS는 넘긴다</td><td><code>pkg/mcp/parser.go:108</code></td></tr>
+<tr><td><code>Connection</code> 헤더에 hop-by-hop이 아닌 헤더 이름이 있다</td><td>400. transparent proxy만 해당한다</td><td><code>pkg/transport/proxy/transparent/transparent_proxy.go:1670</code></td></tr>
+<tr><td><code>--stateless</code> proxy나 <code>2026-07-28</code> revision 요청에 GET, HEAD, DELETE를 보낸다</td><td>405. transparent proxy만 해당한다</td><td><code>pkg/transport/proxy/transparent/transparent_proxy.go:1696</code></td></tr>
+<tr><td>들어오는 인증이 실패한다</td><td>401</td><td><code>docs/middleware.md:780</code></td></tr>
+<tr><td>인가가 거부한다</td><td>403</td><td><code>docs/middleware.md:781</code></td></tr>
+<tr><td>stdio 응답이 60초 안에 오지 않는다</td><td>504</td><td><code>pkg/transport/proxy/streamable/streamable_proxy.go:688</code></td></tr>
+<tr><td>transparent proxy가 MCP 서버에 붙지 못한다</td><td>502. Go <code>ReverseProxy</code>의 기본 동작이다</td><td><code>pkg/transport/proxy/transparent/transparent_proxy.go:1235</code></td></tr>
+<tr><td>세션 저장소에 장애가 났다</td><td>503</td><td><code>pkg/transport/proxy/transparent/transparent_proxy.go:807</code></td></tr>
+</table></div>
+<p>환경 변수 <code>TOOLHIVE_PROXY_REQUEST_TIMEOUT</code>이 stdio의 60초 제한을 바꾼다(source <code>pkg/transport/proxy/streamable/streamable_proxy.go:45</code>). proxy HTTP 서버는 요청 하나를 30초 안에 다 읽어야 하고, <code>--proxy-read-timeout</code> 플래그가 이 값을 바꾼다(source <code>pkg/transport/proxy/transparent/transparent_proxy.go:179</code>).</p>
+
+<h3>성능 메모</h3>
+<ul>
+  <li>stdio 변환기는 메시지 채널 버퍼를 100개로 잡는다(source <code>pkg/transport/proxy/streamable/streamable_proxy.go:55</code>).</li>
+  <li>transparent proxy는 <code>FlushInterval: -1</code>로 응답을 바로 흘려보내서 SSE 스트림이 버퍼에 쌓이지 않는다(source <code>pkg/transport/proxy/transparent/transparent_proxy.go:1236</code>).</li>
+  <li>transparent proxy는 Go <code>http.DefaultTransport</code>로 연결을 재사용한다(source <code>pkg/transport/proxy/transparent/transparent_proxy.go:1283</code>).</li>
+  <li>stdio workload에서는 모든 세션이 MCP 서버 프로세스 하나를 쓰므로 동시 처리 능력은 그 MCP 서버 구현에 달려 있다. 이 항목은 코드 구조에서 추론했고 측정하지 않았다.</li>
+</ul>
+
+<h2 id="s8">8. 원격 MCP 서버</h2>
+<p>원격 workload는 다른 곳에서 도는 MCP 서버 앞에 proxy만 둔다(docs <code>guides-cli/run-remote-mcp-servers</code>).</p>
+<pre><code>thv run https://api.example.com/mcp --name example
+thv run https://api.example.com/sse --transport sse
+thv run https://example.com/mcp --name my-server --transport streamable-http --stateless</code></pre>
+<p>이름을 주지 않으면 ToolHive는 URL의 도메인에서 이름을 만들고, 원격 workload의 기본 transport는 streamable-http다(docs <code>guides-cli/run-remote-mcp-servers</code>).</p>
+<p>원격 URL을 받으면 proxy는 다음처럼 동작한다.</p>
+<ol>
+  <li><code>remote_url</code>이 있으므로 컨테이너를 만들지 않는다(source <code>pkg/runner/runner.go:484</code>).</li>
+  <li>transparent proxy의 대상을 원격 URL의 scheme과 host로 잡는다(source <code>pkg/transport/http.go:285</code>).</li>
+  <li>요청마다 경로를 원격 URL의 경로로 바꾼다. 원격 URL의 query는 요청의 query 앞에 붙인다(source <code>pkg/transport/proxy/transparent/transparent_proxy.go:1256</code>).</li>
+  <li>나가는 인증이 필요하면 access token을 얻고, Authorization 헤더를 넣는 middleware를 맨 안쪽에 붙인다. token exchange middleware가 있으면 붙이지 않는다(source <code>pkg/transport/http.go:330</code>).</li>
+  <li>원격 서버가 401을 돌려주면 상태를 <code>unauthenticated</code>로 바꾼다(source <code>pkg/runner/runner.go:621</code>).</li>
+  <li>health check는 기본으로 끄고, <code>TOOLHIVE_REMOTE_HEALTHCHECKS</code>를 <code>true</code>나 <code>1</code>로 두면 켠다(source <code>pkg/transport/http.go:224</code>).</li>
+</ol>
+<p><code>--stateless</code>는 POST만 받는 서버에 쓰고, 이때 proxy는 GET, HEAD, DELETE에 405를 돌려준다(source <code>pkg/transport/proxy/transparent/transparent_proxy.go:1696</code>, docs <code>guides-cli/run-remote-mcp-servers</code>). 요청의 <code>MCP-Protocol-Version</code> 헤더가 <code>2026-07-28</code>이면 <code>--stateless</code>가 없어도 같은 405를 받는데, 이 검사는 6장이 자세히 다룬다.</p>
+
+<h3>나가는 인증 개요</h3>
+<p>ToolHive는 원격 서버의 인증 요구를 자동으로 찾는데(source <code>docs/remote-mcp-authentication.md:63</code>), 순서는 다음과 같다.</p>
+<ol>
+  <li>시험 요청을 보내고 401 응답과 <code>WWW-Authenticate</code> 헤더를 본다.</li>
+  <li>헤더가 없으면 RFC 9728의 <code>/.well-known/oauth-protected-resource</code>를 찾는다.</li>
+  <li>인가 서버를 찾는다. client 정보가 없으면 CIMD나 DCR(RFC 7591)로 client를 얻는다(docs <code>guides-cli/run-remote-mcp-servers</code>).</li>
+  <li>PKCE를 쓰는 OAuth 흐름으로 access token을 받는다.</li>
+</ol>
+<p>받은 refresh token과 DCR client 정보는 secret으로 저장하고, 저장된 RunConfig에는 그 참조만 적는다. 이때 proxy는 디스크의 RunConfig를 다시 읽고 secret 값을 지운 뒤 쓴다(5장).</p>
+<p>bearer token 직접 지정, 고정 헤더 주입(<code>--remote-forward-headers</code>) 같은 방법도 있다(docs <code>guides-cli/run-remote-mcp-servers</code>). 자세한 흐름은 <a href="05-authn-authz.html">05편</a> 8.4절이 다룬다. Kubernetes에서는 MCPRemoteProxy 리소스가 같은 일을 한다(<a href="07-kubernetes-operator.html">07편</a>).</p>
+
+<h2 id="s9">9. protocol build</h2>
+<p>protocol build는 패키지 주소만으로 이미지를 만드는 기능이라서, 사용자 PC에 Node.js, Python, Go가 없어도 된다(docs <code>guides-cli/run-mcp-servers</code>).</p>
+<pre><code>thv run --transport stdio --name pulumi npx://@pulumi/mcp-server@latest
+thv run --transport stdio uvx://mcp-server-git@latest
+thv build --tag ghcr.io/myorg/mcp-git:v1.0.0 uvx://mcp-server-git@1.0.0
+thv build --dry-run -o Dockerfile.mcp-git uvx://mcp-server-git</code></pre>
+<p>ToolHive는 protocol build를 다음 순서로 한다(source <code>pkg/runner/protocol.go:51</code>).</p>
+<ol>
+  <li>주소에서 build 종류와 패키지 이름을 읽는다(source <code>pkg/runner/protocol.go:84</code>).</li>
+  <li>build 설정을 정한다. RunConfig 값, 설정 파일 값, 기본값 순서로 앞의 것을 쓴다(source <code>pkg/runner/protocol.go:192</code>).</li>
+  <li>템플릿으로 Dockerfile을 만든다(source <code>pkg/container/templates/npx.tmpl</code>).</li>
+  <li>이미지를 build한다. 이름은 <code>toolhivelocal/&lt;종류&gt;-&lt;패키지&gt;:&lt;시각&gt;</code>이다(source <code>pkg/runner/protocol.go:575</code>).</li>
+  <li>만든 이미지로 일반 실행 경로를 탄다.</li>
+</ol>
+<div class="tbl"><table>
+<tr><th>종류</th><th>기본 build 이미지</th><th>설치 방법</th><th>실행 명령</th></tr>
+<tr><td><code>npx://</code></td><td><code>node:24-alpine</code></td><td>builder 단계에서 <code>npm install</code></td><td><code>npx &lt;패키지&gt;</code></td></tr>
+<tr><td><code>uvx://</code></td><td><code>python:3.14-slim</code></td><td><code>uv tool install</code>. 버전 표기 <code>@</code>를 <code>==</code>로 바꾼다</td><td><code>sh -c</code>로 설치된 실행 파일을 띄운다</td></tr>
+<tr><td><code>go://</code></td><td><code>golang:1.27-alpine</code></td><td><code>go build</code> 또는 <code>go install</code></td><td><code>/app/mcp-server</code>. 실행 단계는 <code>alpine:3.24</code></td></tr>
+</table></div>
+<p>표의 근거는 다음 위치에 있다. (source <code>pkg/container/templates/runtime_config.go:255</code>, <code>pkg/container/templates/uvx.tmpl:80</code>, <code>pkg/container/templates/go.tmpl:77</code>)</p>
+<p>세 템플릿 모두 multi-stage build이고, 실행 단계는 root가 아닌 <code>appuser</code>로 돈다(source <code>pkg/container/templates/go.tmpl:123</code>, <code>pkg/container/templates/uvx.tmpl:158</code>). 기본 build 설정은 <code>git</code>과 <code>ca-certificates</code>를 더 설치한다(source <code>pkg/container/templates/runtime_config.go:255</code>).</p>
+<p>설계 문서는 Go 실행 단계를 <code>alpine:3.23</code>으로 적지만(source <code>docs/arch/05-runconfig-and-permissions.md:115</code>), v0.63.0 템플릿은 digest를 고정한 <code>alpine:3.24</code>다. v0.53.0과 견주면 digest만 바뀌었다.</p>
+<p><code>thv build &lt;주소&gt; -- &lt;인자&gt;</code>는 인자를 ENTRYPOINT에 굳히고, 실행 때 준 인자는 그 뒤에 붙는다(docs <code>guides-cli/build-containers</code>).</p>
+<p><code>--runtime-image</code>와 <code>--runtime-add-package</code>는 build 설정을 바꾼다(source <code>cmd/thv/app/run_flags.go:239</code>). <code>--build-with</code>는 uvx에만 있고, 사내 패키지 저장소 주소는 <code>thv config set-build-env</code>로 지정한다(docs <code>guides-cli/build-containers</code>).</p>
+<p>protocol build로 만든 이미지에는 registry 정보가 없어서, <code>--transport</code>가 없으면 6장의 기본값 streamable-http가 된다(source <code>cmd/thv/app/run_flags_test.go:694</code>). stdio 패키지라면 <code>--transport stdio</code>를 적어야 한다.</p>
+
+<h2 id="s10">10. middleware 순서</h2>
+<p>요청은 MCP 서버에 닿기 전에 middleware 체인을 지나는데, 목록의 첫 항목이 가장 바깥에서 먼저 돈다(source <code>pkg/transport/proxy/transparent/transparent_proxy.go:1297</code>). transparent proxy에서는 6장의 <code>Connection</code> 헤더 검사와 405 검사가 이 목록보다 더 바깥에서 돈다. 아래 표는 operator 경로의 순서이고, operator는 RunConfig를 만들 때 <code>PopulateMiddlewareConfigs</code>로 목록을 채운다(source <code>cmd/thv-operator/controllers/mcpserver_runconfig.go:292</code>, <code>pkg/runner/middleware.go:67</code>). 각 middleware의 자세한 동작은 05편과 06편이 다룬다.</p>
+<div class="tbl"><table>
+<tr><th>순서</th><th>type</th><th>하는 일</th><th>들어가는 조건</th></tr>
+<tr><td>1</td><td><code>bodylimit</code></td><td>8 MiB를 넘는 body를 413으로 막는다</td><td>항상</td></tr>
+<tr><td>2</td><td><code>origin</code></td><td>허용하지 않은 Origin 헤더를 막는다(DNS rebinding 방어)</td><td>허용 목록이 있을 때</td></tr>
+<tr><td>3</td><td><code>audit</code></td><td>요청 결과를 감사 기록으로 남긴다(06편)</td><td>설정할 때</td></tr>
+<tr><td>4</td><td><code>auth</code></td><td>들어오는 인증(05편)</td><td>항상</td></tr>
+<tr><td>5</td><td><code>upstreamswap</code></td><td>ToolHive가 발급한 access token을 외부 IdP의 access token으로 바꾼다(05편)</td><td>내장 인가 서버를 쓸 때</td></tr>
+<tr><td>6</td><td><code>tokenexchange</code></td><td>RFC 8693 token exchange(05편)</td><td>설정할 때</td></tr>
+<tr><td>7</td><td><code>tool-filter</code>, <code>tool-call-filter</code></td><td>tool 목록과 tool 호출을 거른다</td><td><code>--tools</code>, <code>--tools-override</code></td></tr>
+<tr><td>8</td><td><code>mcp-parser</code></td><td>JSON-RPC를 해석해 뒤 단계에 넘긴다. POST가 아닌 요청에 body가 있으면 400으로 막는다(source <code>pkg/mcp/parser.go:108</code>)</td><td>항상</td></tr>
+<tr><td>9</td><td><code>telemetry</code></td><td>OpenTelemetry span과 지표(06편)</td><td>설정할 때</td></tr>
+<tr><td>10</td><td><code>ratelimit</code></td><td><code>tools/call</code> 요청 수를 제한한다. 다른 요청은 그대로 넘긴다(06편)</td><td>설정할 때. 세션 저장소가 Redis여야 한다</td></tr>
+<tr><td>11</td><td><code>mutating-webhook</code>, <code>validating-webhook</code></td><td>외부 webhook이 요청을 고치거나 거부한다(06편)</td><td>설정할 때</td></tr>
+<tr><td>12</td><td><code>usagemetrics</code></td><td>익명 사용 지표를 모은다(06편)</td><td>끄지 않았을 때</td></tr>
+<tr><td>13</td><td><code>authorization</code></td><td>Cedar 정책으로 인가한다(05편)</td><td>설정할 때</td></tr>
+<tr><td>14</td><td><code>awssts</code></td><td>AWS STS 자격 증명으로 바꾼다(05편)</td><td>원격 workload에 설정할 때</td></tr>
+<tr><td>15</td><td><code>header-forward</code></td><td>원격 요청에 헤더를 넣는다</td><td>원격 workload에 헤더를 줄 때</td></tr>
+<tr><td>16</td><td><code>recovery</code></td><td>panic을 500 응답으로 바꾼다</td><td>항상</td></tr>
+</table></div>
+<p>1번과 2번은 <code>Runner.Run</code>이 맨 앞에 붙인다(source <code>pkg/runner/runner.go:350</code>, <code>pkg/runner/runner.go:359</code>). Origin 허용 목록은 loopback 주소에 바인드하면 자동으로 생기고, 다른 주소인데 <code>--allowed-origins</code>가 없으면 origin middleware를 빼고 경고만 남긴다(source <code>pkg/runner/middleware.go:755</code>).</p>
+<p>operator는 proxy를 기본으로 <code>0.0.0.0</code>에 바인드하고 Origin 허용 목록을 넣지 않아서, operator 경로에는 기본으로 origin middleware가 없다(source <code>cmd/thv-operator/controllers/mcpserver_runconfig.go:88</code>).</p>
+<p>ratelimit은 Redis 세션 저장소를 요구해서, 세션 저장소가 Redis가 아니면 middleware 목록을 채울 때 오류가 난다(source <code>pkg/runner/middleware.go:783</code>).</p>
+<p>표에 없는 middleware도 있다. 내장 인가 서버가 upstream access token을 넘기지 않는 설정이면 5번 자리에 <code>strip-auth</code>가 들어가는데, upstream이 없거나 upstream access token 주입을 끈 경우가 여기에 해당한다. 이 middleware는 클라이언트의 인증 헤더를 지운다(source <code>pkg/runner/middleware.go:495</code>). 외부 인증 handler가 넣은 middleware는 15번과 16번 사이에 들어간다(source <code>pkg/runner/middleware.go:281</code>).</p>
+<p>원격 workload에 access token이 있으면 middleware가 하나 더 붙는데, HTTP transport 객체가 <code>oauth-token-injection</code>을 맨 안쪽에 붙인다. token exchange middleware가 있으면 붙이지 않는다(source <code>pkg/transport/http.go:330</code>).</p>
+<p>CLI의 <code>thv run</code>과 API 서버는 operator와 다른 함수로 목록을 채워서 순서가 조금 다르다(source <code>pkg/runner/config_builder.go:715</code>, <code>pkg/api/v1/workload_service.go:476</code>).</p>
+<ul>
+  <li><code>tool-filter</code>와 <code>tool-call-filter</code>가 <code>auth</code>보다 앞에 온다.</li>
+  <li><code>usagemetrics</code>가 webhook보다 앞에 오고, <code>telemetry</code>는 webhook 뒤에 온다.</li>
+  <li><code>ratelimit</code>, <code>upstreamswap</code>, <code>awssts</code>는 들어가지 않는다.</li>
+  <li><code>header-forward</code>는 <code>recovery</code> 뒤에 붙는다(source <code>pkg/runner/runner.go:329</code>).</li>
+</ul>
+
+<h2 id="s11">11. API 서버</h2>
+<p><code>thv serve</code>는 REST API를 제공하는 API 서버를 연다. 기본 주소는 <code>127.0.0.1:8080</code>이고(source <code>cmd/thv/app/server.go:157</code>), 기본으로 인증 없이 열린다(docs <code>guides-cli/api-server</code>).</p>
+<ul>
+  <li><code>--socket</code>은 UNIX socket이나 Windows named pipe로 연다.</li>
+  <li><code>--openapi</code>는 <code>/api/doc</code>과 <code>/api/openapi.json</code>을 연다.</li>
+  <li><code>--oidc-issuer</code> 같은 플래그를 주면 요청마다 access token을 확인한다.</li>
+  <li>body가 있는 요청에는 <code>Content-Type: application/json</code>을 붙여야 하고, 없으면 415를 받는다(docs <code>guides-cli/api-server</code>).</li>
+</ul>
+<div class="tbl"><table>
+<tr><th>경로</th><th>하는 일</th></tr>
+<tr><td><code>/api/v1beta/workloads</code></td><td>workload 목록, 생성, 정지, 재시작, 삭제, 로그, export</td></tr>
+<tr><td><code>/api/v1beta/groups</code></td><td>그룹(04편)</td></tr>
+<tr><td><code>/api/v1beta/clients</code></td><td>클라이언트 설정(04편)</td></tr>
+<tr><td><code>/api/v1beta/registry</code>, <code>/registry</code></td><td>registry(04편)</td></tr>
+<tr><td><code>/api/v1beta/secrets</code></td><td>secret(03편)</td></tr>
+<tr><td><code>/api/v1beta/skills</code>, <code>/api/v1beta/plugins</code></td><td>skill, plugin(09편)</td></tr>
+<tr><td><code>/api/v1beta/version</code>, <code>/api/v1beta/discovery</code>, <code>/health</code></td><td>버전, 탐색, health check</td></tr>
+</table></div>
+<p>표의 근거는 다음 위치에 있다. (source <code>pkg/api/server.go:447</code>)</p>
+<pre><code>GET    /api/v1beta/workloads?all=true
+POST   /api/v1beta/workloads
+POST   /api/v1beta/workloads/{name}/stop
+POST   /api/v1beta/workloads/{name}/restart
+GET    /api/v1beta/workloads/{name}/proxy-logs
+GET    /api/v1beta/workloads/{name}/export
+DELETE /api/v1beta/workloads/{name}</code></pre>
+<p>위 경로는 workload 라우터에서 골랐다(source <code>pkg/api/v1/workloads.go:119</code>). workload, skill, plugin 밖의 경로에는 60초 제한이 있다(source <code>pkg/api/server.go:71</code>, <code>pkg/api/server.go:467</code>).</p>
+<p>API 서버는 CLI와 같은 workload 관리자 코드를 쓰기 때문에(source <code>pkg/api/server.go:451</code>), CLI로 만든 workload도 API에 보이고 둘은 같은 RunConfig와 상태 파일을 쓴다.</p>
+<p>ToolHive 데스크톱 앱 v0.40.1은 <code>thv serve --openapi --socket=&lt;경로&gt;</code>로 API 서버를 띄운다(source <code>toolhive-studio main/src/toolhive-manager.ts:142</code>).</p>
+
+<h2 id="s12">12. 소스 지도</h2>
+<p>아래 표는 v0.63.0 트리에서 이 문서와 관련된 패키지를 정리한 것이고, 각 패키지 설명은 패키지 주석과 대조했다.</p>
+<div class="tbl"><table>
+<tr><th>패키지</th><th>하는 일</th></tr>
+<tr><td><code>cmd/thv/app</code></td><td>CLI 명령 정의(run, stop, start, rm, logs, export, build, serve, proxy)</td></tr>
+<tr><td><code>cmd/thv-proxyrunner</code></td><td>Kubernetes용 proxy 진입점(07편)</td></tr>
+<tr><td><code>pkg/workloads</code></td><td>workload 관리자. 실행, 정지, 재시작, 삭제, 목록, 자동 재시작</td></tr>
+<tr><td><code>pkg/workloads/statuses</code></td><td>상태 파일 읽기와 쓰기, 실제 상태와 대조</td></tr>
+<tr><td><code>pkg/runner</code></td><td>RunConfig, 설정 builder, <code>Runner.Run</code>, middleware 순서, protocol build</td></tr>
+<tr><td><code>pkg/runtime</code></td><td><code>Setup</code>. 컨테이너를 만들기 전 환경 변수와 포트를 준비</td></tr>
+<tr><td><code>pkg/container</code></td><td>컨테이너 런타임 추상화와 컨테이너 감시기</td></tr>
+<tr><td><code>pkg/container/docker</code></td><td>Docker 구현. attach, 포트 연결</td></tr>
+<tr><td><code>pkg/container/templates</code></td><td>protocol build용 Dockerfile 템플릿과 build 설정 기본값</td></tr>
+<tr><td><code>pkg/transport</code></td><td>transport 팩토리, transport 객체(stdio, HTTP), StdioBridge, 주소 규칙</td></tr>
+<tr><td><code>pkg/transport/proxy/transparent</code></td><td>transparent proxy</td></tr>
+<tr><td><code>pkg/transport/proxy/streamable</code></td><td>stdio 변환기(streamable HTTP 쪽)</td></tr>
+<tr><td><code>pkg/transport/proxy/httpsse</code></td><td>stdio 변환기(SSE 쪽)</td></tr>
+<tr><td><code>pkg/transport/session</code></td><td>세션 관리와 저장소(메모리, Redis)</td></tr>
+<tr><td><code>pkg/state</code></td><td>저장된 RunConfig 저장소(로컬, Kubernetes)</td></tr>
+<tr><td><code>pkg/networking</code></td><td>포트 찾기, HTTP client</td></tr>
+<tr><td><code>pkg/labels</code></td><td>표준 라벨</td></tr>
+<tr><td><code>pkg/mcp</code></td><td>JSON-RPC 파서(mcp-parser middleware, envelope 검사)와 tool filter middleware</td></tr>
+<tr><td><code>pkg/bodylimit</code></td><td>body 크기 제한 middleware. 표준 라이브러리만 쓰는 구현은 <code>pkg/bodylimit/httplimit</code>에 있다</td></tr>
+<tr><td><code>pkg/healthcheck</code></td><td><code>/health</code> 응답과 MCP 서버 ping</td></tr>
+<tr><td><code>pkg/api</code></td><td>API 서버</td></tr>
+<tr><td><code>pkg/client</code></td><td>클라이언트 설정 관리(04편)</td></tr>
+</table></div>
+
+<h2 id="sQ">13. 자가 점검 문제</h2>
+<p>먼저 답을 생각해 본 다음 펼쳐서 확인한다.</p>
+<details><summary>Q1. 기본 옵션으로 thv run을 실행했다. 명령이 끝난 뒤 남는 thv 프로세스는 몇 개이고, 무슨 일을 하는가?</summary>
+<p>thv 프로세스 하나가 남는다. 터미널의 부모 thv는 RunConfig를 저장하고 끝나고, 부모가 띄운 자식 thv가 proxy로 남아 MCP 서버 컨테이너를 만들고 요청을 넘긴다.</p></details>
+<details><summary>Q2. stdio workload와 streamable HTTP workload에서 proxy 안의 전달 구현은 각각 무엇인가?</summary>
+<p>stdio workload는 stdio 변환기를 쓰고, 변환기는 HTTP 요청을 JSON-RPC 한 줄로 바꿔 컨테이너 stdin에 쓴다. streamable HTTP workload는 transparent proxy를 쓰는데, 요청을 컨테이너의 HTTP 서버로 그대로 넘긴다.</p></details>
+<details><summary>Q3. 컨테이너가 예기치 않게 끝났다. 상태는 어떻게 바뀌고, 언제 error가 되는가?</summary>
+<p>상태는 <code>starting</code>으로 바뀌고 workload 관리자가 다시 실행한다. 대기 시간은 5초에서 시작해 60초까지 늘어나고, 10회를 다 써도 실패하면 <code>error</code>가 된다. 다만 30초 이상 돈 뒤 끝났으면 횟수를 처음부터 다시 센다.</p></details>
+<details><summary>Q4. thv stop 뒤와 thv rm 뒤에 디스크에 남는 파일은 어떻게 다른가?</summary>
+<p>thv stop 뒤에는 저장된 RunConfig와 상태 파일이 남아서 thv start가 그 RunConfig로 다시 실행한다. thv rm 뒤에는 둘 다 지워진다. proxy 로그 파일은 두 경우 모두 남고, <code>thv logs prune</code>이 정리한다.</p></details>
+<details><summary>Q5. 동료가 export한 RunConfig JSON으로 thv run --from-config를 실행했다. 서버가 secret을 찾지 못한다. 왜인가?</summary>
+<p>RunConfig에는 secret 값이 없고 <code>이름,target=환경 변수</code> 참조만 있어서, 실행하는 PC의 secret 저장소에 같은 이름의 secret이 있어야 한다. 그 secret이 없으므로 값을 풀지 못한다.</p></details>
+<details><summary>Q6. fastmcp로 만든 stdio MCP 서버가 시작 로그를 stdout에 찍는다. 어떤 일이 생기는가?</summary>
+<p>proxy는 stdout의 각 줄을 JSON-RPC로 해석한다. 중괄호가 없는 로그 줄은 버리고, 중괄호가 있는 로그 줄은 파싱 오류 로그만 남긴다. stdout은 JSON-RPC 전용이라서 로그는 stderr로 보내야 하고, stderr는 <code>thv logs</code>로 본다.</p></details>
+<details><summary>Q7. MCP 클라이언트 두 개가 같은 stdio workload에 붙어 있다. 응답이 섞이지 않는 이유는 무엇인가?</summary>
+<p>stdio 변환기가 요청을 컨테이너에 보내기 전에 ID를 바꾸기 때문이다. 새 ID는 세션 ID와 요청마다 만든 무작위 토큰을 합친 값이고, 응답이 돌아오면 변환기가 그 값으로 기다리는 요청을 찾아 그 세션에만 보낸다. 원래 ID도 이때 되돌린다.</p></details>
+<details><summary>Q8. thv run npx://some-package를 --transport 없이 실행했다. v0.63.0 코드에서 transport는 무엇이 되고, 무엇을 주의해야 하는가?</summary>
+<p>protocol build 이미지에는 registry 정보가 없기 때문에 transport는 streamable-http가 된다. 공식 문서는 stdio를 기본으로 적으므로 문서와 다르다. 패키지가 stdio로만 말한다면 <code>--transport stdio</code>를 적어야 한다.</p></details>
+<details><summary>Q9. 원격 workload에 thv logs &lt;이름&gt;을 실행하면 오류가 난다. 왜이고, 대신 무엇을 써야 하는가?</summary>
+<p>원격 workload에는 컨테이너가 없어서 컨테이너 로그가 없다. 대신 <code>thv logs &lt;이름&gt; --proxy</code>로 proxy 로그를 봐야 한다.</p></details>
+<details><summary>Q10. 같은 설정을 CLI의 thv run과 operator로 띄웠다. tool filter와 auth의 순서는 어떻게 다른가?</summary>
+<p>CLI 경로에서는 tool filter가 auth보다 바깥에 있어 먼저 돈다. operator 경로에서는 auth가 먼저 돌고, tool filter는 token exchange 다음에 온다.</p></details>
+<details><summary>Q11. 클라이언트가 transparent proxy에 body가 있는 GET 요청을 보냈다. proxy는 어떻게 답하는가?</summary>
+<p>proxy가 <code>--stateless</code>이거나 요청에 <code>MCP-Protocol-Version: 2026-07-28</code> 헤더가 있으면 middleware 체인에 들어가기 전에 405를 받는다. 그 밖의 경우에는 요청이 체인에 들어가고 mcp-parser middleware가 body를 보고 400을 돌려준다. body가 없는 GET이었다면 그대로 MCP 서버로 간다.</p></details>
+
+<h2 id="sR">14. 참고 자료</h2>
+<ul>
+  <li>공식 문서 <code>guides-cli/manage-mcp-servers</code>: https://docs.stacklok.com/toolhive/guides-cli/manage-mcp-servers</li>
+  <li>공식 문서 <code>guides-cli/run-mcp-servers</code>: https://docs.stacklok.com/toolhive/guides-cli/run-mcp-servers</li>
+  <li>공식 문서 <code>guides-cli/run-remote-mcp-servers</code>: https://docs.stacklok.com/toolhive/guides-cli/run-remote-mcp-servers</li>
+  <li>공식 문서 <code>guides-cli/build-containers</code>: https://docs.stacklok.com/toolhive/guides-cli/build-containers</li>
+  <li>공식 문서 <code>guides-cli/api-server</code>, <code>reference/api</code>: https://docs.stacklok.com/toolhive/guides-cli/api-server</li>
+  <li>toolhive v0.63.0 설계 문서 <code>docs/arch/08-workloads-lifecycle.md</code>, <code>05-runconfig-and-permissions.md</code>, <code>03-transport-architecture.md</code>, <code>01-deployment-modes.md</code></li>
+  <li>toolhive v0.63.0 <code>docs/middleware.md</code>, <code>docs/remote-mcp-authentication.md</code></li>
+  <li>toolhive v0.63.0 소스 <code>pkg/workloads</code>, <code>pkg/runner</code>, <code>pkg/transport</code>, <code>pkg/container</code>, <code>pkg/runtime</code>, <code>pkg/mcp</code>, <code>pkg/healthcheck</code>, <code>pkg/bodylimit</code>, <code>pkg/api</code>, <code>cmd/thv/app</code></li>
+  <li>toolhive v0.54.0부터 v0.63.0까지의 release note. 이 문서가 설명한 변경 중 네 개는 release note 제목으로 찾았다. POST가 아닌 요청의 body 거부는 #6806, <code>/health</code>의 마지막 검사 결과 응답은 #7001, OIDC 전송 플래그의 auth middleware 연결은 #6529, <code>DecodeMessage</code>의 ID decode 분리는 #6820이다. <code>Connection</code> 헤더 거부, 변환기의 요청 키 변경, RunConfig 재저장 때 secret 값을 지우는 변경 세 가지는 제목에서 찾지 못했다.</li>
+  <li>toolhive-studio v0.40.1 <code>main/src/toolhive-manager.ts</code></li>
+</ul>
+<div class="box warn" id="unchecked">
+  <p>대조한 것: 이 문서의 명령, 플래그, 기본값, 상태 값, 경로를 소스와 대조했고, middleware 순서도 소스의 해당 줄과 대조했다. 설계 문서와 공식 문서의 내용도 소스와 다시 맞춰 봤다. thv를 실행하거나 build하지는 않았다.</p>
+  <p>2026-11-07에 v0.63.0 트리로 다시 대조했고, 인용한 줄 번호는 모두 v0.63.0 기준이다. 두 버전 사이에 바뀐 인용 파일은 diff를 읽고 바뀐 동작을 본문에 반영했는데, 그 파일은 다음과 같다.</p>
+  <ul>
+    <li>proxy: <code>pkg/runner/runner.go</code>, <code>pkg/transport/proxy/transparent/transparent_proxy.go</code>, <code>pkg/transport/proxy/streamable/streamable_proxy.go</code>, <code>pkg/transport/proxy/streamable/dispatcher.go</code></li>
+    <li>입력 검사: <code>pkg/mcp/parser.go</code>, <code>pkg/mcp/message.go</code>, <code>pkg/bodylimit/middleware.go</code></li>
+    <li>컨테이너와 CLI: <code>pkg/container/docker/client.go</code>, <code>pkg/container/runtime/types.go</code>, <code>pkg/container/templates/go.tmpl</code>, <code>cmd/thv/app/run.go</code>, <code>cmd/thv/app/run_flags.go</code>, <code>cmd/thv/app/run_flags_test.go</code>, <code>cmd/thv/app/logs.go</code></li>
+    <li>operator: <code>cmd/thv-operator/controllers/mcpserver_runconfig.go</code></li>
+    <li>문서: <code>docs/arch/03-transport-architecture.md</code>, <code>docs/arch/05-runconfig-and-permissions.md</code>, <code>docs/middleware.md</code>, <code>docs/remote-mcp-authentication.md</code></li>
+  </ul>
+  <p>공식 문서 다섯 쪽은 2026-11-07에 다시 읽었는데, 그 다섯 쪽은 <code>guides-cli/run-mcp-servers</code>, <code>guides-cli/run-remote-mcp-servers</code>, <code>guides-cli/manage-mcp-servers</code>, <code>guides-cli/build-containers</code>, <code>guides-cli/api-server</code>다. 아래 "다른 곳" 목록은 그날 기준으로도 그대로다.</p>
+  <p>소스와 문서가 서로 다른 곳은 다음과 같고, 이 문서는 소스를 따랐다.</p>
+  <ul>
+    <li>기본 transport: 코드는 streamable-http, 공식 문서 run-mcp-servers는 stdio다.</li>
+    <li>컨테이너 종료: 설계 문서는 stopped로 가고, 코드는 starting으로 가서 자동 재시작한다.</li>
+    <li>thv rm 순서: 설계 문서는 proxy를 먼저 끝내고, 코드는 컨테이너를 먼저 지운다.</li>
+    <li>PID 저장: 설계 문서는 PID 파일이고, 코드는 상태 파일의 <code>process_id</code>다.</li>
+    <li>Go 실행 단계 이미지: 설계 문서는 alpine:3.23, 템플릿은 alpine:3.24다.</li>
+    <li>RunConfig 버전 검사: 설계 문서는 버전을 확인한다고 적지만, <code>ReadJSON</code>에는 빈 값을 채우는 코드만 있다.</li>
+    <li><code>--from-config</code>: 공식 문서는 다른 플래그를 금지한다고 적지만, 코드는 <code>--foreground</code>와 <code>--debug</code>를 허용한다.</li>
+    <li>공식 문서 api-server의 <code>/api/v1beta/status</code> 예시 경로는 v0.63.0 라우터에서도 찾지 못했다.</li>
+    <li>공식 문서 build-containers의 예시 Dockerfile은 v0.63.0 템플릿과 다른데, 예시는 <code>python:3.12-slim</code>과 <code>pip install uv</code>를 쓴다.</li>
+  </ul>
+  <p>대조하지 못한 것과 추정한 것은 다음과 같다.</p>
+  <ul>
+    <li><code>DecodeMessage</code>의 ID decode 분리(v0.54.0)는 <code>pkg/mcp/message.go</code>의 내부 정리로 읽었다. 함께 들어간 "params가 object로 해석되지 않으면 거부" 규칙만 7장 표에 적었다. 그 밖의 동작 변화는 diff에서 찾지 못했다.</li>
+    <li><code>/health</code> 응답이 최대 얼마나 오래된 값인지는 설계 문서 03의 계산식을 따랐다. 코드로 시간을 재지는 않았다.</li>
+    <li>5장의 RunConfig 예시는 코드로 재구성했다. 실제 저장 결과와 필드 구성이 조금 다를 가능성이 있다.</li>
+    <li>macOS 경로는 설계 문서와 공식 문서를 따랐다. <code>adrg/xdg</code> 라이브러리 소스는 읽지 않았다.</li>
+    <li>Docker 포트 연결: <code>runtime.Setup</code>은 target 포트와 같은 번호로 호스트 연결을 요청하는데, 공식 문서는 호스트 쪽에 무작위 포트를 쓴다고 적는다. 네트워크 격리에서 ingress 컨테이너가 쓰는 포트는 따라가지 않았고, 실행으로도 확인하지 못했다.</li>
+    <li>502 응답은 Go <code>httputil.ReverseProxy</code>의 기본 오류 처리 동작이다. Go 표준 라이브러리 소스와는 대조하지 않았다.</li>
+    <li>원격 workload를 thv start로 다시 띄우면 OAuth 흐름을 다시 탄다는 내용은 공식 문서의 주장이고, 코드 경로는 05편 범위라 따라가지 않았다.</li>
+    <li>stdio workload의 동시 처리 능력에 관한 내용은 코드 구조에서 추론했다. 측정 값은 없다.</li>
+  </ul>
+</div>
+<p>다음 학습은 <a href="03-isolation-secret.html">03편 "격리와 secret, 공급망 보안"</a>이다.</p>
+
+<nav class="pager">
+<a class="prev" href="01-overview-first-run.html"><span class="k">이전 글</span><span class="t">ToolHive 개요와 첫 실행</span></a>
+<a class="next" href="03-isolation-secret.html"><span class="k">다음 글</span><span class="t">격리와 secret, 공급망 보안</span></a>
+</nav>
+
+<footer>2026-10-14 작성, 2026-11-07 갱신. 기준: ToolHive v0.63.0.</footer>
+</div>
+</body>
+</html>

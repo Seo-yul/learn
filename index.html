@@ -4,61 +4,62 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>learn</title>
-<meta name="description" content="AI Agent와 RAG를 공부하며 정리한 학습 자료">
-<style>
-  :root {
-    --bg: #faf8f3; --fg: #1f1d1a; --muted: #6b665e; --line: #e2ddd2; --card: #ffffff; --accent: #9a4a1c;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg: #171614; --fg: #ece8e0; --muted: #a09a8f; --line: #33302b; --card: #1f1e1b; --accent: #e0a070; }
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--fg);
-    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Pretendard", "Noto Sans KR", "Segoe UI", sans-serif;
-    line-height: 1.65;
-  }
-  main { max-width: 720px; margin: 0 auto; padding: 56px 16px 80px; }
-  h1 { font-size: 2rem; margin: 0 0 8px; letter-spacing: -0.02em; }
-  .lead { color: var(--muted); margin: 0 0 40px; }
-  h2 { font-size: 0.85rem; color: var(--muted); font-weight: 600; margin: 32px 0 12px; letter-spacing: 0.04em; }
-  ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
-  a.card {
-    display: block; padding: 16px 18px; background: var(--card); border: 1px solid var(--line);
-    border-radius: 10px; color: inherit; text-decoration: none;
-  }
-  a.card:hover, a.card:focus-visible { border-color: var(--accent); outline: none; }
-  .title { font-weight: 650; font-size: 1.05rem; }
-  .desc { color: var(--muted); font-size: 0.93rem; margin-top: 2px; }
-  footer { margin-top: 56px; color: var(--muted); font-size: 0.85rem; }
-</style>
+<meta name="description" content="AI Agent, RAG, MCP 인증, ToolHive를 공부하며 정리한 학습 자료">
+<link rel="stylesheet" href="assets/learn.css">
 </head>
 <body>
-<main>
+<div class="masthead"><div class="bar"><a class="brand" href="index.html">learn</a><span class="crumb">학습 기록</span></div></div>
+<div class="wrap home">
+
+<header>
   <h1>learn</h1>
-  <p class="lead">AI Agent와 RAG를 공부하며 정리한 학습 자료다.</p>
+  <p class="lead">AI Agent와 그 주변 기술을 공부하면서 정리한 학습 자료다. 주제별로 묶었고, 시리즈는 번호 순서대로 읽으면 된다.</p>
+</header>
 
-  <h2>RAG</h2>
-  <ul>
-    <li><a class="card" href="rag-1.html">
-      <div class="title">RAG 학습 자료 1부</div>
-      <div class="desc">기초부터 검색까지: 임베딩, 청킹, 벡터·키워드·하이브리드 검색, 재순위, 벡터 인덱스</div>
-    </a></li>
-    <li><a class="card" href="rag-2.html">
-      <div class="title">RAG 학습 자료 2부</div>
-      <div class="desc">심화와 실무: 질의 변환, 실패 진단, 운영 주의점, 평가, 심화 기법</div>
-    </a></li>
-  </ul>
+<h2>RAG</h2>
+<ul class="entries">
+  <li><a href="rag-1.html"><span class="n">1</span><span class="t">RAG 학습 자료 1부</span><span class="d">기초부터 검색까지 다룬다. 임베딩, 청킹, 벡터·키워드·하이브리드 검색, 재순위, 벡터 인덱스.</span></a></li>
+  <li><a href="rag-2.html"><span class="n">2</span><span class="t">RAG 학습 자료 2부</span><span class="d">심화와 실무를 다룬다. 질의 변환, 실패 진단, 운영 주의점, 평가, 심화 기법.</span></a></li>
+</ul>
 
-  <h2>평가</h2>
-  <ul>
-    <li><a class="card" href="eval-intro.html">
-      <div class="title">Agent 평가(eval) 입문</div>
-      <div class="desc">QA 정답 대조에서 eval 프레임워크까지: 데이터셋, 실행기, 채점기</div>
-    </a></li>
-  </ul>
+<h2>평가</h2>
+<ul class="entries">
+  <li><a href="eval-intro.html"><span class="n">1</span><span class="t">Agent 평가(eval) 입문</span><span class="d">QA 정답 대조에서 eval 프레임워크까지 다룬다. 데이터셋, 실행기, 채점기.</span></a></li>
+</ul>
 
-  <footer>예시 상황은 설명용으로 만든 것이며 실제 측정 사례가 아니다. 도구와 모델의 세부 사항은 공식 문서에서 확인한다.</footer>
-</main>
+<h2>OAuth</h2>
+<ul class="entries">
+  <li><a href="oauth/index.html"><span class="n">0</span><span class="t">OAuth 학습 목차</span><span class="d">MCP 서버의 OAuth를 다루는 6편의 목록과 읽는 순서.</span></a></li>
+  <li><a href="oauth/01-role-scope-oauthproxy.html"><span class="n">1</span><span class="t">role과 scope, 그리고 fastmcp OAuthProxy</span><span class="d">role과 scope의 흐름, MCP 권한 스펙의 PRM·CIMD·DCR, 프록시가 바꾸는 것.</span></a></li>
+  <li><a href="oauth/02-jwks-introspection.html"><span class="n">2</span><span class="t">JWKS와 introspection</span><span class="d">서명의 두 방식, 두 검증 방법의 차이, 취소 반영 시점.</span></a></li>
+  <li><a href="oauth/03-jwt-idp-token.html"><span class="n">3</span><span class="t">JWT와 IdP 토큰의 구성</span><span class="d">JWT 구조와 등록 claim, access·ID·refresh token, IdP별 claim.</span></a></li>
+  <li><a href="oauth/04-issuer-audience-jwks-uri.html"><span class="n">4</span><span class="t">issuer, audience, jwks_uri</span><span class="d">세 설정 값의 뜻과 비교 방식, 키 교체와 캐시, fastmcp JWTVerifier의 동작.</span></a></li>
+  <li><a href="oauth/05-id-jag.html"><span class="n">5</span><span class="t">ID-JAG</span><span class="d">여러 MCP 서버의 로그인을 IdP 한 번으로 줄이는 흐름과 token exchange.</span></a></li>
+  <li><a href="oauth/06-platform-auth-flow.html"><span class="n">6</span><span class="t">우리 플랫폼의 MCP 인증 흐름</span><span class="d">프록시와 IdP의 역할, 로그인과 MCP 요청 순서도, ID-JAG와 비교.</span></a></li>
+</ul>
+
+<h2>ToolHive</h2>
+<ul class="entries">
+  <li><a href="toolhive/index.html"><span class="n">0</span><span class="t">ToolHive 학습 목차</span><span class="d">ToolHive를 기초부터 내부 구조까지 다루는 10편의 목록과 읽는 순서.</span></a></li>
+  <li><a href="toolhive/01-overview-first-run.html"><span class="n">1</span><span class="t">ToolHive 개요와 첫 실행</span><span class="d">ToolHive가 푸는 문제, 구성 요소 지도, 배포 모드, 첫 실행.</span></a></li>
+  <li><a href="toolhive/02-run-model-proxy.html"><span class="n">2</span><span class="t">실행 모델: workload, transport, proxy</span><span class="d">workload 상태, RunConfig, transport별 proxy 구현, 원격 서버.</span></a></li>
+  <li><a href="toolhive/03-isolation-secret.html"><span class="n">3</span><span class="t">격리와 secret, 공급망 보안</span><span class="d">권한 프로필, 네트워크 격리, 컨테이너 보안 기본값, secret, 이미지 검증.</span></a></li>
+  <li><a href="toolhive/04-registry-group-client.html"><span class="n">4</span><span class="t">registry, 그룹, 클라이언트 설정</span><span class="d">registry 형식, registry server, 그룹, 클라이언트 설정 편집.</span></a></li>
+  <li><a href="toolhive/05-authn-authz.html"><span class="n">5</span><span class="t">인증과 인가</span><span class="d">access token 검증, 내장 인가 서버, 나가는 인증, Cedar 인가.</span></a></li>
+  <li><a href="toolhive/06-observability-operations.html"><span class="n">6</span><span class="t">관측, 감사, 사용 제한</span><span class="d">middleware 순서, trace와 metric, 감사 로그, 사용 제한, webhook.</span></a></li>
+  <li><a href="toolhive/07-kubernetes-operator.html"><span class="n">7</span><span class="t">Kubernetes operator</span><span class="d">controller, CRD 카탈로그, MCPServer reconcile, 운영.</span></a></li>
+  <li><a href="toolhive/08-vmcp.html"><span class="n">8</span><span class="t">vMCP와 optimizer</span><span class="d">backend 발견, 집계와 이름 충돌, 세션, composite tool, optimizer.</span></a></li>
+  <li><a href="toolhive/09-skill-plugin.html"><span class="n">9</span><span class="t">skill과 plugin</span><span class="d">skill 배포 흐름, lock file과 신뢰 모델, AI plugin 수명 주기.</span></a></li>
+  <li><a href="toolhive/10-platform-comparison.html"><span class="n">10</span><span class="t">우리 MCP 플랫폼과 비교</span><span class="d">구성 요소 대응, Kubernetes 객체 비교, 인증과 관측의 차이.</span></a></li>
+  <li><a href="toolhive/vs-agentgateway.html"><span class="n">+</span><span class="t">ToolHive와 agentgateway 비교</span><span class="d">MCP gateway와 AI gateway의 차이, 기능별 비교와 선택 기준.</span></a></li>
+</ul>
+
+<h2>AWS</h2>
+<ul class="entries">
+  <li><a href="aws/eks-access.html"><span class="n">1</span><span class="t">EKS 클러스터 접속</span><span class="d">kubectl이 role을 assume해서 EKS에 붙는 경로와 자주 겪는 실패.</span></a></li>
+</ul>
+
+<footer>예시 상황은 설명용으로 만든 것이며 실제 측정 사례가 아니다. 도구와 모델의 세부 사항은 공식 문서에서 확인한다.</footer>
+</div>
 </body>
 </html>

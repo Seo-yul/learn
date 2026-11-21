@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EKS 클러스터 접속</title>
+<link rel="stylesheet" href="../assets/learn.css">
+</head>
+<body>
+<div class="masthead"><div class="bar"><a class="brand" href="../index.html">learn</a><span class="crumb">AWS</span></div></div>
+<div class="wrap">
+
+<header>
+  <h1>EKS 클러스터 접속</h1>
+  <p class="kicker">AWS 학습 · 2026-10-28 작성</p>
+  <p>이 문서는 내 PC의 kubectl이 대상 클러스터에 붙는 경로를 다루고, 그 경로가 끊기는 경우와 고치는 방법도 함께 정리한다.</p>
+  <p>대상은 계정 <code>111122223333</code>의 EKS 클러스터 <code>my-cluster</code>(리전 <code>ap-northeast-2</code>)이고, dev와 QA가 이 클러스터에 함께 있다.</p>
+</header>
+
+<div class="box key">
+  <span class="label">한 문장 요약</span>
+  <p>내 IAM user에는 클러스터 권한이 없어서, kubectl은 매번 role <code>ClusterAccessRole</code>을 assume해서 EKS 토큰을 만든다. 그래서 kubeconfig에 이 role이 빠지면 Unauthorized가 난다.</p>
+</div>
+
+<nav class="toc">
+  <b>목차</b>
+  <ol start="0">
+    <li><a href="#s0">용어집</a></li>
+    <li><a href="#s1">접속 경로 한눈에 보기</a></li>
+    <li><a href="#s2">단계별 동작</a></li>
+    <li><a href="#s3">kubeconfig 만들기</a></li>
+    <li><a href="#s4">상태 확인 명령</a></li>
+    <li><a href="#s5">자주 겪는 실패</a></li>
+    <li><a href="#s6">클러스터 권한을 주는 방법</a></li>
+    <li><a href="#s7">반대 방향: IRSA와 Pod Identity</a></li>
+    <li><a href="#s8">자가 점검 문제</a></li>
+    <li><a href="#s9">참고 자료와 확인 범위</a></li>
+  </ol>
+</nav>
+
+<h2 id="s0">0. 용어집</h2>
+<p>이 문서에서는 아래 용어를 표에 적은 뜻으로만 쓴다.</p>
+<div class="tbl"><table>
+<tr><th>용어</th><th>이 문서에서의 뜻</th></tr>
+<tr><td>IAM user</td><td>사람에게 붙은 AWS 신원. 이 문서에서는 <code>arn:aws:iam::111122223333:user/me</code>다.</td></tr>
+<tr><td>role</td><td>권한을 묶어 둔 AWS 신원. 장기 key가 없다. 이 문서에서는 <code>ClusterAccessRole</code>이다.</td></tr>
+<tr><td>assume</td><td>IAM user가 STS에 요청해서 role의 임시 자격 증명을 받는 일.</td></tr>
+<tr><td>STS</td><td>임시 자격 증명을 발급하는 AWS 서비스. assume 요청을 처리한다.</td></tr>
+<tr><td>trust policy</td><td>role에 붙은 정책. 누가 이 role을 assume할 수 있는지 정한다.</td></tr>
+<tr><td>임시 자격 증명</td><td>STS가 돌려주는 세 값. access key, secret, session token이다. 정해진 시간 뒤 만료된다.</td></tr>
+<tr><td>AWS 프로필</td><td><code>~/.aws/config</code>의 <code>[profile 이름]</code> 한 묶음. aws CLI는 이 묶음의 설정으로 요청한다. 지금 쓰는 이름은 <code>me</code>다.</td></tr>
+<tr><td>로그인 세션</td><td><code>aws login --profile me</code>가 만든 자격 증명. IAM user 신원이다. 만료되면 다시 로그인해야 한다.</td></tr>
+<tr><td>EKS 토큰</td><td>kubectl이 쿠버네티스 API에 내는 인증 값. <code>aws eks get-token</code>이 만든다. 이 문서에서 "토큰"은 이 값만 뜻한다.</td></tr>
+<tr><td>kubeconfig</td><td>kubectl 접속 설정 파일. 이 문서에서는 <code>~/.kube/my-cluster</code>다.</td></tr>
+<tr><td>context</td><td>kubeconfig에서 클러스터와 user 항목을 묶은 이름. 지금 쓰는 이름은 <code>my-cluster</code>다.</td></tr>
+<tr><td>user 항목</td><td>kubeconfig 안의 인증 설정. EKS 토큰을 만드는 명령과 그 명령에 줄 인자를 담는다. IAM user와 다른 것이다.</td></tr>
+<tr><td>access entry</td><td>EKS가 클러스터에 들어올 수 있는 IAM 신원을 기록한 항목.</td></tr>
+<tr><td>access policy</td><td>access entry에 연결하는 쿠버네티스 권한 묶음. 예: <code>AmazonEKSClusterAdminPolicy</code>.</td></tr>
+<tr><td>클러스터 권한</td><td>쿠버네티스 API에서 할 수 있는 일. IAM 권한과 따로 정해진다.</td></tr>
+</table></div>
+
+<h2 id="s1">1. 접속 경로 한눈에 보기</h2>
+<p>아래 그림은 kubectl 명령 하나가 클러스터에 닿기까지의 경로다. 실선은 정상 경로이고, 점선은 role이 빠졌을 때의 경로다.</p>
+<figure class="fig">
+<div class="scroll">
+<svg viewBox="0 0 760 360" width="760" height="360" role="img" aria-label="kubectl이 role을 assume해서 EKS에 접속하는 경로">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-head"/></marker>
+    <marker id="ahw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-head-w"/></marker>
+  </defs>
+  <rect x="20" y="30" width="180" height="70" rx="10" class="d-box"/>
+  <text x="110" y="58" text-anchor="middle" font-weight="600">kubectl</text>
+  <text x="110" y="80" text-anchor="middle" class="d-m" font-size="12">kubeconfig의 user 항목 실행</text>
+
+  <rect x="20" y="150" width="180" height="70" rx="10" class="d-box"/>
+  <text x="110" y="178" text-anchor="middle" font-weight="600">aws eks get-token</text>
+  <text x="110" y="200" text-anchor="middle" class="d-m" font-size="12">AWS 프로필 me</text>
+
+  <rect x="290" y="150" width="190" height="70" rx="10" class="d-acc"/>
+  <text x="385" y="178" text-anchor="middle" font-weight="600">STS AssumeRole</text>
+  <text x="385" y="200" text-anchor="middle" class="d-m" font-size="12">trust policy 확인</text>
+
+  <rect x="570" y="150" width="170" height="70" rx="10" class="d-acc"/>
+  <text x="655" y="178" text-anchor="middle" font-weight="600">role 신원</text>
+  <text x="655" y="200" text-anchor="middle" class="d-m" font-size="12">임시 자격 증명</text>
+
+  <rect x="570" y="270" width="170" height="70" rx="10" class="d-ok"/>
+  <text x="655" y="298" text-anchor="middle" font-weight="600">EKS API</text>
+  <text x="655" y="320" text-anchor="middle" class="d-m" font-size="12">access entry 있음</text>
+
+  <rect x="290" y="270" width="190" height="70" rx="10" class="d-no"/>
+  <text x="385" y="298" text-anchor="middle" font-weight="600">EKS API</text>
+  <text x="385" y="320" text-anchor="middle" class="d-w" font-size="12">Unauthorized</text>
+
+  <line x1="110" y1="100" x2="110" y2="148" class="d-line" marker-end="url(#ah)"/>
+  <line x1="200" y1="185" x2="288" y2="185" class="d-line" marker-end="url(#ah)"/>
+  <text x="244" y="175" text-anchor="middle" class="d-m" font-size="11">① --role</text>
+  <line x1="480" y1="185" x2="568" y2="185" class="d-line" marker-end="url(#ah)"/>
+  <text x="524" y="175" text-anchor="middle" class="d-m" font-size="11">②</text>
+  <line x1="655" y1="220" x2="655" y2="268" class="d-line" marker-end="url(#ah)"/>
+  <text x="668" y="249" class="d-m" font-size="11">③ EKS 토큰</text>
+  <path d="M110,220 L110,305 L288,305" class="d-dash" marker-end="url(#ahw)"/>
+  <text x="120" y="292" class="d-w" font-size="11">role 없음: IAM user 신원 토큰</text>
+</svg>
+</div>
+<figcaption>kubectl은 명령마다 user 항목을 실행해서 EKS 토큰을 얻는데, role이 있으면 role 신원으로, 없으면 IAM user 신원으로 토큰이 만들어진다.</figcaption>
+</figure>
+
+<h2 id="s2">2. 단계별 동작</h2>
+<p>kubectl 명령 하나는 다음 순서로 처리된다.</p>
+<ol>
+  <li>kubectl이 kubeconfig의 user 항목을 읽는다. 이 항목에는 <code>aws eks get-token</code>을 실행하라고 적혀 있다.</li>
+  <li>aws CLI가 AWS 프로필 <code>me</code>의 로그인 세션을 읽는데, 이 신원은 IAM user다.</li>
+  <li>user 항목에 role이 있으면, aws CLI가 STS에 그 role의 assume을 요청한다.</li>
+  <li>STS가 role의 trust policy를 확인하고, 허용되면 임시 자격 증명을 돌려준다.</li>
+  <li>aws CLI가 임시 자격 증명으로 서명한 EKS 토큰을 만들고, kubectl은 이 토큰을 요청에 담는다.</li>
+  <li>EKS가 토큰의 신원을 access entry와 비교한다. 이 role에는 cluster admin 권한이 연결돼 있다.</li>
+</ol>
+<p>EKS가 보는 신원은 <code>arn:aws:sts::111122223333:assumed-role/ClusterAccessRole/EKSGetTokenAuth</code>인데, 끝의 <code>EKSGetTokenAuth</code>는 aws CLI가 붙이는 role 세션 이름이다.</p>
+<div class="box key">
+  <p>3단계가 빠지면 토큰이 IAM user 신원으로 만들어지는데, IAM user에는 access entry가 없어서 6단계에서 거절된다.</p>
+</div>
+
+<h2 id="s3">3. kubeconfig 만들기</h2>
+<p>kubeconfig를 처음 만들거나 다시 만들 때는 다음 순서로 실행한다.</p>
+<ol>
+  <li>로그인 세션을 만든다.
+<pre><code>aws login --profile me</code></pre></li>
+  <li>기존 kubeconfig를 백업한다.
+<pre><code>cp ~/.kube/my-cluster ~/.kube/my-cluster.bak.$(date +%Y%m%d)</code></pre></li>
+  <li>role과 context 이름을 넣어 kubeconfig를 만든다. <code>--role-arn</code>과 <code>--alias</code>는 빼면 안 된다.
+<pre><code>aws eks update-kubeconfig --name my-cluster --region ap-northeast-2 \
+  --profile me \
+  --role-arn arn:aws:iam::111122223333:role/ClusterAccessRole \
+  --kubeconfig ~/.kube/my-cluster --alias my-cluster</code></pre></li>
+  <li>클러스터 ARN 이름의 context가 남아 있으면 지우고, <code>my-cluster</code>를 기본 context로 고른다.
+<pre><code>export KUBECONFIG=~/.kube/my-cluster
+kubectl config delete-context arn:aws:eks:ap-northeast-2:111122223333:cluster/my-cluster
+kubectl config use-context my-cluster</code></pre></li>
+  <li>4장의 명령으로 접속을 확인한다.</li>
+</ol>
+<p>3번 명령이 만든 user 항목은 kubectl을 실행할 때마다 <code>AWS_PROFILE=me</code>로 <code>aws eks get-token --cluster-name my-cluster --role &lt;role ARN&gt;</code>을 실행한다.</p>
+
+<h3>role 프로필을 따로 두는 방법</h3>
+<p><code>--role-arn</code>을 매번 적는 대신 role을 AWS 프로필에 넣어 둘 수도 있다. 아래 묶음을 <code>~/.aws/config</code>에 더하면 된다.</p>
+<pre><code>[profile my-cluster]
+role_arn = arn:aws:iam::111122223333:role/ClusterAccessRole
+source_profile = me
+region = ap-northeast-2</code></pre>
+<p>이 프로필을 쓰면 aws CLI가 <code>me</code>의 로그인 세션으로 role을 assume하므로, kubeconfig는 아래 명령으로 만든다.</p>
+<pre><code>aws eks update-kubeconfig --name my-cluster --profile my-cluster \
+  --kubeconfig ~/.kube/my-cluster --alias my-cluster</code></pre>
+<p>이 방법은 이 PC에서 아직 시험하지 않았고, 9장의 확인 범위에 적어 두었다.</p>
+
+<h2 id="s4">4. 상태 확인 명령</h2>
+<div class="tbl"><table>
+<tr><th>확인할 것</th><th>명령</th><th>정상 결과</th></tr>
+<tr><td>로그인 세션</td><td><code>aws sts get-caller-identity --profile me</code></td><td><code>…:user/me</code>. 이 결과는 IAM user 신원이라 정상이다.</td></tr>
+<tr><td>클러스터가 보는 신원</td><td><code>kubectl auth whoami</code></td><td><code>…:assumed-role/ClusterAccessRole/EKSGetTokenAuth</code></td></tr>
+<tr><td>context 목록</td><td><code>kubectl config get-contexts</code></td><td><code>my-cluster</code> 하나에 <code>*</code> 표시</td></tr>
+<tr><td>user 항목의 role</td><td><code>kubectl config view -o jsonpath='{.users[0].user.exec.args}'</code></td><td>인자 목록에 <code>--role</code>과 role ARN이 있다.</td></tr>
+<tr><td>클러스터 권한</td><td><code>kubectl get ns app-dev app-qa</code></td><td>두 namespace가 <code>Active</code></td></tr>
+</table></div>
+
+<h2 id="s5">5. 자주 겪는 실패</h2>
+<p>아래 표의 앞 두 줄은 2026-10-28에 실제로 겪은 경우다.</p>
+<div class="tbl"><table>
+<tr><th>증상</th><th>원인</th><th>조치</th></tr>
+<tr><td><code>the server has asked for the client to provide credentials</code></td><td><code>update-kubeconfig</code>를 <code>--role-arn</code> 없이 실행했다. 그래서 user 항목이 role 없는 설정으로 바뀌었고, 기존 <code>my-cluster</code> context도 사라졌다.</td><td>3장을 처음부터 다시 실행한다.</td></tr>
+<tr><td><code>You must be logged in to the server (Unauthorized)</code></td><td>AWS 프로필 <code>me</code>를 새로 만들었는데, 그 프로필에는 region과 output만 있다. 이 상태에서 <code>--profile me</code>만 주고 kubeconfig를 만들었다.</td><td>3장의 3번 명령에 <code>--role-arn</code>을 넣어 다시 만든다.</td></tr>
+<tr><td><code>Your session has expired. Please reauthenticate using 'aws login'</code></td><td>로그인 세션이 만료됐다. kubeconfig는 정상이다.</td><td><code>aws login --profile me</code>를 다시 실행한다.</td></tr>
+<tr><td><code>The config profile (default) could not be found</code></td><td>user 항목이나 명령이 <code>default</code> 프로필을 찾는다. 지금 이 PC에는 <code>default</code> 프로필이 없다.</td><td><code>--profile me</code>로 kubeconfig를 다시 만든다.</td></tr>
+</table></div>
+<div class="box warn">
+  <p><code>update-kubeconfig</code>는 user 항목 이름을 클러스터 ARN으로 정하기 때문에, 같은 클러스터로 다시 실행하면 기존 user 항목을 덮어쓴다. role을 빼고 한 번만 실행해도 접속이 끊긴다.</p>
+</div>
+
+<h2 id="s6">6. 클러스터 권한을 주는 방법</h2>
+<p>IAM 신원에 클러스터 권한을 주는 방법은 세 가지다. 이 클러스터의 인증 모드는 <code>API_AND_CONFIG_MAP</code>이라서 앞의 두 방법을 모두 쓸 수 있다.</p>
+<div class="tbl"><table>
+<tr><th>방법</th><th>동작</th><th>지금 상태</th></tr>
+<tr><td>access entry</td><td>EKS API로 IAM 신원을 등록하고 access policy를 연결한다. 범위는 클러스터 전체나 namespace로 정한다.</td><td>role <code>ClusterAccessRole</code>에 <code>AmazonEKSClusterAdminPolicy</code>가 연결돼 있다.</td></tr>
+<tr><td><code>aws-auth</code> ConfigMap</td><td><code>kube-system/aws-auth</code>의 <code>mapUsers</code>·<code>mapRoles</code>에 IAM ARN과 쿠버네티스 그룹을 적는다.</td><td>예전 방식이다. 이 문서는 내용을 확인하지 않았다.</td></tr>
+<tr><td>role assume</td><td>access entry가 있는 role을 assume해서 들어간다. 클러스터 설정은 바꾸지 않는다.</td><td>지금 쓰는 방식이다. IAM user <code>me</code>는 이 role을 assume할 수 있다.</td></tr>
+</table></div>
+
+<h3>IAM user에 access entry를 직접 줄 때</h3>
+<p>role 없이 IAM user로 바로 들어가려면 아래 두 명령이 필요하다. 이 명령은 공유 클러스터의 권한을 바꾸므로 클러스터 관리자와 먼저 정해야 한다.</p>
+<pre><code>aws eks create-access-entry --cluster-name my-cluster \
+  --principal-arn arn:aws:iam::111122223333:user/me --type STANDARD
+aws eks associate-access-policy --cluster-name my-cluster \
+  --principal-arn arn:aws:iam::111122223333:user/me \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy \
+  --access-scope type=namespace,namespaces=app-dev,app-qa</code></pre>
+<p>실행하는 신원에는 <code>eks:CreateAccessEntry</code>와 <code>eks:AssociateAccessPolicy</code> IAM 권한이 있어야 한다.</p>
+
+<div class="box ok">
+  <span class="label">추천</span>
+  <p>role assume을 그대로 쓰기를 추천한다. 클러스터 권한이 role 한 곳에 모여 있어서 회수와 감사가 쉽고, 개인마다 access entry를 두면 관리할 곳이 사람 수만큼 늘어나기 때문이다.</p>
+  <p>직접 접근이 꼭 필요하면 namespace 범위의 <code>AmazonEKSEditPolicy</code>처럼 좁게 주기를 추천한다. cluster admin은 노드와 모든 Secret까지 다룰 수 있기 때문이다.</p>
+</div>
+
+<h2 id="s7">7. 반대 방향: IRSA와 Pod Identity</h2>
+<p>6장은 사람이 쿠버네티스 API에 들어오는 방법이다. IRSA와 Pod Identity는 방향이 반대여서, 클러스터 안의 파드가 AWS API를 부를 때 쓴다.</p>
+<div class="tbl"><table>
+<tr><th>방법</th><th>동작</th></tr>
+<tr><td>IRSA</td><td>관리자가 클러스터의 OIDC provider를 IAM에 등록하고, ServiceAccount에 <code>eks.amazonaws.com/role-arn</code> annotation을 단다. 그러면 그 ServiceAccount를 쓰는 파드가 그 role로 AWS API를 부른다.</td></tr>
+<tr><td>EKS Pod Identity</td><td>관리자가 클러스터에 Pod Identity Agent add-on을 설치하고, <code>aws eks create-pod-identity-association</code>으로 ServiceAccount와 role을 묶는다. OIDC provider는 등록하지 않는다.</td></tr>
+</table></div>
+<p>예를 들어 studio 파드가 정적 key 없이 S3를 쓰려면 이 방법이 필요하다. 두 방법 모두 내 kubectl 접속과는 관계가 없다.</p>
+
+<h2 id="s8">8. 자가 점검 문제</h2>
+<p>먼저 답을 생각해 본 다음 펼쳐서 확인한다.</p>
+<details><summary>Q1. <code>aws eks update-kubeconfig --name my-cluster --region ap-northeast-2</code>만 실행했다. kubectl이 거절된다. 왜인가?</summary>
+<p>이 명령에는 role이 없어서 EKS 토큰이 IAM user 신원으로 만들어진다. IAM user <code>me</code>에는 access entry가 없으므로 EKS가 이 토큰을 거절한다.</p></details>
+<details><summary>Q2. <code>aws sts get-caller-identity --profile me</code>가 <code>user/me</code>를 보여 준다. 설정이 잘못된 것인가?</summary>
+<p>잘못된 것이 아니다. 이 명령은 AWS 프로필의 신원을 보여 주는데, 프로필 <code>me</code>는 IAM user 신원이 맞다. role은 kubeconfig의 user 항목이 EKS 토큰을 만들 때 assume하므로, 클러스터가 보는 신원은 <code>kubectl auth whoami</code>로 확인한다.</p></details>
+<details><summary>Q3. kubeconfig는 정상인데 kubectl이 "session has expired"를 낸다. 무엇을 해야 하나?</summary>
+<p><code>aws login --profile me</code>를 다시 실행해야 한다. 로그인 세션이 만료되면 aws CLI가 assume을 요청하지 못하기 때문이다. kubeconfig는 다시 만들지 않아도 된다.</p></details>
+<details><summary>Q4. IRSA를 설정하면 내 kubectl 접속 문제가 풀리나?</summary>
+<p>풀리지 않는다. IRSA는 파드가 AWS API를 부를 때 쓰는 방법이고, 사람이 쿠버네티스 API에 들어오는 권한은 access entry나 <code>aws-auth</code> ConfigMap이 정한다.</p></details>
+<details><summary>Q5. <code>update-kubeconfig</code>를 두 번 실행했다. 처음에는 <code>--role-arn</code>을 넣었고 두 번째에는 뺐다. 결과는?</summary>
+<p>user 항목 이름이 클러스터 ARN 하나로 같아서 두 번째 실행이 user 항목을 덮어쓴다. 그래서 role이 빠진 설정만 남고 접속이 끊긴다.</p></details>
+<details><summary>Q6. IAM user <code>me</code>에 access entry를 직접 주면 무엇이 좋아지고 무엇이 나빠지나?</summary>
+<p>좋아지는 점은 role 없이 바로 접속할 수 있다는 것 하나다. 나빠지는 점은 관리할 곳이 늘어나는 것인데, 사람마다 access entry가 생기므로 회수할 때 빠뜨릴 가능성이 있다. 그래서 6장은 role assume을 추천한다.</p></details>
+
+<h2 id="s9">9. 참고 자료와 확인 범위</h2>
+<ul>
+  <li>AWS EKS User Guide의 Access entries 절과 Access policies 절.</li>
+  <li>AWS EKS User Guide의 IAM roles for service accounts 절.</li>
+  <li>AWS EKS User Guide의 EKS Pod Identity 절.</li>
+  <li>AWS CLI Command Reference의 <code>aws eks update-kubeconfig</code>, <code>aws eks get-token</code>, <code>aws login</code>.</li>
+  <li>AWS CLI User Guide의 role 프로필 절(<code>role_arn</code>, <code>source_profile</code>).</li>
+</ul>
+<div class="box warn" id="unchecked">
+  <p>다음은 이 PC와 클러스터에서 직접 확인했다.</p>
+  <ul>
+    <li>2026-10-28: 3장 명령으로 만든 kubeconfig의 <code>kubectl auth whoami</code> 결과와 namespace 조회.</li>
+    <li>2026-10-28: 5장 표의 오류 문구 네 가지.</li>
+    <li>2026-10-28: AWS 프로필 <code>me</code>의 신원이 IAM user <code>me</code>라는 점.</li>
+    <li>2026-10-26: 인증 모드가 <code>API_AND_CONFIG_MAP</code>이라는 점.</li>
+    <li>2026-10-26: IAM user <code>me</code>에 access entry가 없다는 점.</li>
+    <li>2026-10-26: role에 <code>AmazonEKSClusterAdminPolicy</code>가 연결된 점.</li>
+  </ul>
+  <p>다음은 확인하지 않았다.</p>
+  <ul>
+    <li>role <code>ClusterAccessRole</code>의 trust policy 원문. MFA를 요구하는지도 모른다.</li>
+    <li>3장의 role 프로필 방법. 이 PC에서 시험하지 않았다.</li>
+    <li>로그인 세션, 임시 자격 증명, EKS 토큰의 유효 시간.</li>
+    <li>이 클러스터의 <code>aws-auth</code> ConfigMap 내용과 IRSA·Pod Identity 설정 여부.</li>
+  </ul>
+</div>
+
+<footer>2026-10-28 작성.</footer>
+</div>
+</body>
+</html>

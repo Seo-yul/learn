@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JWKS와 introspection</title>
+<link rel="stylesheet" href="../assets/learn.css">
+</head>
+<body>
+<div class="masthead"><div class="bar"><a class="brand" href="../index.html">learn</a><span class="crumb"><a href="index.html">OAuth</a></span></div></div>
+<div class="wrap">
+
+<header>
+  <h1>JWKS와 introspection</h1>
+  <p class="kicker">OAuth 학습 2편 · 2026-10-14 작성</p>
+  <p>리소스 서버가 토큰을 검증하는 두 방법을 살펴보고, 우리 MCP 서버가 두 방법을 어디에 쓰는지 다룬다.</p>
+  <p>1편 <a href="01-role-scope-oauthproxy.html">"role과 scope, 그리고 OAuthProxy"</a>의 프록시 구조를 안다고 가정한다.</p>
+</header>
+
+<div class="box key">
+  <span class="label">한 문장 요약</span>
+  <p>JWKS 방식에서는 리소스 서버가 공개키로 서명을 직접 검증하고, introspection 방식에서는 리소스 서버가 IdP에게 토큰 상태를 묻는다. 앞의 방식은 빠르고, 뒤의 방식은 취소를 바로 반영한다.</p>
+</div>
+
+<nav class="toc">
+  <b>목차</b>
+  <ol>
+    <li><a href="#s0">용어집</a></li>
+    <li><a href="#s1">리소스 서버가 따지는 네 가지</a></li>
+    <li><a href="#s2">서명의 두 방식</a></li>
+    <li><a href="#s3">JWKS</a></li>
+    <li><a href="#s4">introspection</a></li>
+    <li><a href="#s5">두 방식 비교</a></li>
+    <li><a href="#s6">취소가 반영되는 시점</a></li>
+    <li><a href="#s7">IdP별 검증 방법</a></li>
+    <li><a href="#s8">우리 MCP 서버의 두 검증 지점</a></li>
+    <li><a href="#s9">자가 점검 문제</a></li>
+    <li><a href="#s10">참고 자료</a></li>
+  </ol>
+</nav>
+
+<h2 id="s0">0. 용어집</h2>
+<p>이 문서는 아래 용어를 아래 뜻으로만 쓴다.</p>
+<div class="tbl"><table>
+<tr><th>용어</th><th>이 문서에서의 뜻</th></tr>
+<tr><td>리소스 서버</td><td>토큰을 받고 API를 제공하는 서버. MCP 서버가 여기에 해당한다.</td></tr>
+<tr><td>IdP</td><td>사용자 계정을 가지고 토큰을 발급하는 외부 서비스. 예: Okta, Keycloak.</td></tr>
+<tr><td>프록시</td><td>fastmcp의 OAuthProxy. MCP 서버 안에서 인가 서버 역할을 한다.</td></tr>
+<tr><td>IdP 토큰</td><td>IdP가 발급한 토큰. 프록시 구조에서는 MCP 서버 쪽 저장소에만 있다.</td></tr>
+<tr><td>fastmcp 토큰</td><td>프록시가 발급해서 MCP 클라이언트에게 주는 JWT.</td></tr>
+<tr><td>검증</td><td>토큰이나 서명이 유효한지 판정하는 일.</td></tr>
+<tr><td>런타임</td><td>우리 MCP 서버 이미지의 코드.</td></tr>
+<tr><td>서명</td><td>발급자가 서명 키로 토큰 내용에서 계산한 값. 내용이 바뀌지 않았다는 증거가 된다.</td></tr>
+<tr><td>개인키, 공개키</td><td>비대칭 서명 키 한 쌍. 개인키로 서명하고 공개키로 검증한다. 개인키는 발급자만 가진다.</td></tr>
+<tr><td>대칭키</td><td>서명과 검증에 같은 값을 쓰는 서명 키.</td></tr>
+<tr><td>JWT</td><td>서명이 붙은 토큰 형식. 구조는 3편에서 다룬다.</td></tr>
+<tr><td>불투명 토큰</td><td>리소스 서버가 내용을 읽지 못하는 토큰 문자열. 뜻은 발급한 IdP만 안다.</td></tr>
+<tr><td>JWKS</td><td>JSON Web Key Set. IdP가 공개하는 공개키 목록(RFC 7517).</td></tr>
+<tr><td>kid</td><td>key ID. 토큰을 어느 서명 키로 서명했는지 가리키는 값.</td></tr>
+<tr><td>introspection</td><td>리소스 서버가 IdP에게 토큰 상태를 묻는 방법(RFC 7662).</td></tr>
+<tr><td>취소</td><td>revoke. 만료 전에 토큰을 무효로 만드는 일.</td></tr>
+<tr><td>키 캐시</td><td>리소스 서버가 받아 둔 JWKS.</td></tr>
+<tr><td>검증 캐시</td><td>리소스 서버가 introspection 결과를 잠시 저장해 두는 곳.</td></tr>
+<tr><td>TTL</td><td>캐시 항목을 유지하는 시간.</td></tr>
+<tr><td>자격 증명</td><td>리소스 서버가 IdP에 자신을 증명하는 값. client_id와 client_secret이다.</td></tr>
+</table></div>
+
+<h2 id="s1">1. 리소스 서버가 따지는 네 가지</h2>
+<p>리소스 서버는 토큰을 받으면 네 가지 질문에 답해야 한다.</p>
+<div class="tbl"><table>
+<tr><th>질문</th><th>보는 값</th></tr>
+<tr><td>진짜 IdP가 발급했나?</td><td>서명, 발급자(<code>iss</code>)</td></tr>
+<tr><td>아직 유효한가?</td><td>만료 시각(<code>exp</code>), 취소 여부</td></tr>
+<tr><td>나에게 온 토큰인가?</td><td>대상(<code>aud</code>)</td></tr>
+<tr><td>무엇을 허용하나?</td><td><code>scope</code> 또는 <code>scp</code></td></tr>
+</table></div>
+<p>JWKS와 introspection은 이 질문에 답하는 두 방법이고, 둘의 차이는 답을 누가 내는가에 있다.</p>
+
+<h2 id="s2">2. 서명의 두 방식</h2>
+<div class="tbl"><table>
+<tr><th>방식</th><th>서명하는 키</th><th>검증하는 키</th><th>알고리즘 예</th><th>쓰는 곳</th></tr>
+<tr><td>비대칭</td><td>개인키</td><td>공개키</td><td>RS256, ES256</td><td>IdP 토큰</td></tr>
+<tr><td>대칭</td><td>대칭키</td><td>같은 대칭키</td><td>HS256</td><td>fastmcp 토큰</td></tr>
+</table></div>
+<p>비대칭 방식에서는 공개키가 알려져도 서명을 위조하지 못한다. 반면 대칭 방식에서는 검증하는 쪽도 서명을 만들 수 있어서, 발급자와 검증자가 같을 때만 쓴다.</p>
+
+<h2 id="s3">3. JWKS</h2>
+<p>JWKS는 IdP가 공개하는 공개키 목록이고, 주소는 IdP의 discovery 문서에 있는 <code>jwks_uri</code>다.</p>
+<pre><code>GET https://{Okta 주소}/oauth2/default/.well-known/openid-configuration
+{
+  "issuer": "https://{Okta 주소}/oauth2/default",
+  "jwks_uri": "https://{Okta 주소}/oauth2/default/v1/keys",
+  "introspection_endpoint": "https://{Okta 주소}/oauth2/default/v1/introspect",
+  ...
+}
+
+GET {jwks_uri}
+{
+  "keys": [
+    { "kty": "RSA", "alg": "RS256", "use": "sig", "kid": "k1a2b3", "n": "0vx7…", "e": "AQAB" }
+  ]
+}</code></pre>
+<p>리소스 서버는 다음 순서로 검증한다.</p>
+<ol>
+  <li>JWKS를 받아 키 캐시에 둔다.</li>
+  <li>토큰 header의 <code>kid</code>를 읽는다.</li>
+  <li>키 캐시에서 같은 <code>kid</code>의 공개키를 찾고, 없으면 JWKS를 다시 받는다.</li>
+  <li>그 공개키로 서명을 검증한다. 내용이 한 글자라도 바뀌었으면 실패한다.</li>
+  <li><code>exp</code>, <code>iss</code>, <code>aud</code>, <code>scope</code>를 본다.</li>
+</ol>
+<p>IdP는 서명 키를 때때로 교체하고, 새 토큰의 <code>kid</code>는 새 키를 가리킨다. 그래서 리소스 서버는 모르는 <code>kid</code>를 만나면 JWKS를 다시 받는다.</p>
+<div class="tbl"><table>
+<tr><th>장점</th><th>단점</th></tr>
+<tr><td>요청마다 IdP를 부르지 않는다. 그래서 빠르고 IdP에 부하가 없다.</td><td>취소를 알지 못한다. 서명이 맞고 <code>exp</code>가 남아 있으면 통과한다.</td></tr>
+<tr><td>IdP가 잠시 멈춰도 키 캐시로 검증을 계속한다.</td><td>JWT에만 쓴다. 불투명 토큰에는 쓰지 못한다.</td></tr>
+</table></div>
+
+<h2 id="s4">4. introspection</h2>
+<p>introspection은 리소스 서버가 받은 토큰을 IdP에 보내서 상태를 묻는 방법이다.</p>
+<pre><code>POST https://{Okta 주소}/oauth2/default/v1/introspect
+Authorization: Basic base64(client_id:client_secret)
+Content-Type: application/x-www-form-urlencoded
+
+token=eyJraWQiOi…&amp;token_type_hint=access_token
+
+200 OK
+{
+  "active": true,
+  "scope": "openid profile email",
+  "client_id": "0oa…",
+  "username": "user@example.com",
+  "exp": 1760430000,
+  "sub": "user@example.com",
+  ...
+}</code></pre>
+<p>검증은 다음 순서로 흐른다.</p>
+<ol>
+  <li>리소스 서버가 토큰을 IdP의 introspection 주소로 보내는데, 이 요청은 자격 증명으로 인증한다.</li>
+  <li>IdP가 토큰의 서명, 만료, 취소 여부를 판정한다.</li>
+  <li>IdP가 <code>active</code> 값과 claim을 돌려준다.</li>
+  <li><code>active</code>가 <code>false</code>면 리소스 서버가 요청을 거부한다.</li>
+</ol>
+<p><code>active: false</code> 응답은 이유를 알려 주지 않아서, 만료된 토큰, 취소된 토큰, IdP가 모르는 토큰이 모두 같은 응답을 받는다.</p>
+<div class="tbl"><table>
+<tr><th>장점</th><th>단점</th></tr>
+<tr><td>취소가 바로 반영된다.</td><td>요청마다 네트워크 호출이 생긴다. 지연이 늘고 IdP 부하가 커진다.</td></tr>
+<tr><td>불투명 토큰에도 쓴다.</td><td>IdP가 멈추면 검증도 실패한다.</td></tr>
+<tr><td>리소스 서버가 토큰 형식을 몰라도 된다.</td><td>리소스 서버에도 자격 증명이 필요하다.</td></tr>
+</table></div>
+
+<h2 id="s5">5. 두 방식 비교</h2>
+<div class="tbl"><table>
+<tr><th>구분</th><th>JWKS</th><th>introspection</th></tr>
+<tr><td>판정하는 곳</td><td>리소스 서버</td><td>IdP</td></tr>
+<tr><td>요청당 네트워크 호출</td><td>없다. 키 캐시를 쓴다.</td><td>있다.</td></tr>
+<tr><td>취소 반영</td><td>만료 시각까지 반영되지 않는다.</td><td>바로 반영된다.</td></tr>
+<tr><td>토큰 형식</td><td>JWT만</td><td>JWT와 불투명 토큰</td></tr>
+<tr><td>리소스 서버에 필요한 것</td><td>공개키</td><td>자격 증명</td></tr>
+<tr><td>IdP가 멈췄을 때</td><td>계속 검증한다.</td><td>검증에 실패한다.</td></tr>
+</table></div>
+<p>JWKS만 쓰면서 access token 수명을 짧게 두는 경우도 많은데, 그러면 취소가 반영되지 않는 기간이 짧아진다.</p>
+
+<h2 id="s6">6. 취소가 반영되는 시점</h2>
+<p>관리자가 토큰을 중간에 취소한 경우를 그림으로 비교한다.</p>
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 250" width="760" height="250" role="img" aria-label="검증 방식별 취소 반영 시점 비교">
+    <line class="d-dash" x1="390" y1="40" x2="390" y2="215"/>
+    <line class="d-line" x1="700" y1="40" x2="700" y2="215"/>
+    <text class="d-m" x="200" y="30" font-size="12" text-anchor="middle">발급</text>
+    <text class="d-w" x="390" y="30" font-size="12" text-anchor="middle">취소</text>
+    <text class="d-m" x="700" y="30" font-size="12" text-anchor="middle">만료(exp)</text>
+
+    <text x="10" y="74" font-size="13" font-weight="600">JWKS</text>
+    <rect class="d-ok" x="200" y="56" width="500" height="26" rx="5"/>
+    <text x="545" y="74" font-size="12" text-anchor="middle">만료까지 통과</text>
+
+    <text x="10" y="124" font-size="13" font-weight="600">introspection</text>
+    <rect class="d-ok" x="200" y="106" width="190" height="26" rx="5"/>
+    <rect class="d-no" x="390" y="106" width="310" height="26" rx="5"/>
+    <text x="545" y="124" font-size="12" text-anchor="middle">바로 거부</text>
+
+    <text x="10" y="166" font-size="13" font-weight="600">introspection</text>
+    <text class="d-m" x="10" y="184" font-size="12">+ 검증 캐시</text>
+    <rect class="d-ok" x="200" y="156" width="250" height="26" rx="5"/>
+    <rect class="d-no" x="450" y="156" width="250" height="26" rx="5"/>
+    <text x="420" y="200" font-size="12" text-anchor="middle">최대 TTL</text>
+    <text x="575" y="174" font-size="12" text-anchor="middle">캐시가 끝나면 거부</text>
+
+    <rect class="d-ok" x="200" y="226" width="14" height="14" rx="3"/>
+    <text class="d-m" x="220" y="238" font-size="12">통과</text>
+    <rect class="d-no" x="270" y="226" width="14" height="14" rx="3"/>
+    <text class="d-m" x="290" y="238" font-size="12">거부</text>
+  </svg>
+  </div>
+  <figcaption>그림 1. 같은 토큰을 취소했을 때 검증 방식별로 요청이 막히는 시점. 가로 길이는 비율이 아니다.</figcaption>
+</figure>
+
+<h2 id="s7">7. IdP별 검증 방법</h2>
+<p>어느 방식을 쓸지는 토큰 형식과 코드가 정하고, 같은 IdP라도 코드에 따라 방식이 다르다.</p>
+<div class="tbl"><table>
+<tr><th>IdP</th><th>access token 형식</th><th>검증 방법</th><th>근거</th></tr>
+<tr><td>Okta</td><td>JWT</td><td>우리 런타임은 introspection을 쓴다. JWT라서 JWKS로도 검증할 수 있다.</td><td>런타임의 Okta 토큰 검증 코드</td></tr>
+<tr><td>Keycloak</td><td>JWT</td><td>우리 런타임은 introspection을 쓴다. fastmcp가 제공하는 Keycloak provider는 JWKS를 쓴다.</td><td>런타임의 Keycloak 토큰 검증 코드, fastmcp <code>providers/keycloak.py:62</code></td></tr>
+<tr><td>Google</td><td>불투명 토큰</td><td>fastmcp가 Google tokeninfo 주소를 부른다. introspection과 같은 역할이다. Google은 이 주소를 진단용으로 안내한다.</td><td>fastmcp <code>providers/google.py:117</code></td></tr>
+<tr><td>GitHub</td><td>불투명 토큰</td><td>fastmcp가 GitHub API(<code>/user</code>)를 불러 본다. 호출이 성공하면 유효한 토큰으로 판정한다. GitHub에는 RFC 7662 introspection 주소가 없다.</td><td>fastmcp <code>providers/github.py:106</code></td></tr>
+</table></div>
+
+<h2 id="s8">8. 우리 MCP 서버의 두 검증 지점</h2>
+<p>MCP 서버는 요청 하나에서 토큰을 두 번 검증하는데, 요청이 오면 프록시는 다음 순서로 일한다(fastmcp <code>proxy.py:2135</code>).</p>
+<ol>
+  <li>fastmcp 토큰의 서명을 대칭키로 검증하고 <code>exp</code>, <code>iss</code>, <code>aud</code>도 본다(fastmcp <code>jwt_issuer.py:232</code>).</li>
+  <li>fastmcp 토큰의 <code>jti</code>로 저장된 IdP 토큰을 찾는다.</li>
+  <li>IdP 토큰을 Okta introspection으로 검증하는데, 검증 캐시에 결과가 있으면 그 결과를 쓴다.</li>
+  <li>IdP 토큰에 required_scopes가 모두 있는지 본다.</li>
+  <li>IdP 토큰의 만료가 30초 안으로 다가오면 IdP refresh token으로 새 IdP 토큰을 받는다. 30초는 런타임 기본값이다(런타임의 서버 코드).</li>
+</ol>
+
+<h3>fastmcp 토큰에 JWKS를 쓰지 않는 이유</h3>
+<p>fastmcp 토큰은 프록시가 발급하고 프록시가 검증한다. 발급자와 검증자가 같아서 공개키를 공개할 필요가 없으므로 대칭키(HS256)를 쓴다. 대칭키는 IdP 앱의 client_secret에서 만들고(런타임의 서버 코드), 저장소 암호화 키도 같은 client_secret에서 만든다.</p>
+
+<h3>검증 캐시</h3>
+<p>Okta introspection은 요청마다 네트워크 호출을 만들기 때문에 런타임은 검증 결과를 캐시에 둔다.</p>
+<div class="tbl"><table>
+<tr><th>항목</th><th>값</th><th>근거</th></tr>
+<tr><td>TTL 기본값</td><td>60초. <code>&lt;접두사&gt;_MCP_VERIFY_CACHE_TTL_SECONDS</code>로 바꾼다.</td><td>런타임의 설정 코드</td></tr>
+<tr><td>TTL 상한</td><td>토큰의 남은 수명보다 길어지지 않는다.</td><td>런타임의 Okta 토큰 검증 코드</td></tr>
+<tr><td>검증 캐시 위치</td><td><code>&lt;접두사&gt;_MCP_REDIS_URL</code>이 있으면 Redis를 쓴다. 없으면 프로세스 메모리를 쓴다.</td><td>런타임의 서버 코드</td></tr>
+<tr><td>Okta가 응답하지 않을 때</td><td>검증 실패로 처리한다. 요청은 거부된다.</td><td>런타임의 Okta 토큰 검증 코드</td></tr>
+</table></div>
+<p>그 결과 IdP에서 토큰을 취소해도 최대 60초 동안은 요청이 통과할 가능성이 있다. 검증 캐시는 introspection의 지연과 JWKS의 취소 문제 사이에서 타협한 장치다.</p>
+
+<h2 id="s9">9. 자가 점검 문제</h2>
+<p>먼저 답을 생각해 본 다음 펼쳐서 확인한다.</p>
+<details><summary>Q1. 관리자가 Okta에서 어떤 사용자의 access token과 refresh token을 모두 취소했다. 그 사용자의 MCP 클라이언트는 fastmcp 토큰을 아직 들고 있다. 요청은 언제 막히나?</summary>
+<p>fastmcp 토큰의 서명은 여전히 맞아서 8장 순서의 1단계는 통과한다. 하지만 프록시는 요청마다 IdP 토큰을 Okta introspection으로 다시 검증한다. 검증 캐시에 이전 결과가 남아 있는 동안은 통과하고, 캐시 항목의 TTL이 지나면 Okta가 <code>active: false</code>를 돌려준다. 프록시는 IdP 토큰 만료 30초 전부터만 갱신을 시도하므로 대개는 갱신하지 않고 요청을 거부한다. 그 구간에서 갱신을 시도해도 refresh token이 취소됐으므로 실패한다. 따라서 요청은 취소 뒤 최대 60초 안에 막힌다.</p></details>
+<details><summary>Q2. IdP가 몇 분 동안 응답하지 않는다. JWKS 방식과 introspection 방식의 리소스 서버는 각각 어떻게 되나?</summary>
+<p>JWKS 방식은 키 캐시의 공개키로 계속 검증하므로 새 <code>kid</code>가 나오기 전까지는 영향이 없다. introspection 방식은 검증 캐시에 없는 토큰을 검증하지 못하고, 우리 런타임은 이때 요청을 거부한다.</p></details>
+<details><summary>Q3. fastmcp 토큰을 JWKS로 검증하지 않는 이유는?</summary>
+<p>fastmcp 토큰은 프록시가 발급하고 같은 프록시가 검증한다. 공개키를 다른 서버에 나눠 줄 필요가 없어서 대칭키 하나로 충분하다.</p></details>
+<details><summary>Q4. IdP 앱의 client_secret을 바꾸면 이미 로그인한 사용자는 어떻게 되나?</summary>
+<p>프록시의 대칭키는 client_secret에서 만들기 때문에 client_secret이 바뀌면 대칭키도 바뀐다. 그래서 기존 fastmcp 토큰은 서명 검증에 모두 실패하고, 사용자는 다시 로그인해야 한다. 저장소 암호화 키도 바뀌므로 저장된 등록 정보를 읽지 못할 가능성이 있다. 이 답은 코드만 읽고 추정한 것이고, 실행해서 시험하지는 않았다.</p></details>
+<details><summary>Q5. introspection 요청에 자격 증명이 필요한 이유는?</summary>
+<p>아무나 토큰을 넣어서 유효한지 알아내면 안 되기 때문이다. 인증이 없으면 공격자가 추측한 토큰 값을 대량으로 시험할 수 있는데, RFC 7662는 이 공격을 token scanning이라고 부른다.</p></details>
+<details><summary>Q6. JWKS 방식에서 access token 수명을 짧게 하면 무엇이 좋아지고 무엇이 나빠지나?</summary>
+<p>취소가 반영되지 않는 기간이 짧아진다. 대신 클라이언트가 토큰을 더 자주 갱신해야 하고, 갱신 요청이 늘면 IdP 부하도 늘어난다.</p></details>
+
+<h2 id="s10">10. 참고 자료</h2>
+<ul>
+  <li>RFC 7517, JSON Web Key (JWK). JWK Set의 형식과 <code>kid</code>.</li>
+  <li>RFC 7662, OAuth 2.0 Token Introspection.</li>
+  <li>OpenID Connect Discovery 1.0. <code>jwks_uri</code>를 담은 discovery 문서.</li>
+  <li>RFC 7009, OAuth 2.0 Token Revocation.</li>
+  <li>fastmcp 4.0.3 소스: <code>server/auth/oauth_proxy/proxy.py</code>, <code>server/auth/jwt_issuer.py</code>, <code>server/auth/providers/</code>.</li>
+  <li>MCP 런타임 저장소: Okta와 Keycloak 토큰 검증 코드, 설정 코드, 서버 코드.</li>
+</ul>
+<div class="box warn" id="unchecked">
+  <p>코드 근거는 2026-10-14에 소스를 직접 읽고 확인했고, 다음 내용은 같은 날 원문과 대조했다.</p>
+  <ul>
+    <li>RFC 7517의 JWK Set 형식과 <code>kid</code>의 쓰임</li>
+    <li>RFC 7662의 요청 파라미터, 인증 요구, <code>active: false</code> 규칙</li>
+    <li>OIDC Discovery의 <code>jwks_uri</code></li>
+    <li>Okta introspection의 경로와 클라이언트 인증 요구</li>
+    <li>Google tokeninfo와 GitHub의 토큰 확인 방법</li>
+  </ul>
+  <p>IdP가 서명 키를 교체하는 주기는 대조하지 않았다. 예시 JSON의 값은 설명용으로 만든 값이다.</p>
+</div>
+<p>다음 학습은 <a href="03-jwt-idp-token.html">03편 "JWT와 IdP 토큰의 구성"</a>이다.</p>
+
+<nav class="pager">
+<a class="prev" href="01-role-scope-oauthproxy.html"><span class="k">이전 글</span><span class="t">role과 scope, 그리고 fastmcp OAuthProxy</span></a>
+<a class="next" href="03-jwt-idp-token.html"><span class="k">다음 글</span><span class="t">JWT와 IdP 토큰의 구성</span></a>
+</nav>
+
+<footer>2026-10-14 작성.</footer>
+</div>
+</body>
+</html>

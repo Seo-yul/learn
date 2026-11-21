@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ToolHive와 agentgateway 비교</title>
+<link rel="stylesheet" href="../assets/learn.css">
+</head>
+<body>
+<div class="masthead"><div class="bar"><a class="brand" href="../index.html">learn</a><span class="crumb"><a href="index.html">ToolHive</a></span></div></div>
+<div class="wrap">
+
+<header>
+  <h1>ToolHive와 agentgateway 비교</h1>
+  <p class="kicker">MCP gateway와 AI gateway의 차이 · 2026-10-13 작성</p>
+  <p>이 문서는 2026-10-13에 두 프로젝트의 GitHub 저장소와 공식 문서를 확인해서 썼다.</p>
+  <p>기준 버전은 ToolHive v0.52.0과 agentgateway v1.6.0이다. 두 프로젝트 모두 자주 바뀌기 때문에 실제로 쓰기 전에 공식 문서를 다시 확인해야 한다.</p>
+</header>
+
+<div class="box key">
+  <span class="label">한 문장 요약</span>
+  <p>ToolHive는 MCP 서버를 컨테이너로 실행하고 관리하는 플랫폼이고, agentgateway는 에이전트의 요청을 목적지로 전달하는 프록시다.</p>
+  <p>ToolHive는 MCP만 다루는 대신 MCP 서버의 실행까지 맡는다. agentgateway는 MCP, A2A, LLM 요청을 모두 다루지만, MCP 서버의 실행은 보통 다른 시스템이 맡는다.</p>
+</div>
+
+<nav class="toc">
+  <b>목차</b>
+  <ol start="0">
+    <li><a href="#s0">용어집</a></li>
+    <li><a href="#s1">질문의 전제 확인</a></li>
+    <li><a href="#s2">한눈에 보는 차이</a></li>
+    <li><a href="#s3">요청 경로에서의 위치</a></li>
+    <li><a href="#s4">ToolHive의 구조</a></li>
+    <li><a href="#s5">agentgateway의 구조</a></li>
+    <li><a href="#s6">기능별 비교</a></li>
+    <li><a href="#s7">같은 일을 다르게 하는 부분</a></li>
+    <li><a href="#s8">선택 기준</a></li>
+    <li><a href="#s9">함께 쓰는 구성</a></li>
+    <li><a href="#s10">자가 점검 문제</a></li>
+    <li><a href="#s11">참고 자료</a></li>
+  </ol>
+</nav>
+
+<h2 id="s0">0. 용어집</h2>
+<p>이 문서는 아래 용어를 아래 뜻으로만 쓰고, 같은 대상을 다른 이름으로 부르지 않는다.</p>
+<div class="tbl"><table>
+<tr><th>용어</th><th>이 문서에서의 뜻</th></tr>
+<tr><td>MCP</td><td>Model Context Protocol. 에이전트가 외부 tool을 호출할 때 쓰는 프로토콜.</td></tr>
+<tr><td>MCP 서버</td><td>tool, 리소스, 프롬프트를 MCP로 제공하는 프로그램.</td></tr>
+<tr><td>MCP 클라이언트</td><td>MCP 서버에 연결하는 프로그램. 예: Claude Code, Cursor, VS Code.</td></tr>
+<tr><td>tool</td><td>MCP 서버가 제공하는 함수 하나. 클라이언트는 이름으로 tool을 호출한다.</td></tr>
+<tr><td>transport</td><td>MCP 메시지를 나르는 방식. stdio, SSE, streamable HTTP가 있다.</td></tr>
+<tr><td>stdio</td><td>프로세스의 표준 입력과 표준 출력으로 메시지를 주고받는 transport.</td></tr>
+<tr><td>streamable HTTP</td><td>HTTP로 메시지를 주고받는 transport. SSE는 그 이전 방식이다.</td></tr>
+<tr><td>A2A</td><td>Agent2Agent 프로토콜. 에이전트가 다른 에이전트에게 작업을 맡길 때 쓴다.</td></tr>
+<tr><td>LLM provider</td><td>LLM API를 제공하는 서비스. 예: OpenAI, Anthropic, AWS Bedrock.</td></tr>
+<tr><td>MCP gateway</td><td>MCP 클라이언트와 여러 MCP 서버 사이에 있는 프록시.</td></tr>
+<tr><td>AI gateway</td><td>에이전트와 LLM provider 사이에 있는 프록시.</td></tr>
+<tr><td>집계</td><td>여러 MCP 서버의 tool 목록을 endpoint 하나로 묶는 동작. ToolHive는 aggregation, agentgateway는 multiplexing이라고 부른다.</td></tr>
+<tr><td>endpoint</td><td>클라이언트가 접속하는 URL 하나.</td></tr>
+<tr><td>data plane</td><td>요청을 받아서 목적지로 전달하는 프로세스.</td></tr>
+<tr><td>control plane</td><td>설정을 만들어서 data plane에 보내는 프로세스.</td></tr>
+<tr><td>CRD</td><td>Kubernetes에 새 리소스 종류를 추가하는 정의.</td></tr>
+<tr><td>LLM 토큰</td><td>LLM이 읽고 생성하는 텍스트 단위. 이 문서의 "토큰"은 이 뜻만 가진다.</td></tr>
+<tr><td>access token</td><td>인증에 쓰는 자격 증명. JWT가 대표적이다. LLM 토큰과 다르다.</td></tr>
+<tr><td>token exchange</td><td>gateway가 받은 access token을 백엔드용 access token으로 바꾸는 동작. 표준은 RFC 8693이다.</td></tr>
+<tr><td>인증</td><td>요청한 주체가 누구인지 확인하는 일 (authentication).</td></tr>
+<tr><td>인가</td><td>그 주체에게 동작을 허용할지 정하는 일 (authorization).</td></tr>
+<tr><td>rate limit</td><td>정해진 시간 동안 허용하는 요청 수나 LLM 토큰 수의 상한.</td></tr>
+<tr><td>guardrail</td><td>프롬프트나 응답을 검사해서 막거나 바꾸는 규칙.</td></tr>
+<tr><td>이미지 검증</td><td>컨테이너 이미지의 서명으로 출처를 확인하는 기능. ToolHive의 기능 이름이다.</td></tr>
+</table></div>
+
+<h2 id="s1">1. 질문의 전제 확인</h2>
+<p>질문은 ToolHive를 MCP gateway로, agentgateway를 Solo.io의 AI gateway로 불렀는데, 두 이름은 각각 일부만 맞다.</p>
+<ol>
+  <li><b>ToolHive는 gateway보다 넓다.</b> ToolHive의 중심 기능은 MCP 서버 실행이고, MCP gateway 기능은 vMCP라는 구성 요소 하나가 맡는다.</li>
+  <li><b>agentgateway는 AI gateway보다 넓다.</b> LLM 요청 외에 MCP 요청과 A2A 요청도 전달하며, Linux Foundation은 agentgateway를 "AI-native proxy"라고 소개한다.</li>
+  <li><b>오픈소스 agentgateway는 재단 프로젝트다.</b> Solo.io가 만들어 2025-08-25에 Linux Foundation에 기증했고, 2026-06-04부터는 Agentic AI Foundation(AAIF)이 호스팅한다. Solo.io는 상용판인 Solo Enterprise for agentgateway를 판매한다.</li>
+  <li><b>Stacklok에도 AI Gateway가 있다.</b> 다만 이 제품은 상용판인 Stacklok Enterprise에 들어 있고, 오픈소스 ToolHive에는 없다.</li>
+</ol>
+<div class="box key">
+  <p>이 문서는 오픈소스판끼리 비교하고, 상용판 기능은 따로 표시한다.</p>
+</div>
+
+<h2 id="s2">2. 한눈에 보는 차이</h2>
+<div class="tbl"><table>
+<tr><th>항목</th><th>ToolHive</th><th>agentgateway</th></tr>
+<tr><td>한 줄 정의</td><td class="th-col">MCP 서버를 실행하고 관리하는 플랫폼</td><td class="ag-col">에이전트 트래픽을 전달하는 프록시</td></tr>
+<tr><td>중심 질문</td><td>MCP 서버를 어디서, 어떤 권한으로 실행하는가?</td><td>에이전트의 요청을 어떤 정책으로 전달하는가?</td></tr>
+<tr><td>다루는 프로토콜</td><td>MCP</td><td>MCP, A2A, LLM API, HTTP, gRPC, TCP, TLS</td></tr>
+<tr><td>MCP 서버 실행</td><td>한다. 컨테이너나 Kubernetes pod로 실행한다.</td><td>Kubernetes 모드는 하지 않는다. standalone 모드는 stdio 서버 프로세스만 시작한다.</td></tr>
+<tr><td>MCP gateway 기능</td><td>vMCP 구성 요소</td><td>기본 기능 (MCP multiplexing)</td></tr>
+<tr><td>LLM 트래픽</td><td>오픈소스는 다루지 않는다. 상용 AI Gateway가 다룬다.</td><td>다룬다. 라우팅, failover, LLM 토큰 rate limit, 비용 추적.</td></tr>
+<tr><td>A2A</td><td>지원하지 않는다</td><td>지원한다</td></tr>
+<tr><td>구현 언어</td><td>Go</td><td>proxy는 Rust. Kubernetes controller는 Go.</td></tr>
+<tr><td>만든 곳, 거버넌스</td><td>Stacklok의 회사 프로젝트. Stacklok은 재단 기증 의사를 밝혔다. 재단과 시기는 밝히지 않았다.</td><td>Solo.io가 만들었다. 지금은 Linux Foundation 프로젝트이고 AAIF가 호스팅한다.</td></tr>
+<tr><td>라이선스</td><td>Apache-2.0</td><td>Apache-2.0</td></tr>
+<tr><td>최신 버전</td><td>v0.52.0 (2026-10-12). 1.0 이전이다.</td><td>v1.6.0 (2026-10-02). v1.0은 2026-03-16에 나왔다.</td></tr>
+<tr><td>GitHub star (2026-10-13)</td><td>약 2,300</td><td>약 5,300</td></tr>
+<tr><td>상용판</td><td>Stacklok Enterprise</td><td>Solo Enterprise for agentgateway</td></tr>
+</table></div>
+
+<h2 id="s3">3. 요청 경로에서의 위치</h2>
+<p>두 제품은 요청 경로에서 서로 다른 구간을 맡는다. 그림 1은 ToolHive를, 그림 2는 agentgateway를 보여 준다.</p>
+
+<figure class="fig">
+  <b>그림 1. ToolHive</b>
+  <div class="scroll">
+  <svg viewBox="0 0 780 290" role="img" aria-label="ToolHive 구조: MCP 클라이언트, vMCP, 서버별 proxy, MCP 서버 컨테이너">
+    <defs><marker id="arrA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-head"/></marker></defs>
+    <rect x="10" y="115" width="140" height="60" rx="10" class="s-box"/>
+    <text x="80" y="140" font-size="13" font-weight="700" text-anchor="middle">MCP 클라이언트</text>
+    <text x="80" y="160" font-size="11" text-anchor="middle" class="sub">Claude Code, Cursor</text>
+
+    <rect x="175" y="10" width="595" height="270" rx="14" class="s-th"/>
+    <text x="192" y="34" font-size="13" font-weight="700">ToolHive</text>
+    <text x="260" y="34" font-size="11" class="sub">operator 또는 thv CLI가 관리하는 범위</text>
+
+    <rect x="195" y="115" width="130" height="60" rx="10" class="s-box"/>
+    <text x="260" y="140" font-size="13" font-weight="700" text-anchor="middle">vMCP</text>
+    <text x="260" y="160" font-size="11" text-anchor="middle" class="sub">집계, 인증, 인가</text>
+
+    <g>
+      <rect x="375" y="52" width="120" height="46" rx="8" class="s-box"/>
+      <text x="435" y="72" font-size="12" font-weight="700" text-anchor="middle">proxy</text>
+      <text x="435" y="89" font-size="11" text-anchor="middle" class="sub">미들웨어</text>
+      <rect x="545" y="52" width="205" height="46" rx="8" class="s-box"/>
+      <text x="647" y="72" font-size="12" font-weight="700" text-anchor="middle">MCP 서버 컨테이너: fetch</text>
+      <text x="647" y="89" font-size="11" text-anchor="middle" class="sub">permission profile 적용</text>
+    </g>
+    <g>
+      <rect x="375" y="122" width="120" height="46" rx="8" class="s-box"/>
+      <text x="435" y="142" font-size="12" font-weight="700" text-anchor="middle">proxy</text>
+      <text x="435" y="159" font-size="11" text-anchor="middle" class="sub">미들웨어</text>
+      <rect x="545" y="122" width="205" height="46" rx="8" class="s-box"/>
+      <text x="647" y="142" font-size="12" font-weight="700" text-anchor="middle">MCP 서버 컨테이너: osv</text>
+      <text x="647" y="159" font-size="11" text-anchor="middle" class="sub">stdio면 proxy가 변환</text>
+    </g>
+    <g>
+      <rect x="375" y="192" width="120" height="46" rx="8" class="s-box"/>
+      <text x="435" y="212" font-size="12" font-weight="700" text-anchor="middle">proxy</text>
+      <text x="435" y="229" font-size="11" text-anchor="middle" class="sub">미들웨어</text>
+      <rect x="545" y="192" width="205" height="46" rx="8" class="s-box"/>
+      <text x="647" y="212" font-size="12" font-weight="700" text-anchor="middle">MCP 서버 컨테이너: github</text>
+      <text x="647" y="229" font-size="11" text-anchor="middle" class="sub">네트워크 격리</text>
+    </g>
+
+    <path d="M150 145 L193 145" class="s-line" marker-end="url(#arrA)"/>
+    <path d="M325 145 L373 75" class="s-line" marker-end="url(#arrA)"/>
+    <path d="M325 145 L373 145" class="s-line" marker-end="url(#arrA)"/>
+    <path d="M325 145 L373 215" class="s-line" marker-end="url(#arrA)"/>
+    <path d="M495 75 L543 75" class="s-line" marker-end="url(#arrA)"/>
+    <path d="M495 145 L543 145" class="s-line" marker-end="url(#arrA)"/>
+    <path d="M495 215 L543 215" class="s-line" marker-end="url(#arrA)"/>
+    <text x="192" y="266" font-size="11" class="sub">ToolHive가 컨테이너를 시작하고, 권한을 제한하고, 중지한다.</text>
+  </svg>
+  </div>
+  <figcaption>ToolHive는 vMCP부터 MCP 서버 컨테이너까지 관리하고, 서버마다 proxy가 하나씩 붙는다. 클라이언트가 vMCP 없이 서버 하나에 바로 연결하는 구성도 있다.</figcaption>
+</figure>
+
+<figure class="fig">
+  <b>그림 2. agentgateway</b>
+  <div class="scroll">
+  <svg viewBox="0 0 780 360" role="img" aria-label="agentgateway 구조: 에이전트, agentgateway proxy, 여러 목적지">
+    <defs><marker id="arrB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-head"/></marker></defs>
+    <rect x="10" y="150" width="150" height="70" rx="10" class="s-box"/>
+    <text x="85" y="178" font-size="13" font-weight="700" text-anchor="middle">에이전트</text>
+    <text x="85" y="198" font-size="11" text-anchor="middle" class="sub">앱, MCP 클라이언트</text>
+
+    <rect x="200" y="10" width="220" height="44" rx="8" class="s-box"/>
+    <text x="310" y="29" font-size="12" font-weight="700" text-anchor="middle">설정 출처</text>
+    <text x="310" y="46" font-size="11" text-anchor="middle" class="sub">YAML 파일 또는 controller의 xDS</text>
+    <path d="M310 54 L310 78" class="s-dash" marker-end="url(#arrB)"/>
+
+    <rect x="200" y="80" width="220" height="270" rx="14" class="s-ag"/>
+    <text x="310" y="104" font-size="13" font-weight="700" text-anchor="middle">agentgateway</text>
+    <text x="310" y="119" font-size="11" text-anchor="middle" class="sub">Rust proxy (data plane)</text>
+    <rect x="215" y="128" width="190" height="34" rx="7" class="s-box"/><text x="310" y="150" font-size="12" text-anchor="middle">listener, route</text>
+    <rect x="215" y="170" width="190" height="34" rx="7" class="s-box"/><text x="310" y="192" font-size="12" text-anchor="middle">인증, 인가 (CEL)</text>
+    <rect x="215" y="212" width="190" height="34" rx="7" class="s-box"/><text x="310" y="234" font-size="12" text-anchor="middle">rate limit (요청, LLM 토큰)</text>
+    <rect x="215" y="254" width="190" height="34" rx="7" class="s-box"/><text x="310" y="276" font-size="12" text-anchor="middle">guardrail</text>
+    <rect x="215" y="296" width="190" height="34" rx="7" class="s-box"/><text x="310" y="318" font-size="12" text-anchor="middle">관측 (OpenTelemetry)</text>
+
+    <rect x="500" y="20" width="270" height="50" rx="8" class="s-ext"/>
+    <text x="635" y="41" font-size="12" font-weight="700" text-anchor="middle">MCP 서버</text>
+    <text x="635" y="59" font-size="11" text-anchor="middle" class="sub">streamable HTTP, SSE, stdio</text>
+    <rect x="500" y="88" width="270" height="50" rx="8" class="s-ext"/>
+    <text x="635" y="109" font-size="12" font-weight="700" text-anchor="middle">REST API (OpenAPI)</text>
+    <text x="635" y="127" font-size="11" text-anchor="middle" class="sub">MCP tool로 변환</text>
+    <rect x="500" y="156" width="270" height="50" rx="8" class="s-ext"/>
+    <text x="635" y="177" font-size="12" font-weight="700" text-anchor="middle">A2A 에이전트</text>
+    <text x="635" y="195" font-size="11" text-anchor="middle" class="sub">A2A, Bedrock AgentCore</text>
+    <rect x="500" y="224" width="270" height="50" rx="8" class="s-ext"/>
+    <text x="635" y="245" font-size="12" font-weight="700" text-anchor="middle">LLM provider</text>
+    <text x="635" y="263" font-size="11" text-anchor="middle" class="sub">OpenAI, Anthropic, Bedrock, Gemini 등</text>
+    <rect x="500" y="292" width="270" height="50" rx="8" class="s-ext"/>
+    <text x="635" y="313" font-size="12" font-weight="700" text-anchor="middle">HTTP, gRPC 서비스</text>
+    <text x="635" y="331" font-size="11" text-anchor="middle" class="sub">일반 트래픽</text>
+
+    <path d="M160 185 L198 185" class="s-line" marker-end="url(#arrB)"/>
+    <path d="M420 100 L498 45" class="s-line" marker-end="url(#arrB)"/>
+    <path d="M420 120 L498 113" class="s-line" marker-end="url(#arrB)"/>
+    <path d="M420 181 L498 181" class="s-line" marker-end="url(#arrB)"/>
+    <path d="M420 249 L498 249" class="s-line" marker-end="url(#arrB)"/>
+    <path d="M420 317 L498 317" class="s-line" marker-end="url(#arrB)"/>
+  </svg>
+  </div>
+  <div class="legend"><span><i class="ext"></i>다른 시스템이 실행하는 목적지</span></div>
+  <figcaption>agentgateway는 가운데 proxy 하나이고, 오른쪽 목적지는 다른 시스템이 실행한다. 예외로 standalone 모드에서는 stdio MCP 서버 프로세스를 직접 시작한다.</figcaption>
+</figure>
+
+<h2 id="s4">4. ToolHive의 구조</h2>
+<h3>구성 요소</h3>
+<div class="tbl"><table>
+<tr><th>구성 요소</th><th>하는 일</th></tr>
+<tr><td><code>thv</code> CLI</td><td>MCP 서버 실행, 서버 그룹, secret, 클라이언트 설정을 관리한다.</td></tr>
+<tr><td>ToolHive UI</td><td>데스크톱 앱이다. 별도 저장소(toolhive-studio)에 있다.</td></tr>
+<tr><td>Kubernetes operator</td><td>CRD를 읽고 MCP 서버를 pod로 실행한다.</td></tr>
+<tr><td>Registry Server</td><td>MCP 서버 목록(registry)을 제공한다. 별도 저장소에 있다.</td></tr>
+<tr><td>vMCP (Virtual MCP Server)</td><td>여러 MCP 서버를 endpoint 하나로 집계한다. ToolHive의 MCP gateway다. Stacklok이 2025-12-08에 발표했다.</td></tr>
+<tr><td>optimizer</td><td>vMCP 안에 있다. 모든 tool 대신 <code>find_tool</code>과 <code>call_tool</code> 두 개만 보여 준다.</td></tr>
+</table></div>
+<p class="note">Stacklok은 v0.47.0(2026-09)에서 Cloud UI를 종료했다. 문서는 구성 요소마다 GA, beta 상태를 표시하지 않는다.</p>
+
+<h3>MCP 서버를 실행하는 방식</h3>
+<p>ToolHive는 MCP 서버 하나를 다음 순서로 실행한다.</p>
+<ol>
+  <li>컨테이너 런타임에서 MCP 서버 컨테이너를 시작한다. Docker, Podman, Colima를 지원한다.</li>
+  <li>서버 앞에 proxy를 하나 붙인다.</li>
+  <li>proxy는 요청마다 미들웨어를 적용하는데, 미들웨어에는 인증, 인가, 감사 로그 등이 있다.</li>
+  <li>stdio 서버면 proxy가 HTTP 요청을 표준 입력으로 보내고, 응답은 표준 출력에서 읽는다.</li>
+</ol>
+<p>Kubernetes에서는 operator가 같은 일을 하는데, proxy runner를 Deployment로, MCP 서버를 StatefulSet으로 만든다.</p>
+<p>ToolHive는 이미지가 없는 서버도 실행한다. <code>npx://</code>, <code>uvx://</code>, <code>go://</code> 형식을 주면 ToolHive가 이미지를 빌드해서 실행하는 방식이다.</p>
+<p>ToolHive는 원격 MCP 서버에도 연결한다. 이때는 서버를 실행하지 않고 proxy만 붙이며, Kubernetes에서는 MCPRemoteProxy가 이 일을 한다.</p>
+
+<h3>격리와 secret</h3>
+<p>ToolHive는 컨테이너마다 다음 제한을 건다.</p>
+<ul>
+  <li><b>파일 시스템</b>: permission profile에 읽기 mount와 쓰기 mount를 지정한다.</li>
+  <li><b>네트워크</b>: 나가는 연결의 host와 port를 허용 목록으로 지정한다. <code>--isolate-network</code>의 기본값은 true다.</li>
+  <li><b>secret</b>: 암호화 저장소(AES-256-GCM), 1Password, 환경 변수 중 하나에 두고, Kubernetes에서는 Secret을 쓴다.</li>
+  <li><b>이미지 검증</b>: registry의 Sigstore 정보로 이미지 출처를 확인하며, 기본 모드는 warn이다.</li>
+</ul>
+
+<h3>Kubernetes CRD</h3>
+<p>API group은 <code>toolhive.stacklok.dev</code>이고, 저장 버전은 v0.23.0부터 v1beta1이다.</p>
+<div class="tbl"><table>
+<tr><th>kind</th><th>하는 일</th></tr>
+<tr><td>MCPServer</td><td>ToolHive가 실행할 MCP 서버 하나를 정의한다.</td></tr>
+<tr><td>MCPRemoteProxy</td><td>원격 MCP 서버 앞에 proxy를 둔다. 인증, 인가, 감사 로그, tool 필터를 적용한다.</td></tr>
+<tr><td>MCPServerEntry</td><td>원격 서버의 endpoint를 선언한다. pod를 만들지 않는다.</td></tr>
+<tr><td>MCPGroup</td><td>MCP 서버를 묶는다. vMCP는 이 묶음 하나를 집계한다.</td></tr>
+<tr><td>VirtualMCPServer</td><td>vMCP 인스턴스 하나를 정의한다.</td></tr>
+<tr><td>VirtualMCPCompositeToolDefinition</td><td>여러 tool을 묶은 composite tool을 정의한다.</td></tr>
+<tr><td>MCPToolConfig</td><td>서버 하나의 tool을 거르고, 이름과 설명을 바꾼다.</td></tr>
+<tr><td>MCPOIDCConfig, MCPExternalAuthConfig, MCPAuthzConfig</td><td>클라이언트 인증, 백엔드 인증, 인가 설정</td></tr>
+<tr><td>MCPTelemetryConfig</td><td>OpenTelemetry 설정</td></tr>
+<tr><td>EmbeddingServer</td><td>optimizer가 쓰는 embedding 서버</td></tr>
+<tr><td>MCPRegistry</td><td>deprecated. 공식 문서는 registry server Helm chart를 권장한다.</td></tr>
+</table></div>
+<p>아래 예는 공식 quickstart에서 가져왔고, 리소스 제한 필드는 줄였다.</p>
+<pre><code>apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPServer
+metadata:
+  name: fetch
+  namespace: toolhive-system
+spec:
+  image: ghcr.io/stackloklabs/gofetch/server
+  transport: streamable-http
+  proxyPort: 8080
+  mcpPort: 8080
+  groupRef:
+    name: demo-tools
+---
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: VirtualMCPServer
+metadata:
+  name: demo-vmcp
+  namespace: toolhive-system
+spec:
+  incomingAuth:
+    type: anonymous
+  outgoingAuth:
+    source: inline
+  serviceType: ClusterIP
+  groupRef:
+    name: demo-tools
+  config:
+    aggregation:
+      conflictResolution: prefix
+      conflictResolutionConfig:
+        prefixFormat: '{workload}_'</code></pre>
+<p>MCPServer는 실행할 컨테이너 이미지를 가지는데, 이 점이 agentgateway의 리소스와 가장 크게 다르다.</p>
+
+<h2 id="s5">5. agentgateway의 구조</h2>
+<h3>설정을 받는 방식</h3>
+<p>agentgateway는 세 가지 방식으로 설정을 받는다.</p>
+<ol>
+  <li>정적 설정</li>
+  <li>로컬 YAML 파일이나 JSON 파일. 파일이 바뀌면 agentgateway가 다시 읽는다.</li>
+  <li>control plane이 xDS로 보내는 설정. Envoy의 xDS transport를 쓰지만, 메시지 형식은 agentgateway 자체 protobuf다.</li>
+</ol>
+
+<h3>standalone 모드와 Kubernetes 모드</h3>
+<div class="tbl"><table>
+<tr><th>항목</th><th>standalone</th><th>Kubernetes</th></tr>
+<tr><td>실행 형태</td><td>바이너리, Docker 컨테이너, Helm chart</td><td>agentgateway controller가 proxy를 배포한다.</td></tr>
+<tr><td>설정</td><td>YAML 파일이나 JSON 파일</td><td>Gateway API 리소스와 agentgateway CRD</td></tr>
+<tr><td>UI</td><td><code>localhost:15000/ui</code>. 설정을 편집한다.</td><td>읽기 전용</td></tr>
+<tr><td>MCP 서버 실행</td><td>stdio target이면 자식 프로세스를 시작한다.</td><td>하지 않는다. 사용자가 서버를 따로 배포한다.</td></tr>
+</table></div>
+<p>standalone 모드도 컨테이너를 관리하지는 않는다. stdio 명령에 <code>docker run</code>을 넣으면 서버가 컨테이너 안에서 실행되지만, 컨테이너의 권한 제한과 이미지 검증은 agentgateway가 하지 않는다.</p>
+
+<h3>다루는 트래픽</h3>
+<div class="tbl"><table>
+<tr><th>종류</th><th>내용</th></tr>
+<tr><td>MCP</td><td>upstream: stdio, SSE, streamable HTTP, OpenAPI. 클라이언트 쪽: <code>/sse</code>, <code>/mcp</code>.</td></tr>
+<tr><td>OpenAPI</td><td>REST API를 MCP tool로 바꾼다. standalone 문서에서만 확인했다.</td></tr>
+<tr><td>A2A</td><td>A2A backend가 있다. AWS Bedrock AgentCore backend도 있다.</td></tr>
+<tr><td>LLM</td><td>OpenAI, Anthropic, Bedrock, Azure, Gemini, Vertex AI 등. API 형식을 서로 변환한다.</td></tr>
+<tr><td>일반</td><td>HTTP, gRPC, TCP, TLS</td></tr>
+</table></div>
+
+<h3>LLM gateway 기능</h3>
+<ul>
+  <li><b>failover</b>: provider 우선순위 그룹을 8개까지 두고, v1.6부터는 상태가 나쁜 provider를 기본으로 제외한다.</li>
+  <li><b>LLM 토큰 rate limit</b>: 요청 시점과 응답 시점에 모두 확인한다.</li>
+  <li><b>비용 추적</b>: v1.6부터 모델 비용 표를 내장하고, 로그, trace, 메트릭에 USD 비용을 기록한다.</li>
+  <li><b>guardrail</b>: regex, PII 탐지, OpenAI moderation, 외부 webhook 등이 있고, 여러 guardrail을 겹쳐서 건다.</li>
+  <li><b>inference routing</b>: Gateway API Inference Extension을 지원해서 HTTPRoute가 InferencePool을 목적지로 가리킨다.</li>
+</ul>
+<p class="note">gateway 쪽 응답 캐시는 찾지 못했다. <code>promptCaching</code>은 provider에 캐시 표시만 붙인다.</p>
+
+<h3>Kubernetes 리소스</h3>
+<p>agentgateway는 Gateway API를 따른다. GatewayClass 이름은 <code>agentgateway</code>이고, 경로는 HTTPRoute, GRPCRoute, TCPRoute, TLSRoute로 정한다.</p>
+<p>자체 CRD는 <code>agentgateway.dev/v1alpha1</code>에 4종이 있다.</p>
+<div class="tbl"><table>
+<tr><th>kind</th><th>하는 일</th></tr>
+<tr><td>AgentgatewayBackend</td><td>목적지를 정의한다. MCP 서버, LLM provider, A2A 에이전트 등이다.</td></tr>
+<tr><td>AgentgatewayPolicy</td><td>인증, 인가, rate limit 같은 정책을 정의한다.</td></tr>
+<tr><td>AgentgatewayParameters, AgentgatewayModel</td><td>이름만 확인했다. 세부 역할은 공식 문서에서 확인해야 한다.</td></tr>
+</table></div>
+<p>아래 예는 공식 문서에서 가져왔고, MCP 서버는 사용자가 미리 배포해야 한다.</p>
+<pre><code>apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: mcp-backend
+spec:
+  mcp:
+    targets:
+    - name: mcp-target
+      static:
+        host: mcp-website-fetcher.default.svc.cluster.local
+        port: 80
+        protocol: SSE
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mcp
+spec:
+  parentRefs:
+    - name: agentgateway-proxy
+      namespace: agentgateway-system
+  rules:
+    - matches:
+      - path:
+          type: PathPrefix
+          value: /mcp
+      backendRefs:
+      - name: mcp-backend
+        group: agentgateway.dev
+        kind: AgentgatewayBackend</code></pre>
+<p>AgentgatewayBackend는 이미 실행 중인 서버의 주소를 가지고, 컨테이너 이미지 필드는 없다.</p>
+<p>standalone 모드의 예는 다음과 같은데, 이 예에서는 agentgateway가 <code>npx</code> 프로세스를 직접 시작한다.</p>
+<pre><code>mcp:
+  port: 3000
+  targets:
+  - name: everything
+    stdio:
+      cmd: npx
+      args: ["@modelcontextprotocol/server-everything"]</code></pre>
+
+<h3>Rust를 고른 이유와 성능 주장</h3>
+<ul>
+  <li>프로젝트는 성능과 메모리 안전성 때문에 Rust를 골랐다고 설명하는데, Istio ztunnel과 같은 이유다.</li>
+  <li>Envoy를 쓰지 않은 이유도 밝혔는데, 에이전트 프로토콜을 지원하려면 Envoy 구조를 크게 바꿔야 했다는 설명이다.</li>
+  <li>프로젝트 발표 수치: 512 연결에서 약 50만 QPS, 3만 QPS에서 P99 0.2 ms 미만.</li>
+</ul>
+<p class="note">모든 성능 수치는 프로젝트가 직접 발표한 것이고, 제3자 벤치마크는 찾지 못했다.</p>
+
+<h2 id="s6">6. 기능별 비교</h2>
+<p>아래 표는 오픈소스판 기준이고, 상용판에만 있는 기능은 "상용"으로 표시한다.</p>
+<div class="tbl"><table>
+<tr><th>기능</th><th>ToolHive</th><th>agentgateway</th></tr>
+<tr><td>MCP 서버 실행</td><td class="th-col">컨테이너, pod로 실행. 시작과 중지를 관리.</td><td>Kubernetes 모드는 하지 않음. standalone은 stdio 프로세스만 시작.</td></tr>
+<tr><td>컨테이너 격리</td><td class="th-col">permission profile, 네트워크 격리</td><td>해당 없음</td></tr>
+<tr><td>이미지 검증</td><td class="th-col">Sigstore</td><td>해당 없음</td></tr>
+<tr><td>집계</td><td>vMCP. MCPGroup 단위.</td><td>MCP backend 하나에 target 여러 개.</td></tr>
+<tr><td>tool 이름 충돌</td><td>prefix, priority, manual 중 선택</td><td>target 이름 prefix. <code>prefixMode</code>로 조정.</td></tr>
+<tr><td>tool 필터, 이름 변경</td><td>허용·거부 목록, 이름 변경, 설명 변경</td><td>인가 규칙으로 tool을 숨김</td></tr>
+<tr><td>composite tool</td><td class="th-col">DAG workflow</td><td>확인하지 못함. 상용판에 composable MCP server.</td></tr>
+<tr><td>tool 수 줄이기</td><td class="th-col">optimizer, code mode</td><td>상용: tool search, code mode</td></tr>
+<tr><td>클라이언트 인증</td><td>OIDC, JWT. OAuth authorization server 내장.</td><td>JWT, API key, OIDC, 외부 인증. MCP Authorization spec 지원.</td></tr>
+<tr><td>백엔드 인증</td><td>token exchange, header 주입, AWS STS 등</td><td>token exchange, AWS, GCP, Azure 자격 증명 등</td></tr>
+<tr><td>인가 정책 언어</td><td>Cedar. 외부 PDP도 지원.</td><td>CEL. 외부 gRPC 서버(ExtMCP)도 지원.</td></tr>
+<tr><td>목록 응답 필터</td><td>한다</td><td>한다</td></tr>
+<tr><td>rate limit 단위</td><td>MCP 요청 수</td><td class="ag-col">요청 수, LLM 토큰 수</td></tr>
+<tr><td>LLM 라우팅, failover</td><td>상용 AI Gateway</td><td class="ag-col">한다</td></tr>
+<tr><td>guardrail</td><td>상용 AI Gateway</td><td class="ag-col">regex, PII, moderation, webhook 등</td></tr>
+<tr><td>비용 추적</td><td>상용 AI Gateway (USD 상한)</td><td class="ag-col">USD 비용 기록, 예산</td></tr>
+<tr><td>A2A</td><td>지원하지 않음</td><td class="ag-col">지원</td></tr>
+<tr><td>TLS, mTLS</td><td>이 문서에서 확인하지 않음</td><td>TLS, mTLS, SPIFFE</td></tr>
+<tr><td>관측</td><td>OTel trace, 메트릭, Prometheus, 감사 로그</td><td>OTel trace, Prometheus 메트릭, access log</td></tr>
+<tr><td>클라이언트 자동 설정</td><td class="th-col"><code>thv client setup</code>. 약 25종 지원.</td><td>확인하지 못함</td></tr>
+<tr><td>Kubernetes 모델</td><td>자체 CRD 13종 (v1beta1)</td><td>Gateway API와 자체 CRD 4종 (v1alpha1)</td></tr>
+</table></div>
+<p class="note">파란 칸은 ToolHive에만 있는 기능이고, 초록 칸은 agentgateway에만 있는 기능이다.</p>
+
+<h2 id="s7">7. 같은 일을 다르게 하는 부분</h2>
+<h3>7.1 집계</h3>
+<p>두 제품 모두 여러 MCP 서버를 endpoint 하나로 묶지만, 이름이 겹칠 때의 처리가 다르다.</p>
+<p>vMCP는 MCPGroup 하나에 속한 서버를 집계하고, tool, 리소스, 프롬프트를 모두 묶는다. 이름이 겹치면 세 전략 중 하나를 쓴다.</p>
+<div class="tbl"><table>
+<tr><th>전략</th><th>동작</th></tr>
+<tr><td><code>prefix</code> (기본)</td><td>모든 tool 이름 앞에 서버 이름을 붙인다.</td></tr>
+<tr><td><code>priority</code></td><td>순위가 가장 높은 서버의 tool만 남긴다. 순위는 <code>priorityOrder</code>로 정한다.</td></tr>
+<tr><td><code>manual</code></td><td>겹치는 tool마다 사용자가 이름을 정한다. 하나라도 빠지면 vMCP가 시작하지 않는다.</td></tr>
+</table></div>
+<p>agentgateway는 MCP backend 하나에 target 여러 개를 두고, target이 둘 이상이면 tool 이름 앞에 target 이름을 붙인다. 이 동작은 <code>prefixMode</code>로 바꾸며, 값은 Conditional, Always, Never다.</p>
+<p>ToolHive는 집계 위에 기능을 더 얹는다.</p>
+<ul>
+  <li><b>composite tool</b>: 여러 tool 호출을 DAG workflow 하나로 묶는다.</li>
+  <li><b>optimizer</b>: 클라이언트에게 <code>find_tool</code>과 <code>call_tool</code>만 보여 주고, 키워드 검색과 의미 검색으로 tool을 찾는다.</li>
+  <li><b>code mode</b>: 에이전트가 Starlark 스크립트로 tool 여러 개를 호출하는 기능이고, 기본으로 꺼져 있다.</li>
+</ul>
+<p>Stacklok은 optimizer가 LLM 토큰을 60~85% 줄인다고 주장하는데, 이 수치는 회사 발표다. agentgateway 오픈소스판에서 같은 기능은 확인하지 못했고, Solo.io 상용판이 tool search와 code mode를 제공한다.</p>
+
+<h3>7.2 인가</h3>
+<p>두 제품은 허용하지 않은 tool을 목록 응답에서 지워서, 클라이언트는 호출이 허용된 tool만 본다. 정책 언어는 서로 다르다.</p>
+<p>ToolHive는 Cedar를 쓰고, Cedar 정책은 principal, action, resource를 명시한다.</p>
+<pre><code>permit(principal, action == Action::"call_tool", resource == Tool::"calculator");</code></pre>
+<p>agentgateway는 CEL 식을 쓰는데, 식 하나가 access token의 claim과 MCP 요청 정보를 함께 검사한다.</p>
+<pre><code>jwt.sub == "test-user" &amp;&amp; mcp.tool.name == "add"</code></pre>
+<p>외부 판단 서버도 두 제품 모두 지원한다. ToolHive는 HTTP PDP를, agentgateway는 gRPC 서버(ExtMCP)를 쓰고, ExtMCP는 tool 호출을 허용하거나, 바꾸거나, 거부한다.</p>
+
+<h3>7.3 rate limit</h3>
+<ul>
+  <li>ToolHive는 MCP 요청 수를 세고, 범위는 전체 공유, 사용자별, tool별이다.</li>
+  <li>agentgateway는 요청 수와 LLM 토큰 수를 센다.</li>
+</ul>
+<p>출력 토큰 수는 응답이 와야 알 수 있어서 LLM 토큰 rate limit은 응답 시점에도 확인해야 한다. agentgateway는 요청 시점과 응답 시점에 모두 확인한다.</p>
+
+<h3>7.4 Kubernetes 모델</h3>
+<p>ToolHive는 MCP 서버 자체를 리소스로 정의해서, MCPServer 하나가 실행할 서버 하나다. 그래서 ToolHive CRD는 워크로드를 만든다.</p>
+<p>agentgateway는 Gateway API의 모델을 따라서 Gateway와 HTTPRoute가 경로를 정하고, AgentgatewayBackend가 목적지를 정한다. 그래서 agentgateway CRD는 라우팅 규칙을 만든다.</p>
+<div class="box key">
+  <p>프로젝트 버전과 CRD 버전은 반대 방향이다. ToolHive는 v0.52지만 CRD는 v1beta1이고, agentgateway는 v1.6이지만 CRD는 v1alpha1이다.</p>
+</div>
+
+<h2 id="s8">8. 선택 기준</h2>
+<div class="tbl"><table>
+<tr><th>상황</th><th>맞는 제품</th><th>이유</th></tr>
+<tr><td>개발자가 로컬에서 MCP 서버를 안전하게 쓰고 싶다.</td><td>ToolHive (CLI, UI)</td><td>서버를 컨테이너에서 실행한다. 파일 접근과 네트워크를 제한한다.</td></tr>
+<tr><td>MCP 서버 수십 개를 Kubernetes에서 운영한다.</td><td>ToolHive operator</td><td>MCPServer CRD로 서버 실행을 선언한다.</td></tr>
+<tr><td>에이전트의 LLM 호출을 여러 provider로 보내고 비용을 제한한다.</td><td>agentgateway</td><td>failover, LLM 토큰 rate limit, 비용 추적을 오픈소스에서 제공한다.</td></tr>
+<tr><td>에이전트끼리 A2A로 통신하고 정책을 건다.</td><td>agentgateway</td><td>ToolHive는 A2A를 지원하지 않는다.</td></tr>
+<tr><td>이미 Gateway API로 클러스터 진입 트래픽을 운영한다.</td><td>agentgateway</td><td>GatewayClass와 HTTPRoute를 그대로 쓴다.</td></tr>
+<tr><td>tool이 너무 많아서 LLM 컨텍스트가 커진다.</td><td>ToolHive vMCP optimizer</td><td>오픈소스판에 들어 있다. agentgateway에서는 상용판의 tool search가 이 일을 한다.</td></tr>
+<tr><td>사내 REST API를 MCP tool로 노출한다.</td><td>agentgateway</td><td>OpenAPI target이 REST API를 tool로 바꾼다.</td></tr>
+</table></div>
+
+<h2 id="s9">9. 함께 쓰는 구성</h2>
+<p>두 제품은 겹치는 부분보다 다른 부분이 커서, 두 제품을 함께 쓰는 구성도 생각할 수 있다.</p>
+<figure class="fig">
+  <b>그림 3. 함께 쓰는 구성의 예</b>
+  <div class="scroll">
+  <svg viewBox="0 0 780 305" role="img" aria-label="agentgateway가 앞단에서 LLM, A2A, ToolHive vMCP로 요청을 나누는 구성">
+    <defs><marker id="arrC" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-head"/></marker></defs>
+    <rect x="10" y="122" width="130" height="56" rx="10" class="s-box"/>
+    <text x="75" y="155" font-size="13" font-weight="700" text-anchor="middle">에이전트</text>
+
+    <rect x="180" y="105" width="160" height="90" rx="12" class="s-ag"/>
+    <text x="260" y="140" font-size="13" font-weight="700" text-anchor="middle">agentgateway</text>
+    <text x="260" y="160" font-size="11" text-anchor="middle" class="sub">LLM, A2A, MCP 정책</text>
+
+    <rect x="400" y="15" width="200" height="50" rx="8" class="s-ext"/>
+    <text x="500" y="37" font-size="12" font-weight="700" text-anchor="middle">LLM provider</text>
+    <text x="500" y="54" font-size="11" text-anchor="middle" class="sub">OpenAI, Anthropic 등</text>
+
+    <rect x="390" y="88" width="380" height="160" rx="12" class="s-th"/>
+    <text x="405" y="108" font-size="12" font-weight="700">ToolHive operator</text>
+    <rect x="405" y="133" width="110" height="56" rx="8" class="s-box"/>
+    <text x="460" y="158" font-size="12" font-weight="700" text-anchor="middle">vMCP</text>
+    <text x="460" y="176" font-size="11" text-anchor="middle" class="sub">집계</text>
+    <rect x="560" y="120" width="195" height="32" rx="7" class="s-box"/><text x="657" y="141" font-size="12" text-anchor="middle">MCP 서버 컨테이너</text>
+    <rect x="560" y="162" width="195" height="32" rx="7" class="s-box"/><text x="657" y="183" font-size="12" text-anchor="middle">MCP 서버 컨테이너</text>
+    <rect x="560" y="204" width="195" height="32" rx="7" class="s-box"/><text x="657" y="225" font-size="12" text-anchor="middle">MCP 서버 컨테이너</text>
+
+    <rect x="400" y="258" width="200" height="40" rx="8" class="s-ext"/>
+    <text x="500" y="283" font-size="12" font-weight="700" text-anchor="middle">A2A 에이전트</text>
+
+    <path d="M140 150 L178 150" class="s-line" marker-end="url(#arrC)"/>
+    <path d="M340 125 L398 42" class="s-line" marker-end="url(#arrC)"/>
+    <path d="M340 158 L403 160" class="s-line" marker-end="url(#arrC)"/>
+    <path d="M340 180 L398 276" class="s-line" marker-end="url(#arrC)"/>
+    <path d="M515 161 L558 136" class="s-line" marker-end="url(#arrC)"/>
+    <path d="M515 161 L558 178" class="s-line" marker-end="url(#arrC)"/>
+    <path d="M515 161 L558 220" class="s-line" marker-end="url(#arrC)"/>
+  </svg>
+  </div>
+  <figcaption>agentgateway가 앞단에서 요청을 목적지별로 나누고, MCP 요청은 ToolHive vMCP로 간다. MCP 서버 컨테이너는 ToolHive가 실행하며, 서버별 proxy는 그림에서 생략했다.</figcaption>
+</figure>
+<p>이 구성에서 두 제품은 다음과 같이 일을 나눈다.</p>
+<ol>
+  <li>ToolHive operator가 MCP 서버를 컨테이너로 실행한다.</li>
+  <li>vMCP가 그 서버들을 endpoint 하나로 집계한다.</li>
+  <li>agentgateway가 vMCP endpoint를 MCP backend로 등록한다.</li>
+  <li>agentgateway는 같은 proxy에서 LLM 요청과 A2A 요청도 받는다.</li>
+</ol>
+<div class="box warn">
+  <p>이 구성은 작성자가 두 제품의 기능을 조합한 예다. 두 프로젝트의 공식 문서에서 이 조합을 확인하지 않았고, 실제로 동작하는지도 시험하지 않았다.</p>
+  <p>작성자 의견: 이 구성에서는 인증이 두 번 일어날 수 있어서 access token 흐름을 먼저 설계해야 한다. 집계, 인가, 감사 로그처럼 겹치는 기능은 한쪽에서만 켜는 편이 단순하다.</p>
+</div>
+
+<h2 id="s10">10. 자가 점검 문제</h2>
+<p>먼저 답을 생각한 다음 펼쳐서 확인한다.</p>
+<details><summary>Q1. 팀이 MCP 서버 20개를 Kubernetes에서 직접 운영해야 한다. 서버 실행은 어느 제품이 맡는가?</summary>
+<p>ToolHive가 맡는다. ToolHive operator가 MCPServer CRD를 읽고 서버를 pod로 실행한다. agentgateway의 Kubernetes 모드는 서버를 실행하지 않고, 이미 실행 중인 서버로 요청을 전달만 한다.</p></details>
+<details><summary>Q2. agentgateway가 MCP 서버를 직접 시작하는 경우가 있는가?</summary>
+<p>standalone 모드에서 stdio target을 쓰는 경우가 그렇다. 이때 agentgateway가 자식 프로세스를 시작하지만, 컨테이너의 권한 제한이나 이미지 검증은 하지 않는다.</p></details>
+<details><summary>Q3. 에이전트의 LLM 호출 비용을 팀별로 제한해야 한다. 오픈소스판 기준으로 어느 제품을 쓰는가?</summary>
+<p>agentgateway를 쓴다. agentgateway는 LLM 토큰 rate limit, 비용 기록, 예산을 제공한다. 오픈소스 ToolHive는 LLM 트래픽을 다루지 않고, 이 기능은 Stacklok 상용판의 AI Gateway가 제공한다.</p></details>
+<details><summary>Q4. 두 MCP 서버가 같은 이름의 <code>search</code> tool을 제공한다. 각 제품은 어떻게 처리하는가?</summary>
+<p>vMCP는 prefix, priority, manual 중 하나를 쓰고, 기본값인 prefix는 서버 이름을 앞에 붙인다. agentgateway는 target이 둘 이상이면 target 이름을 앞에 붙이며, 이 동작은 <code>prefixMode</code>로 바꾼다.</p></details>
+<details><summary>Q5. 사용자 A에게 특정 tool만 보이게 하려면 각 제품에서 무엇을 쓰는가?</summary>
+<p>ToolHive는 Cedar 정책을, agentgateway는 CEL 인가 규칙을 쓴다. 두 제품 모두 허용하지 않은 tool을 목록 응답에서 지운다.</p></details>
+<details><summary>Q6. 두 제품의 rate limit은 무엇을 세는가? LLM 토큰 rate limit을 응답 시점에도 확인하는 이유는?</summary>
+<p>ToolHive는 MCP 요청 수를 세고, agentgateway는 요청 수와 LLM 토큰 수를 센다. 출력 토큰 수는 응답이 와야 알 수 있어서 응답 시점에도 확인한다.</p></details>
+<details><summary>Q7. ToolHive의 MCPServer와 agentgateway의 AgentgatewayBackend는 무엇이 다른가?</summary>
+<p>MCPServer는 컨테이너 이미지를 가지고, operator가 그 이미지로 서버를 실행한다. AgentgatewayBackend는 이미 실행 중인 서버의 주소를 가진다. 하나는 워크로드를 정의하고, 다른 하나는 목적지를 정의한다.</p></details>
+<details><summary>Q8. 에이전트끼리 A2A로 통신한다. 이 트래픽에 인증과 관측을 붙이려면 어느 제품을 쓰는가?</summary>
+<p>agentgateway를 쓴다. agentgateway는 A2A backend를 지원하고, ToolHive 저장소에서는 A2A 코드와 문서를 찾지 못했다.</p></details>
+
+<h2 id="s11">11. 참고 자료</h2>
+<p>모든 자료는 2026-10-13에 확인했다.</p>
+<h3>ToolHive</h3>
+<ul>
+  <li><a href="https://github.com/stacklok/toolhive">github.com/stacklok/toolhive</a> (README, <a href="https://github.com/stacklok/toolhive/releases">releases</a>)</li>
+  <li><a href="https://github.com/stacklok/toolhive/blob/main/docs/arch/10-virtual-mcp-architecture.md">vMCP 아키텍처 문서</a></li>
+  <li><a href="https://github.com/stacklok/toolhive/blob/main/docs/authz.md">인가 문서 (Cedar)</a></li>
+  <li><a href="https://docs.stacklok.com/toolhive/guides-vmcp/quickstart">vMCP quickstart</a>, <a href="https://docs.stacklok.com/toolhive/guides-vmcp/tool-aggregation">tool 집계와 충돌 처리</a></li>
+  <li><a href="https://docs.stacklok.com/toolhive/guides-vmcp/optimizer">optimizer</a></li>
+  <li><a href="https://docs.stacklok.com/toolhive/enterprise">Stacklok Enterprise</a>, <a href="https://docs.stacklok.com/ai-gateway">Stacklok AI Gateway</a></li>
+</ul>
+<h3>agentgateway</h3>
+<ul>
+  <li><a href="https://github.com/agentgateway/agentgateway">github.com/agentgateway/agentgateway</a> (README, <a href="https://github.com/agentgateway/agentgateway/releases">releases</a>)</li>
+  <li><a href="https://agentgateway.dev/docs/standalone/latest/documentation/about/introduction/">standalone 소개</a>, <a href="https://agentgateway.dev/docs/kubernetes/latest/documentation/about/architecture/">Kubernetes 아키텍처</a></li>
+  <li><a href="https://agentgateway.dev/docs/kubernetes/latest/documentation/mcp/static-mcp/">Kubernetes MCP backend 예</a></li>
+  <li><a href="https://agentgateway.dev/docs/standalone/latest/documentation/llm/about/">LLM 기능</a>, <a href="https://agentgateway.dev/docs/standalone/latest/documentation/configuration/security/mcp-authz/">MCP 인가</a></li>
+  <li><a href="https://www.linuxfoundation.org/press/linux-foundation-welcomes-agentgateway-project-to-accelerate-ai-agent-adoption-while-maintaining-security-observability-and-governance">Linux Foundation 발표 (2025-08-25)</a>, <a href="https://aaif.io/blog/agentgateway-joins-aaif-as-an-open-gateway-for-agentic-ai-infrastructure/">AAIF 발표 (2026-06-04)</a></li>
+  <li><a href="https://agentgateway.dev/blog/2026-06-04-designing-agentgateway-unified-gateway/">설계 블로그 (Rust 선택, 성능)</a></li>
+  <li><a href="https://docs.solo.io/agentgateway/latest/about/overview/">Solo Enterprise for agentgateway</a></li>
+</ul>
+
+<div class="box warn">
+  <span class="label">확인하지 못한 사실</span>
+  <ul>
+    <li>ToolHive 구성 요소의 GA, beta 상태. 문서에 표시가 없다.</li>
+    <li>Stacklok 상용 AI Gateway의 기반 기술. 문서에 언급이 없다.</li>
+    <li>agentgateway OpenAPI target이 Kubernetes 모드에서도 동작하는지 여부. standalone 문서에서만 봤다.</li>
+    <li>agentgateway가 stdio 프로세스를 세션마다 시작하는지, 하나를 공유하는지 여부.</li>
+    <li>agentgateway의 tool 이름 변경 기능. 이 문서에서 확인하지 않았다.</li>
+    <li>9장의 함께 쓰는 구성. 공식 문서에서 확인하지 않았고, 실제로 시험하지 않았다.</li>
+  </ul>
+  <p>인용하기 전에 원문을 다시 확인해야 한다.</p>
+</div>
+
+<footer>2026-10-13 작성. 기준 버전: ToolHive v0.52.0, agentgateway v1.6.0.</footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>우리 플랫폼의 MCP 인증 흐름</title>
+<link rel="stylesheet" href="../assets/learn.css">
+</head>
+<body>
+<div class="masthead"><div class="bar"><a class="brand" href="../index.html">learn</a><span class="crumb"><a href="index.html">OAuth</a></span></div></div>
+<div class="wrap">
+
+<header>
+  <h1>우리 플랫폼의 MCP 인증 흐름</h1>
+  <p class="kicker">OAuth 학습 6편 · 2026-11-18 작성</p>
+  <p>우리 MCP 서버의 인증 흐름을 코드로 따라가 보고, ID-JAG를 넣을 때 달라지는 점을 정리한다.</p>
+</header>
+
+<div class="box key">
+  <span class="label">한 문장 요약</span>
+  <p>우리 MCP 서버마다 들어 있는 프록시는 IdP가 아니라 MCP 인가 서버다. Okta에서 받은 IdP 토큰은 Redis에 두고, MCP 클라이언트에는 자기가 서명한 fastmcp 토큰을 준다.</p>
+</div>
+
+<div class="box">
+  <span class="label">읽는 방법</span>
+  <p>장마다 난이도를 표시했다. 1편 6장, 3편 6장, 5편을 먼저 읽으면 이해하기 쉽다.</p>
+  <ul>
+    <li><span class="lvl l1">초급</span> 1장과 2장에서 구성 요소와 역할을 다룬다.</li>
+    <li><span class="lvl l2">중급</span> 3장부터 6장까지는 로그인, MCP 요청, Redis, ID-JAG 비교를 다룬다.</li>
+    <li><span class="lvl l3">고급</span> 7장부터 9장까지는 다른 구조 두 가지와 backend 토큰 문제를 다룬다.</li>
+  </ul>
+</div>
+
+<nav class="toc">
+  <b>목차</b>
+  <ol start="0">
+    <li><a href="#s0">용어집</a></li>
+    <li><a href="#s1">구성 요소와 배치</a></li>
+    <li><a href="#s2">프록시와 IdP의 차이</a></li>
+    <li><a href="#s3">로그인 흐름</a></li>
+    <li><a href="#s4">MCP 요청과 backend 호출</a></li>
+    <li><a href="#s5">Redis에 저장하는 값</a></li>
+    <li><a href="#s6">ID-JAG와 비교</a></li>
+    <li><a href="#s7">사용자 ID로 토큰 하나를 묶는 안</a></li>
+    <li><a href="#s8">게이트웨이 방식</a></li>
+    <li><a href="#s9">ID-JAG와 backend 토큰</a></li>
+    <li><a href="#s10">자가 점검 문제</a></li>
+    <li><a href="#s11">참고 자료</a></li>
+  </ol>
+</nav>
+
+<h2 id="s0">0. 용어집</h2>
+<p>이 문서에서는 아래 용어를 표에 적은 뜻으로만 쓴다.</p>
+<div class="tbl"><table>
+<tr><th>용어</th><th>이 문서에서의 뜻</th></tr>
+<tr><td>IdP</td><td>사용자 계정을 가지고 로그인을 맡는 서비스. 이 문서에서는 Okta다.</td></tr>
+<tr><td>MCP 클라이언트</td><td>사용자를 대신해 MCP 서버를 부르는 앱. 예: 플랫폼 에이전트(core), IDE.</td></tr>
+<tr><td>MCP 서버</td><td>tool을 제공하는 서버. 우리 플랫폼에서는 런타임 이미지로 배포한 서버다.</td></tr>
+<tr><td>런타임</td><td>우리 MCP 서버 이미지의 코드.</td></tr>
+<tr><td>core</td><td>플랫폼 백엔드 라이브러리. 이 문서에서는 MCP 클라이언트 역할만 다룬다.</td></tr>
+<tr><td>MCP 인가 서버</td><td>MCP 서버용 access token을 발급하는 역할. 5편의 용어와 같다.</td></tr>
+<tr><td>프록시</td><td>fastmcp의 OAuthProxy. MCP 서버 안에서 MCP 인가 서버 역할을 한다.</td></tr>
+<tr><td>중앙 인가 서버</td><td>MCP 서버 밖에서 여러 MCP 서버의 토큰을 함께 발급하는 인가 서버. 지금 우리 플랫폼에는 없다.</td></tr>
+<tr><td>IdP 앱</td><td>관리자가 Okta에 등록한 OAuth 클라이언트 하나. 프록시는 이 앱의 client_id와 secret으로 Okta에 붙는다.</td></tr>
+<tr><td>IdP 토큰</td><td>Okta가 발급한 access token과 refresh token. 프록시가 Redis에 저장한다.</td></tr>
+<tr><td>IdP 토큰 묶음</td><td>프록시가 로그인 한 번으로 받은 IdP 토큰과 만료 시각을 모은 저장 값.</td></tr>
+<tr><td>upstream_token_id</td><td>프록시가 IdP 토큰 묶음마다 만드는 무작위 ID.</td></tr>
+<tr><td>fastmcp 토큰</td><td>프록시가 자기 키로 서명해서 MCP 클라이언트에게 주는 JWT. 구조는 3편 6장에 있다.</td></tr>
+<tr><td>jti</td><td>JWT마다 붙는 고유 ID claim. 프록시는 fastmcp 토큰의 jti로 IdP 토큰 묶음을 찾는다.</td></tr>
+<tr><td>인가 코드</td><td>로그인 뒤 콜백 주소에 붙어 오는 일회용 값. Okta가 주는 IdP 인가 코드와 프록시가 주는 프록시 인가 코드가 있다.</td></tr>
+<tr><td>콜백 주소</td><td>로그인이 끝나고 브라우저가 돌아오는 주소.</td></tr>
+<tr><td>DCR</td><td>Dynamic Client Registration. MCP 클라이언트가 실행 중에 인가 서버에 자기를 등록하는 방법(RFC 7591).</td></tr>
+<tr><td>PKCE</td><td>인가 코드를 가로챈 쪽이 그 코드를 쓰지 못하게 하는 장치(RFC 7636).</td></tr>
+<tr><td>트랜잭션</td><td>프록시가 로그인 한 번의 진행 상태를 저장한 기록.</td></tr>
+<tr><td>프록시 동의 화면</td><td>프록시가 사용자에게 허용 여부를 묻는 화면. 사용자는 여기서 위임 scope를 고른다.</td></tr>
+<tr><td>위임 scope</td><td>사용자가 프록시 동의 화면에서 MCP 클라이언트에 맡긴 scope.</td></tr>
+<tr><td>컬렉션</td><td>프록시가 Redis에 값을 종류별로 나눠 두는 이름. 예: <code>mcp-upstream-tokens</code>.</td></tr>
+<tr><td>backend API</td><td>MCP 서버의 tool이 부르는 API. 사용자가 OpenAPI 스펙으로 등록한다.</td></tr>
+<tr><td>토큰 전달</td><td>런타임이 backend API 요청의 Authorization 헤더에 IdP 토큰을 넣는 동작. 런타임의 토큰 전달 설정이 이 동작을 켠다.</td></tr>
+<tr><td>ID-JAG</td><td>IdP가 특정 MCP 인가 서버 앞으로 발급하는 서명된 JWT. 5편에서 다룬다.</td></tr>
+<tr><td>token exchange</td><td>RFC 8693. 가진 토큰을 내고 다른 종류의 토큰을 받는 OAuth 요청.</td></tr>
+<tr><td>subject token</td><td>token exchange 요청에서 사용자를 대신한다는 근거로 내는 토큰.</td></tr>
+<tr><td>token passthrough</td><td>MCP 서버가 자기 앞으로 발급되지 않은 토큰을 받아 다른 서버로 넘기는 일. MCP 권한 스펙이 금지한다.</td></tr>
+<tr><td>게이트웨이</td><td>MCP 서버 여러 개를 MCP 주소 하나 뒤에 두는 서버.</td></tr>
+<tr><td>백채널 요청</td><td>브라우저 없이 앱이나 서버가 직접 보내는 HTTP 요청.</td></tr>
+<tr><td>검증</td><td>받는 쪽이 토큰을 받아들일지 판단하는 전체 과정. 서명을 맞춰 보는 단계는 "서명 검증"이라고 부른다.</td></tr>
+</table></div>
+
+<h2 id="s1">1. 구성 요소와 배치<span class="lvl l1">초급</span></h2>
+<p>우리 플랫폼의 MCP 인증에는 구성 요소가 여섯 개 있다.</p>
+<div class="tbl"><table>
+<tr><th>구성 요소</th><th>하는 일</th></tr>
+<tr><td>MCP 클라이언트(core)</td><td>사용자를 대신해 MCP 서버를 부른다. fastmcp 토큰을 사용자 ID와 MCP 서버 주소별로 저장한다(core의 토큰 저장 코드).</td></tr>
+<tr><td>MCP 서버</td><td>tool을 제공한다. MCP 서버마다 프록시가 하나씩 들어 있다.</td></tr>
+<tr><td>프록시</td><td>Okta 로그인을 중개하고 fastmcp 토큰을 발급한다.</td></tr>
+<tr><td>Okta</td><td>사용자를 로그인시키고 IdP 토큰을 발급한다.</td></tr>
+<tr><td>Redis</td><td>프록시의 저장소다. 여러 MCP 서버가 Redis 하나를 함께 쓴다.</td></tr>
+<tr><td>backend API</td><td>tool이 부르는 API다.</td></tr>
+</table></div>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 820 370" width="820" role="img" aria-label="MCP 클라이언트가 MCP 서버 세 개의 프록시에 각각 다른 fastmcp 토큰으로 붙고, 세 MCP 서버가 Okta, Redis, backend API를 함께 쓰는 배치도">
+    <defs>
+      <marker id="f1m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+    </defs>
+
+    <text class="d-m" x="83" y="128" font-size="11.5" text-anchor="middle">서버마다 다른</text>
+    <text class="d-m" x="83" y="144" font-size="11.5" text-anchor="middle">fastmcp 토큰</text>
+    <rect class="d-acc" x="16" y="157" width="134" height="56" rx="8"/>
+    <text x="83" y="181" font-size="13" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <text class="d-m" x="83" y="200" font-size="11.5" text-anchor="middle">core 에이전트</text>
+
+    <rect class="d-outer" x="214" y="20" width="282" height="96" rx="10"/>
+    <text class="d-m" x="226" y="38" font-size="12" font-weight="700">MCP 서버 A</text>
+    <rect class="d-box" x="226" y="48" width="116" height="56" rx="8"/>
+    <text x="284" y="72" font-size="13" font-weight="600" text-anchor="middle">프록시</text>
+    <text class="d-m" x="284" y="90" font-size="11" text-anchor="middle">OAuthProxy</text>
+    <rect class="d-box" x="354" y="48" width="130" height="56" rx="8"/>
+    <text x="419" y="72" font-size="13" font-weight="600" text-anchor="middle">MCP endpoint</text>
+    <text class="d-m" x="419" y="90" font-size="11" text-anchor="middle">tool 실행</text>
+
+    <rect class="d-outer" x="214" y="137" width="282" height="96" rx="10"/>
+    <text class="d-m" x="226" y="155" font-size="12" font-weight="700">MCP 서버 B</text>
+    <rect class="d-box" x="226" y="165" width="116" height="56" rx="8"/>
+    <text x="284" y="189" font-size="13" font-weight="600" text-anchor="middle">프록시</text>
+    <text class="d-m" x="284" y="207" font-size="11" text-anchor="middle">OAuthProxy</text>
+    <rect class="d-box" x="354" y="165" width="130" height="56" rx="8"/>
+    <text x="419" y="189" font-size="13" font-weight="600" text-anchor="middle">MCP endpoint</text>
+    <text class="d-m" x="419" y="207" font-size="11" text-anchor="middle">tool 실행</text>
+
+    <rect class="d-outer" x="214" y="254" width="282" height="96" rx="10"/>
+    <text class="d-m" x="226" y="272" font-size="12" font-weight="700">MCP 서버 C</text>
+    <rect class="d-box" x="226" y="282" width="116" height="56" rx="8"/>
+    <text x="284" y="306" font-size="13" font-weight="600" text-anchor="middle">프록시</text>
+    <text class="d-m" x="284" y="324" font-size="11" text-anchor="middle">OAuthProxy</text>
+    <rect class="d-box" x="354" y="282" width="130" height="56" rx="8"/>
+    <text x="419" y="306" font-size="13" font-weight="600" text-anchor="middle">MCP endpoint</text>
+    <text class="d-m" x="419" y="324" font-size="11" text-anchor="middle">tool 실행</text>
+
+    <path class="d-line" d="M150,185 L224,76" marker-end="url(#f1m)"/>
+    <path class="d-line" d="M150,185 L224,193" marker-end="url(#f1m)"/>
+    <path class="d-line" d="M150,185 L224,310" marker-end="url(#f1m)"/>
+
+    <path class="d-line" d="M496,68 L530,68"/>
+    <path class="d-line" d="M496,185 L530,185"/>
+    <path class="d-line" d="M496,302 L530,302"/>
+    <path class="d-line" d="M530,50 L530,302"/>
+    <path class="d-line" d="M530,50 L608,50" marker-end="url(#f1m)"/>
+    <path class="d-line" d="M530,185 L608,185" marker-end="url(#f1m)"/>
+    <path class="d-line" d="M530,302 L608,302" marker-end="url(#f1m)"/>
+    <text class="d-m" x="569" y="42" font-size="11" text-anchor="middle">로그인, 갱신</text>
+    <text class="d-m" x="569" y="177" font-size="11" text-anchor="middle">IdP 토큰 저장</text>
+    <text class="d-m" x="569" y="294" font-size="11" text-anchor="middle">토큰 전달</text>
+
+    <rect class="d-warn" x="610" y="20" width="196" height="60" rx="8"/>
+    <text x="708" y="55" font-size="13" font-weight="600" text-anchor="middle">Okta (IdP)</text>
+
+    <rect class="d-box" x="610" y="137" width="196" height="96" rx="8"/>
+    <text x="708" y="161" font-size="13" font-weight="600" text-anchor="middle">Redis</text>
+    <text class="d-m" x="708" y="184" font-size="11.5" text-anchor="middle">&lt;접두사&gt;-mcp:A:…</text>
+    <text class="d-m" x="708" y="203" font-size="11.5" text-anchor="middle">&lt;접두사&gt;-mcp:B:…</text>
+    <text class="d-m" x="708" y="222" font-size="11.5" text-anchor="middle">&lt;접두사&gt;-mcp:C:…</text>
+
+    <rect class="d-box" x="610" y="254" width="196" height="96" rx="8"/>
+    <text x="708" y="296" font-size="13" font-weight="600" text-anchor="middle">backend API</text>
+    <text class="d-m" x="708" y="316" font-size="11.5" text-anchor="middle">OpenAPI 스펙으로 등록</text>
+  </svg>
+  </div>
+  <figcaption>그림 1. 우리 플랫폼의 배치. 프록시는 MCP 서버마다 하나씩 있고, MCP 서버들은 Redis 하나를 함께 쓰지만 키 접두사는 서버마다 다르다.</figcaption>
+</figure>
+
+<div class="box key">
+  <p>프록시는 MCP 서버가 아니라 MCP 서버 프로세스 안에 들어 있는 인증 부품이다. 그래서 MCP 서버가 세 개면 프록시도 세 개다.</p>
+</div>
+
+<h2 id="s2">2. 프록시와 IdP의 차이<span class="lvl l1">초급</span></h2>
+<p>MCP 클라이언트가 보기에 프록시는 인가 서버다. 프록시에 authorize 주소, token 주소, DCR 주소가 있기 때문이다(1편 6장). 그래서 프록시가 IdP처럼 보인다. 하지만 두 역할은 다르고, 사용자가 누구인지는 끝까지 Okta가 판단한다.</p>
+<div class="tbl"><table>
+<tr><th>항목</th><th>Okta(IdP)</th><th>프록시(MCP 인가 서버)</th></tr>
+<tr><td>사용자 계정</td><td>가진다.</td><td>없다. 로그인은 Okta에 맡긴다.</td></tr>
+<tr><td>발급하는 토큰</td><td>ID token, IdP 토큰, ID-JAG</td><td>fastmcp 토큰</td></tr>
+<tr><td>서명 방식</td><td>비대칭 키(RS256)로 서명한다. 공개 키는 JWKS로 공개한다.</td><td>대칭 키(HS256)로 서명한다. 키는 IdP 앱의 secret에서 만든다(런타임의 서버 코드).</td></tr>
+<tr><td>토큰을 받는 곳</td><td>Okta를 믿고 aud가 맞는 서비스</td><td>그 프록시가 든 MCP 서버 하나. aud가 그 서버의 MCP 주소다(3편 6장).</td></tr>
+<tr><td>개수</td><td>하나</td><td>MCP 서버마다 하나</td></tr>
+</table></div>
+
+<h3>두 역할이 한 곳인 구성</h3>
+<p>MCP 서버가 프록시 없이 Okta를 직접 MCP 인가 서버로 쓰는 구성도 있는데, 이때 MCP 클라이언트는 Okta에서 바로 access token을 받는다. 이 구성에서는 ID-JAG를 발급하는 쪽과 받는 쪽이 같은 Okta가 되므로 ID-JAG가 필요 없다.</p>
+
+<h2 id="s3">3. 로그인 흐름<span class="lvl l2">중급</span></h2>
+<p>로그인 한 번은 아래 순서로 흐른다. 1편 6장에서 설명한 순서와 같고, 이 장에서는 Redis에 값이 들어가는 시점을 더했다. 1번에 앞서 MCP 클라이언트는 DCR로 프록시에 자기를 등록한다.</p>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 840 580" width="840" role="img" aria-label="브라우저, MCP 클라이언트, 프록시, Okta, Redis 다섯 참여자 사이의 로그인 순서도">
+    <defs>
+      <marker id="f2m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+      <marker id="f2w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="d-head-w" d="M0,0 L10,5 L0,10 z"/></marker>
+    </defs>
+
+    <rect class="d-band" x="8" y="62" width="824" height="192" rx="8"/>
+    <rect class="d-band" x="8" y="260" width="824" height="118" rx="8"/>
+    <rect class="d-band" x="8" y="384" width="824" height="182" rx="8"/>
+
+    <rect class="d-box" x="18" y="12" width="124" height="40" rx="8"/>
+    <text x="80" y="37" font-size="13" font-weight="600" text-anchor="middle">브라우저</text>
+    <rect class="d-acc" x="178" y="12" width="124" height="40" rx="8"/>
+    <text x="240" y="37" font-size="13" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <rect class="d-box" x="358" y="12" width="124" height="40" rx="8"/>
+    <text x="420" y="37" font-size="13" font-weight="600" text-anchor="middle">프록시</text>
+    <rect class="d-warn" x="538" y="12" width="124" height="40" rx="8"/>
+    <text x="600" y="37" font-size="13" font-weight="600" text-anchor="middle">Okta</text>
+    <rect class="d-box" x="698" y="12" width="124" height="40" rx="8"/>
+    <text x="760" y="37" font-size="13" font-weight="600" text-anchor="middle">Redis</text>
+
+    <path class="d-life" d="M80,52 L80,572"/>
+    <path class="d-life" d="M240,52 L240,572"/>
+    <path class="d-life" d="M420,52 L420,572"/>
+    <path class="d-life" d="M600,52 L600,572"/>
+    <path class="d-life" d="M760,52 L760,572"/>
+    <text class="d-a h" x="16" y="78" font-size="12" font-weight="700">① 동의와 로그인</text>
+    <text class="d-a h" x="16" y="276" font-size="12" font-weight="700">② 프록시가 IdP 토큰을 받는다</text>
+    <text class="d-a h" x="16" y="400" font-size="12" font-weight="700">③ MCP 클라이언트가 fastmcp 토큰을 받는다</text>
+
+    <path class="d-dash" d="M240,100 L82,100" marker-end="url(#f2w)"/>
+    <text x="160" y="93" font-size="12" text-anchor="middle">authorize 주소로 보낸다</text>
+    <path class="d-dash" d="M80,128 L418,128" marker-end="url(#f2w)"/>
+    <text x="330" y="121" font-size="12" text-anchor="middle">authorize 요청</text>
+    <path class="d-dash" d="M420,156 L82,156" marker-end="url(#f2w)"/>
+    <text x="330" y="149" font-size="12" text-anchor="middle">프록시 동의 화면</text>
+    <path class="d-dash" d="M80,186 L598,186" marker-end="url(#f2w)"/>
+    <text x="510" y="179" font-size="12" text-anchor="middle">허용 뒤 Okta 로그인</text>
+    <path class="d-dash" d="M600,214 L82,214" marker-end="url(#f2w)"/>
+    <text x="510" y="207" font-size="12" text-anchor="middle">IdP 인가 코드</text>
+    <path class="d-dash" d="M80,242 L418,242" marker-end="url(#f2w)"/>
+    <text x="330" y="235" font-size="12" text-anchor="middle">콜백 주소 + IdP 인가 코드</text>
+
+    <path class="d-line" d="M420,296 L598,296" marker-end="url(#f2m)"/>
+    <text x="510" y="289" font-size="12" text-anchor="middle">IdP 인가 코드 교환</text>
+    <path class="d-line" d="M600,324 L422,324" marker-end="url(#f2m)"/>
+    <text x="510" y="317" font-size="12" text-anchor="middle">IdP 토큰</text>
+    <path class="d-line" d="M420,356 L758,356" marker-end="url(#f2m)"/>
+    <text x="590" y="349" font-size="12" text-anchor="middle">프록시 인가 코드 + IdP 토큰</text>
+
+    <path class="d-dash" d="M420,428 L82,428" marker-end="url(#f2w)"/>
+    <text x="250" y="421" font-size="12" text-anchor="middle">프록시 인가 코드</text>
+    <path class="d-dash" d="M80,456 L238,456" marker-end="url(#f2w)"/>
+    <text x="160" y="449" font-size="12" text-anchor="middle">콜백 주소로 전달</text>
+    <path class="d-line" d="M240,486 L418,486" marker-end="url(#f2m)"/>
+    <text x="330" y="479" font-size="12" text-anchor="middle">프록시 인가 코드 교환</text>
+    <path class="d-line" d="M420,516 L758,516" marker-end="url(#f2m)"/>
+    <text x="590" y="509" font-size="12" text-anchor="middle">IdP 토큰 묶음, jti 대응</text>
+    <path class="d-line" d="M420,548 L242,548" marker-end="url(#f2m)"/>
+    <text x="330" y="541" font-size="12" text-anchor="middle">fastmcp 토큰</text>
+  </svg>
+  </div>
+  <figcaption>그림 2. 로그인 한 번의 순서. 점선은 브라우저를 거치는 요청이고 실선은 백채널 요청이다. 프록시는 ②에서 IdP 토큰을 먼저 받고 ③에서 fastmcp 토큰을 준다.</figcaption>
+</figure>
+
+<ol>
+  <li>MCP 클라이언트가 브라우저를 프록시의 authorize 주소로 보내면, 프록시는 트랜잭션을 Redis에 저장한다(<code>proxy.py:1204</code>).</li>
+  <li>프록시가 프록시 동의 화면을 보여 주고, 사용자는 위임 scope를 골라 허용한다.</li>
+  <li>프록시가 브라우저를 Okta로 보내고, 사용자가 Okta에 로그인한다.</li>
+  <li>Okta가 브라우저를 프록시의 콜백 주소로 보내는데, 이 주소에 IdP 인가 코드가 붙어 있다.</li>
+  <li>프록시가 IdP 앱의 client_id와 secret으로 IdP 인가 코드를 IdP 토큰으로 바꾼다(<code>proxy.py:2753</code>).</li>
+  <li>프록시가 프록시 인가 코드를 만들고, 이 코드와 IdP 토큰을 Redis에 5분 동안 둔다(<code>proxy.py:2779</code>).</li>
+  <li>프록시가 브라우저를 MCP 클라이언트의 콜백 주소로 보내는데, 이 주소에 프록시 인가 코드가 붙어 있다.</li>
+  <li>MCP 클라이언트가 프록시 인가 코드를 프록시의 token 주소로 보낸다(<code>proxy.py:1288</code>).</li>
+  <li>프록시가 IdP 토큰 묶음을 Redis에 저장하고(<code>proxy.py:1421</code>), 그다음 fastmcp 토큰을 서명한다(<code>proxy.py:1436</code>).</li>
+  <li>프록시가 jti와 upstream_token_id의 대응을 Redis에 저장하고(<code>proxy.py:1457</code>), fastmcp 토큰을 MCP 클라이언트에 준다.</li>
+</ol>
+
+<div class="box key">
+  <p>프록시는 IdP 토큰을 먼저 받고, fastmcp 토큰은 그다음에 준다. MCP 클라이언트는 IdP 토큰을 끝까지 보지 못한다.</p>
+</div>
+
+<h2 id="s4">4. MCP 요청과 backend 호출<span class="lvl l2">중급</span></h2>
+<p>로그인한 뒤의 MCP 요청 한 번은 아래 순서로 흐른다.</p>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 860 366" width="860" role="img" aria-label="MCP 클라이언트, 프록시, Redis, Okta, backend API 사이의 MCP 요청 순서도">
+    <defs>
+      <marker id="f3m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+    </defs>
+
+    <rect class="d-band" x="8" y="190" width="844" height="72" rx="8"/>
+    <text class="d-a" x="16" y="206" font-size="12" font-weight="700">필요할 때만</text>
+
+    <rect class="d-acc" x="25" y="12" width="130" height="40" rx="8"/>
+    <text x="90" y="37" font-size="13" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <rect class="d-box" x="215" y="12" width="150" height="40" rx="8"/>
+    <text x="290" y="37" font-size="13" font-weight="600" text-anchor="middle">MCP 서버(프록시)</text>
+    <rect class="d-box" x="410" y="12" width="120" height="40" rx="8"/>
+    <text x="470" y="37" font-size="13" font-weight="600" text-anchor="middle">Redis</text>
+    <rect class="d-warn" x="570" y="12" width="120" height="40" rx="8"/>
+    <text x="630" y="37" font-size="13" font-weight="600" text-anchor="middle">Okta</text>
+    <rect class="d-box" x="725" y="12" width="130" height="40" rx="8"/>
+    <text x="790" y="37" font-size="13" font-weight="600" text-anchor="middle">backend API</text>
+
+    <path class="d-life" d="M90,52 L90,358"/>
+    <path class="d-life" d="M290,52 L290,358"/>
+    <path class="d-life" d="M470,52 L470,358"/>
+    <path class="d-life" d="M630,52 L630,358"/>
+    <path class="d-life" d="M790,52 L790,358"/>
+
+    <path class="d-line" d="M90,92 L288,92" marker-end="url(#f3m)"/>
+    <text x="190" y="85" font-size="12" text-anchor="middle">MCP 요청 + fastmcp 토큰</text>
+    <text class="d-m" x="298" y="118" font-size="11.5">서명 검증, jti 꺼내기</text>
+    <path class="d-line" d="M290,146 L468,146" marker-end="url(#f3m)"/>
+    <text x="380" y="139" font-size="12" text-anchor="middle">jti로 찾기</text>
+    <path class="d-line" d="M470,174 L292,174" marker-end="url(#f3m)"/>
+    <text x="380" y="167" font-size="12" text-anchor="middle">IdP 토큰 묶음</text>
+
+    <path class="d-line" d="M290,222 L628,222" marker-end="url(#f3m)"/>
+    <text x="460" y="215" font-size="12" text-anchor="middle">IdP 토큰 갱신</text>
+    <path class="d-line" d="M630,250 L292,250" marker-end="url(#f3m)"/>
+    <text x="460" y="243" font-size="12" text-anchor="middle">새 IdP 토큰</text>
+
+    <path class="d-line" d="M290,290 L788,290" marker-end="url(#f3m)"/>
+    <text x="540" y="283" font-size="12" text-anchor="middle">tool 호출 + IdP 토큰 (토큰 전달)</text>
+    <path class="d-line" d="M790,318 L292,318" marker-end="url(#f3m)"/>
+    <text x="540" y="311" font-size="12" text-anchor="middle">응답</text>
+    <path class="d-line" d="M290,346 L92,346" marker-end="url(#f3m)"/>
+    <text x="190" y="339" font-size="12" text-anchor="middle">MCP 응답</text>
+  </svg>
+  </div>
+  <figcaption>그림 3. MCP 요청 한 번의 순서. 프록시는 jti로 IdP 토큰 묶음을 찾고, 토큰 전달을 쓰면 backend API는 IdP 토큰을 받는다.</figcaption>
+</figure>
+
+<ol>
+  <li>MCP 클라이언트가 MCP 요청에 fastmcp 토큰을 붙여 보낸다.</li>
+  <li>프록시가 fastmcp 토큰을 서명 검증하고 jti를 꺼낸다(<code>proxy.py:2151</code>).</li>
+  <li>프록시가 jti로 upstream_token_id를 찾고, 그 값으로 IdP 토큰 묶음을 찾는다(<code>proxy.py:2174</code>, <code>:2183</code>).</li>
+  <li>프록시가 IdP 토큰을 검증하고, IdP 토큰이 곧 만료되면 Okta에서 새 IdP 토큰을 받는다(<code>proxy.py:2200</code>).</li>
+  <li>tool이 backend API를 부르면 런타임이 IdP 토큰을 Authorization 헤더에 넣는다(런타임의 서버 코드).</li>
+</ol>
+<p>5번이 토큰 전달인데, backend가 Bearer 인증을 쓰고 토큰 전달 설정이 켜졌을 때만 일어난다(런타임의 서버 코드). IdP 토큰에는 로그인용 scope만 들어 있고, 위임 scope는 fastmcp 토큰에만 들어간다(런타임의 위임 scope 코드).</p>
+
+<h2 id="s5">5. Redis에 저장하는 값<span class="lvl l2">중급</span></h2>
+<p>프록시는 Redis에 값을 컬렉션별로 나눠 두는데, 아래 표에는 주요 컬렉션만 적었다.</p>
+<div class="tbl"><table>
+<tr><th>컬렉션</th><th>키</th><th>값</th><th>수명</th></tr>
+<tr><td><code>mcp-oauth-proxy-clients</code></td><td>client_id</td><td>DCR로 등록한 MCP 클라이언트 정보</td><td>14일. 읽을 때마다 다시 14일이 된다(런타임의 Redis 저장소 래퍼).</td></tr>
+<tr><td><code>mcp-oauth-transactions</code></td><td>트랜잭션 ID</td><td>로그인 한 번의 진행 상태</td><td>15분(<code>proxy.py:1204</code>)</td></tr>
+<tr><td><code>mcp-authorization-codes</code></td><td>프록시 인가 코드</td><td>IdP 토큰과 PKCE 값</td><td>5분(<code>proxy.py:2779</code>)</td></tr>
+<tr><td><code>mcp-upstream-tokens</code></td><td>upstream_token_id</td><td>IdP 토큰 묶음</td><td>묶음 안에서 가장 늦게 만료되는 토큰까지(<code>proxy.py:1421</code>)</td></tr>
+<tr><td><code>mcp-jti-mappings</code></td><td>fastmcp 토큰의 jti</td><td>upstream_token_id</td><td>그 fastmcp 토큰이 만료될 때까지(<code>proxy.py:1457</code>)</td></tr>
+<tr><td><code>mcp-refresh-tokens</code></td><td>fastmcp refresh token의 해시</td><td>refresh token 메타데이터</td><td>그 refresh token이 만료될 때까지</td></tr>
+</table></div>
+
+<h3>서버별 접두사와 암호화</h3>
+<p>키 이름 앞에는 MCP 서버별 접두사가 붙고, 접두사의 기본값은 <code>&lt;접두사&gt;-mcp:{서버 이름}</code>이다(런타임 설정). 그래서 프록시는 다른 MCP 서버의 키를 찾지 않는다(런타임의 Redis 저장소 래퍼).</p>
+<p>런타임은 Redis에 넣는 값을 모두 Fernet으로 암호화하는데(런타임의 서버 코드), 암호화 키도 IdP 앱의 secret에서 만든다.</p>
+
+<h3>IdP 토큰 묶음을 찾는 키</h3>
+<div class="box key">
+  <p>IdP 토큰 묶음을 찾는 키는 세션 ID도 사용자 ID도 아니다. 프록시는 fastmcp 토큰의 jti로 upstream_token_id를 찾고, 그 값으로 IdP 토큰 묶음을 찾는다.</p>
+</div>
+<p>IdP 토큰 묶음은 로그인 한 번마다 하나 생기고, 토큰을 갱신할 때는 기존 묶음을 고쳐 쓴다(<code>proxy.py:1912</code>). 예를 들어 MCP 클라이언트가 MCP 서버 세 개에 한 번씩 로그인하면 묶음이 세 개 생기고, 세 묶음은 서버별 접두사로 나뉜다.</p>
+
+<h2 id="s6">6. ID-JAG와 비교<span class="lvl l2">중급</span></h2>
+<p>지금 흐름과 ID-JAG는 신뢰 구조가 같다. 둘 다 Okta가 사용자를 증명하고, 프록시는 그 증명을 믿고 fastmcp 토큰을 준다. 그래서 지금 흐름이 ID-JAG와 비슷해 보이는데, 다른 점은 증명이 오는 길과 Okta 토큰을 가진 쪽이다.</p>
+<div class="tbl"><table>
+<tr><th>항목</th><th>지금 흐름</th><th>ID-JAG</th></tr>
+<tr><td>사용자 증명이 오는 길</td><td>MCP 서버마다 브라우저로 Okta에 로그인한다.</td><td>core가 Okta에서 받은 ID-JAG를 백채널 요청으로 낸다.</td></tr>
+<tr><td>프록시 동의 화면</td><td>MCP 서버마다 나온다.</td><td>나오지 않는다. Okta 정책이 대신한다.</td></tr>
+<tr><td>Okta 토큰을 가진 쪽</td><td>각 프록시. Redis에 둔다.</td><td>core. 사용자별 Okta refresh token을 둔다.</td></tr>
+<tr><td>MCP 클라이언트가 받는 토큰</td><td>서버마다 다른 fastmcp 토큰</td><td>서버마다 다른 fastmcp 토큰</td></tr>
+<tr><td>fastmcp refresh token</td><td>준다.</td><td>주지 않는다(5편 7장).</td></tr>
+<tr><td>backend API에 보낼 IdP 토큰</td><td>Redis에 있다.</td><td>없다(9장).</td></tr>
+</table></div>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 840 350" width="840" role="img" aria-label="core, Okta, MCP 서버 A의 프록시, backend API 사이의 ID-JAG 순서도. 마지막 토큰 전달에서 fastmcp 토큰이 backend API로 나간다">
+    <defs>
+      <marker id="f4m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+      <marker id="f4w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="4" markerHeight="4" orient="auto"><path class="d-head-w" d="M0,0 L10,5 L0,10 z"/></marker>
+    </defs>
+
+    <rect class="d-acc" x="25" y="12" width="150" height="40" rx="8"/>
+    <text x="100" y="37" font-size="13" font-weight="600" text-anchor="middle">MCP 클라이언트(core)</text>
+    <rect class="d-warn" x="260" y="12" width="120" height="40" rx="8"/>
+    <text x="320" y="37" font-size="13" font-weight="600" text-anchor="middle">Okta</text>
+    <rect class="d-box" x="465" y="12" width="150" height="40" rx="8"/>
+    <text x="540" y="37" font-size="13" font-weight="600" text-anchor="middle">MCP 서버 A(프록시)</text>
+    <rect class="d-box" x="690" y="12" width="120" height="40" rx="8"/>
+    <text x="750" y="37" font-size="13" font-weight="600" text-anchor="middle">backend API</text>
+
+    <path class="d-life" d="M100,52 L100,340"/>
+    <path class="d-life" d="M320,52 L320,340"/>
+    <path class="d-life" d="M540,52 L540,340"/>
+    <path class="d-life" d="M750,52 L750,340"/>
+    <text class="d-m" x="108" y="74" font-size="11.5">Okta refresh token 보관</text>
+
+    <path class="d-line" d="M100,104 L318,104" marker-end="url(#f4m)"/>
+    <text x="210" y="97" font-size="12" text-anchor="middle">token exchange</text>
+    <path class="d-line" d="M320,134 L102,134" marker-end="url(#f4m)"/>
+    <text x="210" y="127" font-size="12" text-anchor="middle">ID-JAG (aud = 프록시 A)</text>
+    <path class="d-line" d="M100,170 L538,170" marker-end="url(#f4m)"/>
+    <text x="320" y="163" font-size="12" text-anchor="middle">JWT bearer grant (ID-JAG)</text>
+    <text class="d-m" x="548" y="194" font-size="11.5">ID-JAG 검증</text>
+    <path class="d-line" d="M540,216 L102,216" marker-end="url(#f4m)"/>
+    <text x="320" y="209" font-size="12" text-anchor="middle">fastmcp 토큰</text>
+    <path class="d-line" d="M100,252 L538,252" marker-end="url(#f4m)"/>
+    <text x="320" y="245" font-size="12" text-anchor="middle">MCP 요청 + fastmcp 토큰</text>
+
+    <path class="d-bad" d="M540,292 L747,292" marker-end="url(#f4w)"/>
+    <text class="d-w" x="645" y="284" font-size="12" font-weight="600" text-anchor="middle">토큰 전달: fastmcp 토큰</text>
+    <text class="d-w" x="645" y="316" font-size="11.5" text-anchor="middle">연결된 IdP 토큰이 없다(9장)</text>
+  </svg>
+  </div>
+  <figcaption>그림 4. ID-JAG를 넣은 뒤의 순서. 브라우저를 쓰지 않고, 서버 B와 C에는 token exchange부터 반복한다. 굵은 주황 선은 9장에서 다루는 문제다.</figcaption>
+</figure>
+
+<div class="box key">
+  <p>ID-JAG에서도 access token은 MCP 서버마다 따로 받고, 공유하는 것은 core가 가진 Okta 로그인이다(5편 14.2절).</p>
+</div>
+
+<h2 id="s7">7. 사용자 ID로 토큰 하나를 묶는 안<span class="lvl l3">고급</span></h2>
+<p>이 장에서는 검토한 안 하나를 다룬다. 안의 내용은 다음과 같다.</p>
+<ol>
+  <li>프록시가 사용자 ID별로 토큰을 모은다.</li>
+  <li>같은 사용자에게는 MCP 서버가 달라도 같은 토큰을 준다.</li>
+  <li>MCP 클라이언트는 토큰 하나로 MCP 서버 세 개를 부른다.</li>
+  <li>뒤쪽에서는 프록시가 서버마다 다른 IdP 토큰으로 Okta와 통신한다.</li>
+</ol>
+<p>이 안은 ID-JAG가 아니다. ID-JAG는 access token을 공유하지 않고, MCP 클라이언트가 가진 Okta 로그인을 공유한다.</p>
+
+<h3>문제 세 가지</h3>
+<ol>
+  <li><b>aud 규칙을 어긴다.</b> 서버 세 개가 받는 토큰은 aud를 서버 하나로 정할 수 없어서, 이 토큰이 새면 서버 세 개가 모두 열린다(5편 1장).</li>
+  <li><b>MCP 클라이언트 구분이 사라진다.</b> 같은 사용자의 core 에이전트와 IDE가 같은 토큰을 쓰게 되고, 클라이언트마다 고른 위임 scope도 섞인다.</li>
+  <li><b>지금 구조로는 만들 수 없다.</b> 프록시는 MCP 서버마다 따로 있고, fastmcp 토큰의 aud와 Redis 접두사도 서버마다 다르다. 서버 세 개가 토큰 하나를 믿게 하려면 프록시를 중앙 인가 서버로 옮겨야 한다.</li>
+</ol>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 820 310" width="820" role="img" aria-label="두 패널 비교. 왼쪽은 토큰 T 하나로 MCP 서버 세 개를 부르는 구조이고, 오른쪽은 게이트웨이가 토큰 G를 받아 서버마다 토큰 a, b, c로 바꿔 보내는 구조">
+    <defs>
+      <marker id="f5m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+    </defs>
+
+    <rect class="d-outer" x="8" y="8" width="396" height="294" rx="10"/>
+    <text x="22" y="32" font-size="13" font-weight="700">(가) 사용자 ID로 토큰 하나를 묶는 안</text>
+    <rect class="d-acc" x="24" y="128" width="120" height="48" rx="8"/>
+    <text x="84" y="157" font-size="13" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <rect class="d-box" x="272" y="56" width="116" height="42" rx="8"/>
+    <text x="330" y="82" font-size="12.5" font-weight="600" text-anchor="middle">MCP 서버 A</text>
+    <rect class="d-box" x="272" y="131" width="116" height="42" rx="8"/>
+    <text x="330" y="157" font-size="12.5" font-weight="600" text-anchor="middle">MCP 서버 B</text>
+    <rect class="d-box" x="272" y="206" width="116" height="42" rx="8"/>
+    <text x="330" y="232" font-size="12.5" font-weight="600" text-anchor="middle">MCP 서버 C</text>
+    <path class="d-line" d="M144,152 L270,77" marker-end="url(#f5m)"/>
+    <path class="d-line" d="M144,152 L270,152" marker-end="url(#f5m)"/>
+    <path class="d-line" d="M144,152 L270,227" marker-end="url(#f5m)"/>
+    <text x="200" y="108" font-size="12" font-weight="700" text-anchor="middle">T</text>
+    <text x="207" y="145" font-size="12" font-weight="700" text-anchor="middle">T</text>
+    <text x="200" y="206" font-size="12" font-weight="700" text-anchor="middle">T</text>
+    <text class="d-w" x="22" y="272" font-size="12">T 하나가 새면 A, B, C가 모두 열린다.</text>
+    <text class="d-w" x="22" y="292" font-size="12">T의 aud를 서버 하나로 정할 수 없다.</text>
+
+    <rect class="d-outer" x="416" y="8" width="396" height="294" rx="10"/>
+    <text x="430" y="32" font-size="13" font-weight="700">(나) 게이트웨이 방식</text>
+    <rect class="d-acc" x="428" y="128" width="112" height="48" rx="8"/>
+    <text x="484" y="157" font-size="12.5" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <rect class="d-ok" x="580" y="122" width="96" height="60" rx="8"/>
+    <text x="628" y="157" font-size="13" font-weight="600" text-anchor="middle">게이트웨이</text>
+    <rect class="d-box" x="708" y="56" width="96" height="42" rx="8"/>
+    <text x="756" y="82" font-size="12" font-weight="600" text-anchor="middle">MCP 서버 A</text>
+    <rect class="d-box" x="708" y="131" width="96" height="42" rx="8"/>
+    <text x="756" y="157" font-size="12" font-weight="600" text-anchor="middle">MCP 서버 B</text>
+    <rect class="d-box" x="708" y="206" width="96" height="42" rx="8"/>
+    <text x="756" y="232" font-size="12" font-weight="600" text-anchor="middle">MCP 서버 C</text>
+    <path class="d-line" d="M540,152 L578,152" marker-end="url(#f5m)"/>
+    <text x="559" y="144" font-size="12" font-weight="700" text-anchor="middle">G</text>
+    <path class="d-line" d="M676,152 L706,77" marker-end="url(#f5m)"/>
+    <path class="d-line" d="M676,152 L706,152" marker-end="url(#f5m)"/>
+    <path class="d-line" d="M676,152 L706,227" marker-end="url(#f5m)"/>
+    <text x="684" y="106" font-size="11.5" font-weight="700" text-anchor="middle">a</text>
+    <text x="691" y="145" font-size="11.5" font-weight="700" text-anchor="middle">b</text>
+    <text x="684" y="206" font-size="11.5" font-weight="700" text-anchor="middle">c</text>
+    <text class="d-o" x="430" y="272" font-size="12">G의 aud는 게이트웨이 하나다.</text>
+    <text class="d-o" x="430" y="292" font-size="12">게이트웨이가 서버마다 a, b, c로 바꿔 보낸다.</text>
+  </svg>
+  </div>
+  <figcaption>그림 5. MCP 클라이언트가 토큰 하나만 갖는 두 구조. (가)는 aud 규칙을 어기고, (나)는 토큰의 aud를 게이트웨이 하나로 정하므로 규칙을 지킨다.</figcaption>
+</figure>
+
+<h3>사용자 단위로 묶는 곳</h3>
+<p>사용자 단위로 묶는 일은 이미 MCP 클라이언트 쪽에서 하고 있다. core는 토큰을 <code>user:{사용자 ID}:</code> 접두사와 MCP 서버 주소로 저장한다(core의 토큰 저장 코드). ID-JAG를 넣어도 이 구조는 그대로이고, core에 사용자별 Okta 로그인 하나만 더 생긴다.</p>
+
+<h2 id="s8">8. 게이트웨이 방식<span class="lvl l3">고급</span></h2>
+<p>MCP 클라이언트가 토큰 하나만 가져야 한다면 게이트웨이 방식이 맞다(5편 9장). 그림 5의 (나)가 이 구조다.</p>
+<ol>
+  <li>MCP 서버 여러 개를 게이트웨이의 MCP 주소 하나 뒤에 둔다.</li>
+  <li>MCP 클라이언트는 게이트웨이 하나에만 로그인하고, 토큰의 aud는 게이트웨이다.</li>
+  <li>게이트웨이가 뒤쪽 MCP 서버마다 토큰을 바꿔서 보낸다.</li>
+</ol>
+<p>이 구조에서 토큰을 관리하는 쪽은 게이트웨이라서, 7장의 안이 프록시에 맡기려던 일을 게이트웨이가 한다. 대신 게이트웨이가 모든 MCP 요청의 관문이 되므로, 게이트웨이가 멈추면 뒤쪽 MCP 서버를 하나도 쓸 수 없다.</p>
+
+<h2 id="s9">9. ID-JAG와 backend 토큰<span class="lvl l3">고급</span></h2>
+<p>ID-JAG를 넣으면 4장 5번의 토큰 전달이 깨진다. 이 내용은 코드를 읽은 결과이고, 실행해서 확인하지는 않았다.</p>
+<ol>
+  <li>fastmcp는 ID-JAG로 발급한 fastmcp 토큰에 IdP 토큰 묶음을 연결하지 않는다.</li>
+  <li>프록시는 이 토큰을 검증할 때 Redis를 찾지 않고, 받은 토큰을 그대로 돌려준다(<code>proxy.py:2159</code>).</li>
+  <li>런타임은 돌려받은 토큰을 Authorization 헤더에 넣는다(런타임의 서버 코드).</li>
+  <li>그래서 backend API는 Okta 토큰 대신 fastmcp 토큰을 받는다.</li>
+</ol>
+<p>fastmcp 토큰은 프록시가 HS256으로 서명한 값이고, aud도 backend API가 아니라 MCP 서버다. 그래서 Okta 토큰을 검증하는 backend API는 이 토큰을 거부할 가능성이 높다.</p>
+
+<h3>backend 토큰을 얻는 방법과 추천</h3>
+<div class="tbl"><table>
+<tr><th>방법</th><th>추천</th><th>이유</th></tr>
+<tr><td>① 토큰 전달을 쓰지 않는 MCP 서버에만 ID-JAG를 켠다.</td><td>추천. 첫 단계로 쓴다.</td><td>새 신뢰 관계가 필요 없다. 토큰 전달을 쓰는 서버는 지금 흐름을 그대로 쓴다. 두 흐름은 한 프록시에서 함께 동작한다(5편 14.4절).</td></tr>
+<tr><td>② 프록시가 Okta에서 backend용 토큰을 따로 받는다.</td><td>검토 후보. PoC에서 확인한다.</td><td>표준 token exchange(RFC 8693)를 쓰는 방법이다. 다만 프록시에는 사용자의 Okta 토큰이 없다. subject token으로 무엇을 낼지와 Okta의 지원 여부를 확인하지 않았다.</td></tr>
+<tr><td>③ backend API가 fastmcp 토큰을 받아들인다.</td><td>추천하지 않는다.</td><td>fastmcp 토큰은 대칭 키로 서명한다. backend API가 검증하려면 같은 키를 가져야 한다. 그러면 backend API도 fastmcp 토큰을 만들 수 있게 된다.</td></tr>
+<tr><td>④ core가 backend용 토큰을 따로 받아 MCP 요청 헤더로 넘긴다.</td><td>추천하지 않는다.</td><td>런타임에는 MCP 요청 헤더를 backend API로 옮기는 기능이 있다(런타임의 서버 코드). 그러나 MCP 서버가 자기 앞으로 발급되지 않은 토큰을 넘기게 된다. MCP 권한 스펙이 금지하는 token passthrough에 해당할 가능성이 있다.</td></tr>
+<tr><td>⑤ backend API를 서비스 자격(client credentials)으로 부른다.</td><td>사용자별 권한이 없는 backend API에만 쓴다.</td><td>client credentials로 받은 토큰에는 사용자 정보가 없다. 그래서 backend API는 사용자를 구분하지 못한다.</td></tr>
+</table></div>
+
+<h2 id="s10">10. 자가 점검 문제</h2>
+<p>먼저 답을 생각해 보고, 그다음 펼쳐서 확인한다.</p>
+<details><summary>Q1. MCP 서버가 세 개다. 프록시는 몇 개이고 어디에 있나?</summary>
+<p>세 개다. 프록시는 따로 떠 있는 서버가 아니라 MCP 서버 프로세스마다 하나씩 들어 있다.</p></details>
+<details><summary>Q2. 프록시는 IdP인가?</summary>
+<p>아니다. 프록시는 MCP 인가 서버다. 사용자 계정이 없고, 사용자 로그인은 Okta에 맡긴다.</p></details>
+<details><summary>Q3. 로그인 중 프록시가 IdP 토큰을 받는 일과 fastmcp 토큰을 주는 일 중 어느 쪽이 먼저인가?</summary>
+<p>IdP 토큰을 받는 일이 먼저다. 프록시는 Okta가 콜백 주소로 돌아올 때 IdP 인가 코드를 IdP 토큰으로 바꾸고, fastmcp 토큰은 MCP 클라이언트가 프록시 인가 코드를 낸 뒤에 준다.</p></details>
+<details><summary>Q4. 프록시가 Redis에서 IdP 토큰 묶음을 찾을 때 쓰는 키는 세션 ID인가, 사용자 ID인가?</summary>
+<p>둘 다 아니다. 프록시는 fastmcp 토큰의 jti로 upstream_token_id를 찾고, 그 값으로 IdP 토큰 묶음을 찾는다.</p></details>
+<details><summary>Q5. MCP 클라이언트가 MCP 서버 세 개에 한 번씩 로그인했다. Redis에 IdP 토큰 묶음은 몇 개 생기나?</summary>
+<p>세 개 생긴다. 프록시가 서버마다 따로 로그인을 처리하기 때문이고, 세 묶음은 서버별 접두사로 나뉜다.</p></details>
+<details><summary>Q6. ID-JAG를 넣었다. MCP 서버 세 개를 쓰는 MCP 클라이언트는 access token을 몇 개 가지나?</summary>
+<p>세 개 가진다. ID-JAG에서도 access token은 서버마다 따로 받고, 공유하는 것은 core가 가진 Okta 로그인이다.</p></details>
+<details><summary>Q7. 같은 사용자의 core 에이전트와 IDE가 토큰 하나를 같이 쓰면 무엇을 잃나?</summary>
+<p>MCP 클라이언트의 구분을 잃는다. 클라이언트마다 고른 위임 scope가 섞이고, 한 클라이언트의 토큰을 취소하면 다른 클라이언트도 끊긴다.</p></details>
+<details><summary>Q8. MCP 클라이언트가 토큰 하나만 가져야 한다. aud 규칙을 지키는 구조는 무엇인가?</summary>
+<p>게이트웨이 방식이다. 토큰의 aud는 게이트웨이 하나이고, 게이트웨이가 뒤쪽 MCP 서버마다 토큰을 바꿔서 보낸다.</p></details>
+<details><summary>Q9. 토큰 전달을 쓰는 MCP 서버에 ID-JAG를 켰다. backend API는 어떤 토큰을 받나?</summary>
+<p>코드를 읽은 결과로는 fastmcp 토큰을 받는다. ID-JAG로 받은 fastmcp 토큰에는 연결된 IdP 토큰 묶음이 없기 때문이다. Okta 토큰을 검증하는 backend API는 이 토큰을 거부할 가능성이 높다.</p></details>
+<details><summary>Q10. backend API가 fastmcp 토큰을 직접 검증하게 하면 안 되는 이유는?</summary>
+<p>fastmcp 토큰은 대칭 키(HS256)로 서명하므로 backend API가 검증하려면 같은 키를 가져야 하고, 그러면 backend API도 fastmcp 토큰을 만들 수 있게 된다. 토큰의 aud도 backend API가 아니라 MCP 서버다.</p></details>
+
+<h2 id="s11">11. 참고 자료</h2>
+<ul>
+  <li>fastmcp 4.0.3 소스: <code>server/auth/oauth_proxy/proxy.py</code>, <code>server/auth/oauth_proxy/models.py</code>, <code>server/auth/jwt_issuer.py</code>.</li>
+  <li>MCP 런타임 저장소의 코드: 서버 코드, 설정, Redis 저장소 래퍼, 위임 scope 코드.</li>
+  <li>core 저장소의 코드: MCP 클라이언트의 토큰 저장소 코드.</li>
+  <li><a href="01-role-scope-oauthproxy.html#s6">1편 6장</a> OAuthProxy의 구조와 로그인 순서.</li>
+  <li><a href="03-jwt-idp-token.html#s6">3편 6장</a> fastmcp 토큰의 구조.</li>
+  <li><a href="05-id-jag.html">5편</a> ID-JAG. 특히 9장, 14장.</li>
+  <li>RFC 8693, OAuth 2.0 Token Exchange.</li>
+</ul>
+<div class="box warn" id="unchecked">
+  <p>이 문서의 동작은 모두 코드를 읽고 확인했고, 실행해서 확인하지는 않았다. 코드 줄 번호는 위 fastmcp 버전 기준이다.</p>
+  <p>다음 내용은 확인하지 않았다.</p>
+  <ul>
+    <li>배포된 MCP 서버의 실제 설정. 토큰 전달 설정, Redis 접두사, 프록시 동의 화면 설정을 클러스터에서 보지 않았다.</li>
+    <li>9장 ②번 방법에서 Okta가 받는 subject token의 종류와 Okta의 지원 여부</li>
+    <li>9장 ④번 방법이 MCP 권한 스펙의 token passthrough 금지에 해당하는지. 스펙 문구와 대조하지 않았다.</li>
+    <li>8장의 게이트웨이가 뒤쪽 MCP 서버용 토큰을 얻는 방법. 이 문서는 다루지 않았다.</li>
+    <li>Okta가 RS256으로 서명한다는 점. 이번에 Okta 문서와 다시 대조하지 않았다.</li>
+  </ul>
+</div>
+<p>이 문서가 OAuth 학습의 마지막 편이다. 전체 목록은 <a href="index.html">목차</a>에 있다.</p>
+
+<nav class="pager">
+<a class="prev" href="05-id-jag.html"><span class="k">이전 글</span><span class="t">ID-JAG</span></a>
+</nav>
+
+<footer>2026-11-18 작성. 라이브러리 근거는 fastmcp 4.0.3 소스다. 우리 코드는 런타임과 core를 읽었고, 둘 다 2026-11-17 커밋 기준이다.</footer>
+</div>
+</body>
+</html>

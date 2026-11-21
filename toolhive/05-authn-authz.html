@@ -1,0 +1,975 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>인증과 인가</title>
+<link rel="stylesheet" href="../assets/learn.css">
+</head>
+<body>
+<div class="masthead"><div class="bar"><a class="brand" href="../index.html">learn</a><span class="crumb"><a href="index.html">ToolHive</a></span></div></div>
+<div class="wrap">
+
+<header>
+  <h1>인증과 인가</h1>
+  <p class="kicker">ToolHive 학습 05편 · 2026-10-14 작성 · 2026-11-07 갱신</p>
+  <p>ToolHive proxy가 MCP 서버 앞에서 하는 인증과 인가를 다루는 문서로, 들어오는 인증, 내장 인가 서버, 나가는 인증, 위임, Cedar 인가를 차례로 본다. OAuth 기본 개념은 <a href="../oauth/index.html">OAuth 학습 시리즈</a>를 따르고 여기서 다시 설명하지 않는다.</p>
+  <p>기준 버전은 ToolHive v0.63.0(2026-11-06)이다. 2026-10-14에 v0.53.0 기준으로 썼고 2026-11-07에 v0.63.0 기준으로 갱신했으며, 공식 문서는 2026-11-07 상태를 읽었다. ToolHive는 자주 바뀌기 때문에 실제로 쓰기 전에 공식 문서를 다시 확인해야 한다.</p>
+</header>
+
+<div class="box key">
+  <span class="label">한 문장 요약</span>
+  <p>ToolHive proxy는 두 경계에서 일한다. 들어오는 쪽에서는 access token을 검증하고 Cedar policy로 요청을 거르고, 나가는 쪽에서는 MCP 서버가 쓸 자격 증명을 바꾸거나 붙인다. 내장 인가 서버를 켜면 proxy가 fastmcp OAuthProxy처럼 MCP 클라이언트의 인가 서버가 된다.</p>
+</div>
+
+<div class="box key">
+  <span class="label">v0.63.0 갱신 요약</span>
+  <ul>
+    <li>1, 2, 4, 8장의 동작, 곧 middleware 순서, 세 모드, 401과 PRM, AWS STS, 원격 MCP 서버의 OAuth는 바뀌지 않아서 행 번호만 다시 맞췄다.</li>
+    <li>proxy는 token session에 쓸 수 있는 upstream access token이 하나도 없어도 401을 주고, upstream ID token이 만료되면 access token이 살아 있어도 갱신한다. ToolHive refresh token으로 갱신할 때 내장 인가 서버는 upstream 자격 증명부터 본다(5장).</li>
+    <li>내장 인가 서버의 DCR에 클라이언트 수 상한(기본 10000)과 24시간 미사용 만료가 생겼고, <code>/oauth/register</code> 속도 제한과 상한은 CRD 필드가 됐다. upstream DCR 등록은 시작할 때와 실행 중에 다시 확인한다(5, 6, 7장).</li>
+    <li>동의 화면은 upstream IdP의 표시 이름을 보여 주고, Go로 내장하는 쪽은 사전 승인 클라이언트의 동의 화면을 건너뛰게 할 수 있다(6장).</li>
+    <li>delegate client의 RunConfig 설정이 늘어서 private_key_jwt 인증, grant 종류, 자기 발급 subject token의 출처 제한이 들어왔고, 입력 audience와 exchange grant(token exchange로 받는 refresh token)도 선언한다. CRD는 아직 예전 네 필드만 받는다. audience 거부는 <code>invalid_target</code>이 됐다(9장).</li>
+    <li>SPIFFE 설정은 여전히 시작 단계에서 거부되지만, 인가 서버용 TLS listener(8443)와 file bundle source는 들어왔다(9장).</li>
+    <li>인가 middleware는 대상이 없는 요청과 정규형이 아닌 resource URI를 policy 전에 거부하고, 응답 필터는 압축된 목록 응답을 500으로 바꾼다. MCP 파서는 POST가 아닌 요청의 본문을 400으로 거부하며, vMCP의 tool은 <code>Backend::</code> 부모 entity를 갖는다(10, 11장).</li>
+  </ul>
+</div>
+
+<nav class="toc">
+  <b>목차</b>
+  <ol start="0">
+    <li><a href="#s0">용어집</a></li>
+    <li><a href="#s1">두 경계와 middleware 순서</a></li>
+    <li><a href="#s2">들어오는 인증의 세 모드</a></li>
+    <li><a href="#s3">access token 검증</a></li>
+    <li><a href="#s4">401 응답과 PRM</a></li>
+    <li><a href="#s5">내장 인가 서버</a></li>
+    <li><a href="#s6">클라이언트 등록과 동의 화면</a></li>
+    <li><a href="#s7">내장 인가 서버의 저장소</a></li>
+    <li><a href="#s8">나가는 인증</a></li>
+    <li><a href="#s9">위임과 workload identity</a></li>
+    <li><a href="#s10">Cedar 인가</a></li>
+    <li><a href="#s11">통합 예: Okta와 vMCP</a></li>
+    <li><a href="#sQ">자가 점검 문제</a></li>
+    <li><a href="#sR">참고 자료</a></li>
+  </ol>
+</nav>
+
+<h2 id="s0">0. 용어집</h2>
+<p>이 문서는 아래 용어를 아래 뜻으로만 쓴다. 한국어 낱말 "토큰"은 단독으로 쓰지 않고 늘 access token, refresh token, ID token, JWT처럼 종류를 붙인다.</p>
+<div class="tbl"><table>
+<tr><th>용어</th><th>이 문서에서의 뜻</th></tr>
+<tr><td>인증 / 인가</td><td>authentication / authorization. 인증은 누구인지 확인한다. 인가는 무엇을 허용할지 정한다.</td></tr>
+<tr><td>들어오는 인증</td><td>MCP 클라이언트가 ToolHive proxy에 자기를 증명하는 일. 공식 문서의 frontend 경계, vMCP 문서의 incoming이다.</td></tr>
+<tr><td>나가는 인증</td><td>proxy나 MCP 서버가 다음 구간에 자기를 증명하는 일. 다음 구간은 MCP 서버, 원격 MCP 서버, 외부 API다. 공식 문서는 backend authentication이라 부른다.</td></tr>
+<tr><td>proxy</td><td>ToolHive가 MCP 서버마다 앞에 두는 프로세스. Kubernetes에서는 <code>thv-proxyrunner</code>다.</td></tr>
+<tr><td>fastmcp OAuthProxy</td><td>fastmcp 라이브러리의 OAuth 프록시 기능. OAuth 01편의 "프록시"다. 이 문서는 늘 전체 이름으로 쓴다.</td></tr>
+<tr><td>middleware</td><td>proxy가 요청마다 차례로 통과시키는 HTTP 처리 단계.</td></tr>
+<tr><td>자격 증명</td><td>다음 구간에 내는 증명 값. access token, API 키, AWS 서명 등을 묶어 부른다.</td></tr>
+<tr><td>검증</td><td>proxy가 access token이 유효한지 판정하는 일. 서명, issuer, audience, 만료를 본다.</td></tr>
+<tr><td>IdP</td><td>사용자 계정을 가진 외부 서비스. 예: Okta, Google, GitHub, Entra ID.</td></tr>
+<tr><td>인가 서버</td><td>access token을 발급하는 OAuth 구성 요소(authorization server). 서비스 이름이 아니다.</td></tr>
+<tr><td>내장 인가 서버</td><td>proxy 안에서 도는 인가 서버(embedded authorization server). MCP 클라이언트에게 자기 JWT를 발급한다.</td></tr>
+<tr><td>upstream IdP</td><td>내장 인가 서버가 사용자 로그인을 맡기는 IdP.</td></tr>
+<tr><td>upstream access token</td><td>upstream IdP가 발급한 access token. 내장 인가 서버가 보관한다.</td></tr>
+<tr><td>token session</td><td>내장 인가 서버가 upstream access token 묶음을 저장한 기록. JWT의 <code>tsid</code> claim이 이 기록을 가리킨다. MCP 세션과 다르다.</td></tr>
+<tr><td>OAuth 클라이언트</td><td>인가 서버에 <code>client_id</code>로 알려진 주체. MCP 클라이언트도 proxy도 OAuth 클라이언트가 되는 경우가 있다.</td></tr>
+<tr><td>클라이언트 등록</td><td>OAuth 클라이언트가 인가 서버에서 <code>client_id</code>를 얻는 일. DCR, CIMD, 사전 등록이 있다.</td></tr>
+<tr><td>DCR</td><td>Dynamic Client Registration(RFC 7591). 클라이언트가 실행 중에 인가 서버에 등록한다.</td></tr>
+<tr><td>CIMD</td><td>Client ID Metadata Document. 클라이언트 정보 문서의 https URL을 <code>client_id</code>로 쓴다.</td></tr>
+<tr><td>PRM</td><td>Protected Resource Metadata(RFC 9728). MCP 서버가 자기 인가 서버를 알리는 문서. OAuth 01편과 뜻이 같다.</td></tr>
+<tr><td>resource URL</td><td>PRM의 <code>resource</code> 값. MCP 클라이언트가 접속하는 MCP 서버 주소다.</td></tr>
+<tr><td>동의 화면</td><td>내장 인가 서버가 upstream IdP로 보내기 전에 보여 주는 승인 화면. IdP의 동의 화면과 다르다.</td></tr>
+<tr><td>claim / scope</td><td>access token 안의 이름과 값 한 쌍 / OAuth 권한 이름.</td></tr>
+<tr><td>role</td><td>IdP가 사용자에게 붙이는 속성. 보통 <code>roles</code> claim으로 온다.</td></tr>
+<tr><td>IdP 그룹</td><td>IdP가 <code>groups</code> claim에 넣는 사용자 소속. Cedar에서는 <code>THVGroup</code> entity가 된다. ToolHive 그룹(<a href="04-registry-group-client.html">04편</a>)과 다르다.</td></tr>
+<tr><td>IAM role</td><td>AWS의 권한 묶음. AWS STS가 임시 자격 증명을 줄 때 하나를 고른다.</td></tr>
+<tr><td>client secret</td><td>OAuth 클라이언트의 비밀 값. ToolHive secret(<a href="03-isolation-secret.html">03편</a>)과 다르다.</td></tr>
+<tr><td>token exchange</td><td>RFC 8693 grant. access token 하나를 내고 다른 audience의 access token을 받는다.</td></tr>
+<tr><td>위임</td><td>한 주체가 다른 사용자를 대신해 행동하는 일. <code>act</code> claim에 기록된다.</td></tr>
+<tr><td>delegate client</td><td>내장 인가 서버에 미리 선언한 OAuth 클라이언트. 기본은 token exchange 전용이다. v0.63.0 RunConfig에서는 다른 grant도 선언한다(9장).</td></tr>
+<tr><td>exchange grant</td><td>token exchange로 발급한 refresh token의 서버 쪽 기록. 그 refresh token으로 무엇을 발급할지 정해 둔다. 로그인으로 받은 refresh token과 다르다.</td></tr>
+<tr><td>사전 승인 클라이언트</td><td>동의 화면을 건너뛰게 미리 지정한 OAuth 클라이언트(consent-exempt client). 내장 인가 서버를 Go 코드로 내장하는 쪽만 지정한다.</td></tr>
+<tr><td>Cedar policy</td><td>Cedar 언어로 쓴 permit 또는 forbid 규칙.</td></tr>
+<tr><td>Cedar resource</td><td>Cedar 요청의 resource 칸. Tool, Prompt, Resource, Skill entity가 들어간다.</td></tr>
+<tr><td>MCP resource</td><td>MCP의 resources 기능으로 읽는 데이터. Cedar에서는 <code>Resource</code> entity가 된다.</td></tr>
+<tr><td>PDP</td><td>policy decision point. 인가 판정을 맡는 외부 서버.</td></tr>
+<tr><td>원격 MCP 서버</td><td>ToolHive가 컨테이너 없이 앞에만 서는 MCP 서버(<a href="02-run-model-proxy.html">02편</a>).</td></tr>
+</table></div>
+
+<h2 id="s1">1. 두 경계와 middleware 순서</h2>
+<p>ToolHive의 인증은 두 경계에서 일어난다(docs <code>concepts/auth-framework</code>). 경계 1은 MCP 클라이언트와 proxy 사이이고, 경계 2는 proxy 뒤쪽이다. MCP 서버나 외부 API가 경계 2에 있다.</p>
+<p>공식 문서는 두 경계를 frontend와 backend로 부르고, vMCP 문서는 같은 경계를 incoming과 outgoing으로 부른다. 이 문서에서는 들어오는 인증과 나가는 인증으로 쓴다.</p>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 320" width="760" height="320" role="img" aria-label="두 인증 경계. MCP 클라이언트, ToolHive proxy, MCP 서버, 외부 API, IdP">
+    <defs>
+      <marker id="f1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+      <marker id="f1w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head-w" d="M0,0 L10,5 L0,10 z"/></marker>
+    </defs>
+    <rect class="d-box" x="200" y="16" width="200" height="44" rx="10"/>
+    <text x="300" y="44" font-size="15" font-weight="600" text-anchor="middle">IdP</text>
+    <line class="d-line" x1="220" y1="60" x2="120" y2="146" marker-end="url(#f1a)"/>
+    <text class="d-m" x="160" y="98" font-size="12" text-anchor="end">로그인, 발급</text>
+    <line class="d-dash" x1="340" y1="60" x2="380" y2="126" marker-end="url(#f1w)"/>
+    <text class="d-m" x="372" y="94" font-size="12" text-anchor="start">JWKS 또는 introspection</text>
+
+    <rect class="d-box" x="20" y="150" width="150" height="64" rx="10"/>
+    <text x="95" y="178" font-size="15" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <text class="d-m" x="95" y="199" font-size="12" text-anchor="middle">IDE, 에이전트</text>
+
+    <rect class="d-acc" x="300" y="128" width="180" height="112" rx="10"/>
+    <text x="390" y="154" font-size="15" font-weight="600" text-anchor="middle">ToolHive proxy</text>
+    <text x="390" y="181" font-size="12" text-anchor="middle">access token 검증</text>
+    <text x="390" y="201" font-size="12" text-anchor="middle">Cedar 인가</text>
+    <text x="390" y="221" font-size="12" text-anchor="middle">자격 증명 교체, 추가</text>
+
+    <rect class="d-box" x="600" y="150" width="140" height="64" rx="10"/>
+    <text x="670" y="178" font-size="15" font-weight="600" text-anchor="middle">MCP 서버</text>
+    <text class="d-m" x="670" y="199" font-size="12" text-anchor="middle">컨테이너 또는 원격</text>
+
+    <rect class="d-box" x="600" y="262" width="140" height="44" rx="10"/>
+    <text x="670" y="289" font-size="14" font-weight="600" text-anchor="middle">외부 API</text>
+
+    <line class="d-line" x1="170" y1="182" x2="297" y2="182" marker-end="url(#f1a)"/>
+    <text class="d-m" x="234" y="174" font-size="12" text-anchor="middle">access token</text>
+    <text class="d-w" x="234" y="204" font-size="12" font-weight="700" text-anchor="middle">경계 1</text>
+    <text class="d-w" x="234" y="221" font-size="12" text-anchor="middle">들어오는 인증</text>
+
+    <line class="d-line" x1="480" y1="182" x2="597" y2="182" marker-end="url(#f1a)"/>
+    <text class="d-m" x="539" y="174" font-size="12" text-anchor="middle">바꾼 자격 증명</text>
+    <text class="d-w" x="539" y="204" font-size="12" font-weight="700" text-anchor="middle">경계 2</text>
+    <text class="d-w" x="539" y="221" font-size="12" text-anchor="middle">나가는 인증</text>
+
+    <line class="d-line" x1="670" y1="214" x2="670" y2="259" marker-end="url(#f1a)"/>
+    <text class="d-m" x="660" y="244" font-size="12" text-anchor="end">받은 자격 증명</text>
+  </svg>
+  </div>
+  <figcaption>그림 1. 두 인증 경계. proxy가 경계 1에서 검증과 인가를 하고 경계 2로는 바꾸거나 붙인 자격 증명만 넘기므로, MCP 서버 코드에는 OAuth 처리 코드가 없어도 된다.</figcaption>
+</figure>
+
+<p>proxy는 RunConfig를 읽고 middleware 목록을 만든다(source <code>pkg/runner/middleware.go:67</code>). 요청은 목록 순서대로 지나가고, 마지막에 넣은 항목이 가장 안쪽에서 돈다(같은 파일 283행 주석). 아래 표는 operator 경로의 순서인데, 인증과 관련된 항목만 적었다.</p>
+<div class="tbl"><table>
+<tr><th>순서</th><th>middleware</th><th>하는 일</th><th>근거(<code>pkg/runner/middleware.go</code>)</th></tr>
+<tr><td>1</td><td><code>auth</code></td><td>access token을 검증하고 사용자 정보를 요청에 싣는다. 항상 있다.</td><td>105행</td></tr>
+<tr><td>2</td><td><code>upstreamswap</code></td><td>내장 인가 서버를 쓸 때 JWT를 upstream access token으로 바꾼다.</td><td>122행</td></tr>
+<tr><td>3</td><td><code>tokenexchange</code></td><td>RFC 8693으로 access token을 바꾼다.</td><td>131행</td></tr>
+<tr><td>4</td><td>MCP 파서</td><td>JSON-RPC 본문을 해석한다. 항상 있다.</td><td>169행</td></tr>
+<tr><td>5</td><td><code>authorization</code></td><td>Cedar나 외부 PDP로 요청을 판정한다.</td><td>228행</td></tr>
+<tr><td>6</td><td><code>awssts</code></td><td>AWS 임시 자격 증명으로 요청에 SigV4 서명을 한다.</td><td>245행</td></tr>
+<tr><td>7</td><td>header forward</td><td>원격 MCP 서버로 가는 요청에 고정 헤더를 붙인다.</td><td>254행</td></tr>
+</table></div>
+<p>2번이 3번보다 앞서는 것은 3번이 헤더를 바꾸기 전에 2번이 원래 JWT의 <code>tsid</code>를 읽어야 하기 때문이다(122행 주석). <code>thv run</code> 경로는 순서가 조금 달라서(source <code>pkg/runner/config_builder.go:748</code>) upstreamswap과 awssts가 없고 tool filter가 auth보다 앞이다. 감사 로그 middleware는 두 경로 모두 1번보다 바깥에 있는데, 감사 로그와 사용 제한은 <a href="06-observability-operations.html">06편</a>에서 다룬다.</p>
+<p>Kubernetes에서는 CRD 세 개가 이 설정을 나눠 갖고(docs <code>guides-k8s/auth-k8s</code>), MCPServer와 MCPRemoteProxy는 아래 필드로 이 CRD를 참조한다(source <code>cmd/thv-operator/api/v1beta1/mcpserver_types.go:327</code>).</p>
+<div class="tbl"><table>
+<tr><th>MCPServer 필드</th><th>참조하는 CRD</th><th>쓰임</th></tr>
+<tr><td><code>oidcConfigRef</code></td><td>MCPOIDCConfig</td><td>들어오는 인증의 access token 검증. 서버마다 <code>audience</code>를 따로 둔다.</td></tr>
+<tr><td><code>authServerRef</code></td><td>MCPExternalAuthConfig</td><td>내장 인가 서버를 켠다. <code>type: embeddedAuthServer</code>다.</td></tr>
+<tr><td><code>externalAuthConfigRef</code></td><td>MCPExternalAuthConfig</td><td>나가는 인증. token exchange, AWS STS, 헤더 주입 등이다.</td></tr>
+<tr><td><code>authzConfig</code>, <code>authzConfigRef</code></td><td>ConfigMap, MCPAuthzConfig</td><td>Cedar policy. 두 필드는 함께 쓸 수 없다.</td></tr>
+</table></div>
+<p>CRD 전체 구조와 reconcile은 <a href="07-kubernetes-operator.html">07편</a>이 다룬다.</p>
+
+<h2 id="s2">2. 들어오는 인증의 세 모드</h2>
+<p>들어오는 인증에는 모드가 셋 있는데, 단일 MCP 서버 경로와 vMCP 경로는 고를 수 있는 모드가 다르다. VirtualMCPServer CRD는 <code>oidc</code>와 <code>anonymous</code>만 받는다(source <code>cmd/thv-operator/api/v1beta1/virtualmcpserver_types.go:206</code>).</p>
+<div class="tbl"><table>
+<tr><th>모드</th><th>쓰는 곳</th><th>동작</th><th>근거</th></tr>
+<tr><td>oidc</td><td><code>thv run</code>에 OIDC 설정이 있을 때. vMCP <code>type: oidc</code>.</td><td>access token을 JWKS나 introspection으로 검증한다.</td><td><code>pkg/auth/utils.go:69</code></td></tr>
+<tr><td>local</td><td><code>thv run</code>에 OIDC 설정이 없을 때의 기본값. vmcp 설정 파일의 <code>type: local</code>.</td><td>현재 OS 사용자 이름을 <code>sub</code>로 싣는다. 검증은 하지 않는다.</td><td><code>pkg/auth/utils.go:82</code>, <code>pkg/auth/local.go:20</code></td></tr>
+<tr><td>anonymous</td><td>vMCP의 <code>type: anonymous</code>만.</td><td>모든 요청에 <code>sub: anonymous</code>를 싣는다. 검증은 하지 않는다.</td><td><code>pkg/auth/anonymous.go:22</code>, <code>pkg/vmcp/auth/factory/incoming.go:81</code></td></tr>
+</table></div>
+<p>local과 anonymous는 가짜 claim을 만들고, Cedar policy가 이 claim으로 principal을 만든다. 그래서 인증 없이도 인가 설정을 시험할 수 있다(<code>pkg/auth/anonymous.go:14</code> 주석).</p>
+<div class="box warn">
+  <p>OIDC 설정이 없는 <code>thv run</code>은 모든 요청을 받고, proxy는 시작할 때 이 사실을 WARN 로그로 남긴다(<code>pkg/auth/utils.go:82</code>). 모든 요청이 같은 OS 사용자로 보여서 사용자별 인가도 되지 않으므로, 로컬 개발 밖에서는 OIDC를 켜야 한다.</p>
+</div>
+
+<h2 id="s3">3. access token 검증</h2>
+<p>JWKS와 introspection의 기본 개념은 <a href="../oauth/02-jwks-introspection.html">OAuth 02편</a>을 따르고, 이 장에서는 ToolHive proxy가 두 방식을 어떻게 고르는지 본다.</p>
+<p>proxy의 TokenValidator는 요청마다 다음 순서로 검증한다(source <code>pkg/auth/token.go:1118</code>).</p>
+<ol>
+  <li>첫 요청 때 issuer의 OIDC discovery를 하고, 실패하면 다음 요청 때 다시 한다(<code>token.go:817</code>).</li>
+  <li>access token을 JWT로 해석하고, 서명 키는 JWKS에서 찾는다(<code>token.go:943</code>).</li>
+  <li>JWT 형식이 아니면 introspection으로 넘긴다(<code>token.go:1141</code>).</li>
+  <li>JWT라면 issuer, audience, 만료 시각을 본다(<code>token.go:998</code>).</li>
+  <li>claim으로 사용자 정보를 만들고 요청 context에 싣는다(<code>token.go:1339</code>, 1425행).</li>
+</ol>
+<p>3번으로 가는 경우는 access token이 JWT 형식이 아닐 때뿐이라서, 서명이 틀린 JWT는 introspection으로 가지 않고 바로 401이 된다. 공식 문서는 "JWT를 먼저 시도하고 필요하면 introspection으로 넘어간다"고 쓰지만 코드의 실제 조건은 이보다 좁다.</p>
+<p>4번에서 proxy는 issuer와 audience를 설정했을 때만 비교하고(<code>token.go:998</code>) 만료 시각은 늘 본다. audience를 빼면 같은 issuer가 발급한 다른 서비스용 JWT도 통과하기 때문에 공식 문서는 <code>--oidc-audience</code>를 함께 주라고 한다(docs <code>guides-cli/auth</code>).</p>
+
+<h3>introspection provider</h3>
+<p>proxy는 introspection 주소를 보고 provider를 고른다(source <code>pkg/auth/token.go:503</code>).</p>
+<div class="tbl"><table>
+<tr><th>introspection 주소</th><th>provider</th><th>특징</th></tr>
+<tr><td>Google tokeninfo 주소</td><td>Google</td><td>RFC 7662가 아닌 Google 전용 API다. audience가 없으면 시작을 거부한다(<code>token.go:735</code>).</td></tr>
+<tr><td>GitHub token-check API</td><td>GitHub</td><td>GitHub 전용 API다. client ID와 client secret을 쓴다.</td></tr>
+<tr><td>그 밖의 주소</td><td>RFC 7662</td><td>client ID와 client secret이 둘 다 있으면 Basic 인증으로 부른다(<code>token.go:309</code>).</td></tr>
+</table></div>
+<p>Google tokeninfo 응답에는 <code>iss</code>가 없어서 audience만이 이 배포에 묶는 근거가 된다. 코드 주석은 audience 없이 쓰면 남의 Google access token도 통과한다고 경고한다(<code>token.go:726</code>).</p>
+
+<h3>CLI 설정</h3>
+<p>CLI는 아래 flag로 검증을 켠다(source <code>cmd/thv/app/common.go:21</code>, <code>cmd/thv/app/run_flags.go:270</code>).</p>
+<pre><code>thv run \
+  --oidc-issuer https://auth.example.com \
+  --oidc-audience https://mcp.example.com/mcp \
+  --resource-url https://mcp.example.com/mcp \
+  --authz-config ./authz-config.json \
+  &lt;서버 이름&gt;</code></pre>
+<div class="tbl"><table>
+<tr><th>flag</th><th>뜻</th></tr>
+<tr><td><code>--oidc-issuer</code></td><td>issuer URL. discovery로 JWKS 주소를 찾는다.</td></tr>
+<tr><td><code>--oidc-audience</code></td><td>기대하는 <code>aud</code> 값.</td></tr>
+<tr><td><code>--oidc-jwks-url</code></td><td>IdP에 discovery가 없을 때 쓰는 JWKS 주소.</td></tr>
+<tr><td><code>--oidc-introspection-url</code></td><td>opaque access token을 검증하는 주소.</td></tr>
+<tr><td><code>--oidc-client-id</code>, <code>--oidc-client-secret</code></td><td>introspection을 부를 때만 쓰는 자격 증명.</td></tr>
+<tr><td><code>--oidc-scopes</code></td><td>PRM에 알릴 scope. 기본값은 <code>openid</code>다.</td></tr>
+<tr><td><code>--resource-url</code></td><td>PRM의 resource URL.</td></tr>
+<tr><td><code>--thv-ca-bundle</code></td><td>JWKS와 discovery를 읽을 때 쓰는 CA 번들 파일.</td></tr>
+<tr><td><code>--jwks-auth-token-file</code></td><td>JWKS와 discovery 요청에 붙이는 bearer token 파일.</td></tr>
+<tr><td><code>--oidc-insecure-allow-http</code></td><td>http issuer를 허용한다. 로컬 시험용이다.</td></tr>
+</table></div>
+<p>마지막 세 flag는 v0.57.0부터 access token 검증 설정에도 들어간다(source <code>cmd/thv/app/run_flags.go:477</code>, 1232행). v0.53.0에서는 flag가 있어도 검증 설정이 이 값을 받지 않았다.</p>
+
+<h3>Kubernetes 설정</h3>
+<p>Kubernetes에서는 MCPOIDCConfig에 IdP 설정을 한 번 두고, 각 MCPServer가 <code>oidcConfigRef</code>로 참조하면서 자기 audience를 정한다(docs <code>guides-k8s/auth-k8s</code>).</p>
+<pre><code>apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPOIDCConfig
+metadata:
+  name: production-oidc
+  namespace: toolhive-system
+spec:
+  type: inline
+  inline:
+    issuer: 'https://auth.example.com'
+    jwksUrl: 'https://auth.example.com/.well-known/jwks.json'
+---
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPServer
+metadata:
+  name: weather-server
+  namespace: toolhive-system
+spec:
+  image: ghcr.io/stackloklabs/weather-mcp/server
+  transport: streamable-http
+  proxyPort: 8080
+  oidcConfigRef:
+    name: production-oidc
+    audience: 'https://mcp.example.com/mcp'
+    resourceUrl: 'https://mcp.example.com/mcp'
+    scopes:
+      - openid</code></pre>
+<p>MCPOIDCConfig에는 <code>type: kubernetesServiceAccount</code>도 있는데, 이 모드는 클러스터 안 pod의 service account token을 검증한다. issuer 기본값은 <code>https://kubernetes.default.svc</code>이고(source <code>cmd/thv-operator/pkg/oidc/resolver.go:22</code>), operator는 pod에 마운트된 CA와 service account token으로 JWKS를 읽게 설정한다(<code>resolver.go:137</code>).</p>
+<div class="box warn">
+  <p>공식 문서는 <code>serviceAccount</code>와 <code>namespace</code> 필드가 특정 service account만 허용한다고 쓴다. 그런데 v0.63.0의 <code>resolver.go:102</code>도 이 두 필드를 검증 설정으로 넘기지 않는다. 이 파일은 v0.53.0과 같고, 다른 코드 경로도 찾지 못했다. 특정 service account만 받아야 한다면 클러스터에서 직접 시험해야 하고, 시험 전에는 <code>sub</code> claim에 Cedar policy를 거는 안을 함께 검토해야 한다.</p>
+</div>
+
+<h2 id="s4">4. 401 응답과 PRM</h2>
+<p>PRM의 개념은 <a href="../oauth/01-role-scope-oauthproxy.html#s5">OAuth 01편 5장</a>을 따른다. fastmcp OAuthProxy 구성에서는 MCP 서버가 401과 PRM을 내지만, ToolHive에서는 proxy가 MCP 서버 대신 낸다.</p>
+<p>검증에 실패하면 proxy는 401과 <code>WWW-Authenticate</code> 헤더를 준다(source <code>pkg/auth/token.go:1176</code>). 헤더가 없으면 오류 코드는 <code>invalid_request</code>이고, access token이 틀리면 <code>invalid_token</code>이다(<code>token.go:1325</code>, 1333행).</p>
+<pre><code>HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer realm="https://auth.example.com",
+  resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+  error="invalid_request", error_description="authorization header required"</code></pre>
+<p><code>resource_metadata</code> 주소는 resource URL에서 만드는데, proxy가 호스트와 경로 사이에 <code>/.well-known/oauth-protected-resource</code>를 넣는 방식이다(RFC 9728 3.1절). <code>realm</code>에는 설정한 issuer가 들어간다.</p>
+<p>MCP 클라이언트가 그 주소를 읽으면 proxy는 아래 JSON을 준다(source <code>pkg/auth/token.go:1440</code>).</p>
+<pre><code>{
+  "resource": "https://mcp.example.com/mcp",
+  "authorization_servers": ["https://auth.example.com"],
+  "bearer_methods_supported": ["header"],
+  "scopes_supported": ["openid"]
+}</code></pre>
+<ul>
+  <li><code>authorization_servers</code>에는 설정한 issuer 하나가 들어가는데, 내장 인가 서버를 쓰면 이 값이 내장 인가 서버의 issuer가 된다.</li>
+  <li>resource URL을 설정하지 않으면 proxy는 404를 준다(<code>token.go:1460</code>).</li>
+  <li>인증을 끈 proxy도 <code>/.well-known/</code> 아래에 JSON 404를 주는데, Claude Code 같은 MCP 클라이언트가 응답을 해석하게 하려는 처리다(<code>pkg/auth/well_known.go:21</code> 주석).</li>
+</ul>
+
+<h2 id="s5">5. 내장 인가 서버</h2>
+<p>내장 인가 서버는 proxy 프로세스 안에서 도는 OAuth 2.0 인가 서버다(docs <code>concepts/embedded-auth-server</code>). MCP 클라이언트에게는 인가 서버로 보이고 upstream IdP에게는 OAuth 클라이언트 하나로 보인다. 이 구조는 fastmcp OAuthProxy와 같다.</p>
+<p>공식 문서는 이 기능을 두 문제의 답으로 설명한다(docs <code>concepts/auth-framework</code>).</p>
+<ul>
+  <li>Google, GitHub, Atlassian 같은 IdP는 OAuth 클라이언트를 미리 등록해야 하는데, MCP 클라이언트마다 등록하면 관리가 어렵다.</li>
+  <li>GitHub API 같은 외부 API는 회사 IdP와 연합 관계가 없어서 token exchange로는 그 API용 access token을 얻지 못한다.</li>
+</ul>
+<p>공식 문서는 이 기능을 Kubernetes operator 배포에서만 지원한다고 쓰고, <code>thv run</code>에는 이 기능을 켜는 flag가 없다. RunConfig에는 <code>embedded_auth_server_config</code> 필드가 있고(source <code>pkg/runner/config.go:317</code>), proxy는 이 필드가 있으면 인가 서버를 만들고 그 경로를 붙인다(source <code>pkg/runner/runner.go:370</code>, 408행). proxy 하나에는 upstream IdP를 하나만 두고, 여러 개는 VirtualMCPServer에서만 된다(<code>runner.go:372</code>).</p>
+
+<h3>fastmcp OAuthProxy와 비교</h3>
+<p>fastmcp 쪽 사실은 <a href="../oauth/01-role-scope-oauthproxy.html#s7">OAuth 01편 7장</a>을 따른다.</p>
+<div class="tbl"><table>
+<tr><th>항목</th><th>fastmcp OAuthProxy</th><th>ToolHive 내장 인가 서버</th></tr>
+<tr><td>도는 곳</td><td>MCP 서버 프로세스 안</td><td>proxy 프로세스 안. MCP 서버 컨테이너 밖이다.</td></tr>
+<tr><td>MCP 클라이언트 등록</td><td>DCR, CIMD</td><td>DCR, CIMD. CIMD는 설정으로 켠다. DCR 클라이언트 수에 상한이 있다(6장).</td></tr>
+<tr><td>upstream 연결</td><td>IdP 앱 하나</td><td>MCPServer는 upstream IdP 하나. 사전 등록이나 upstream DCR을 쓴다.</td></tr>
+<tr><td>MCP 클라이언트가 받는 것</td><td>fastmcp가 발급한 JWT</td><td>ToolHive JWT. <code>tsid</code> claim이 token session을 가리킨다.</td></tr>
+<tr><td>upstream access token 보관</td><td>디스크나 Redis</td><td>memory나 Redis(7장)</td></tr>
+<tr><td>IdP 쪽 access token을 쓰는 곳</td><td>MCP 서버 프로세스 안. fastmcp OAuthProxy가 찾아 다시 검증한다.</td><td>MCP 서버 컨테이너. <code>Authorization</code> 헤더로 받는다.</td></tr>
+<tr><td>동의 화면</td><td>있다. 전체 승인이나 전체 거부만 한다.</td><td>있다. 승인과 거부만 한다. 브라우저별 승인 기억과 사전 승인 클라이언트 예외가 있다(6장).</td></tr>
+<tr><td>role 처리</td><td>fastmcp OAuthProxy는 role claim을 읽지 않는다.</td><td>Cedar가 claim을 읽어 IdP 그룹과 role을 entity로 만든다(10장).</td></tr>
+</table></div>
+
+<h3>로그인 흐름</h3>
+<p>MCP 클라이언트와 내장 인가 서버는 다음 순서로 로그인한다(source <code>pkg/authserver/server/doc.go:82</code>, <code>pkg/authserver/server/handlers/authorize.go:55</code>).</p>
+<ol>
+  <li>MCP 클라이언트가 PRM을 읽고 내장 인가 서버를 찾는다.</li>
+  <li>MCP 클라이언트가 DCR로 등록하거나 CIMD URL을 <code>client_id</code>로 쓴다.</li>
+  <li>MCP 클라이언트가 브라우저를 <code>/oauth/authorize</code>로 보낸다. PKCE challenge를 함께 보낸다.</li>
+  <li>내장 인가 서버가 요청을 저장하고 동의 화면을 보여 준다(<code>authorize.go:169</code>).</li>
+  <li>사용자가 승인하면 내장 인가 서버가 브라우저를 upstream IdP로 보낸다.</li>
+  <li>upstream IdP가 인가 코드를 붙여 브라우저를 <code>/oauth/callback</code>으로 돌려보낸다.</li>
+  <li>내장 인가 서버가 그 코드를 upstream access token으로 바꾸고 token session에 저장한다.</li>
+  <li>내장 인가 서버가 자기 인가 코드를 MCP 클라이언트의 콜백 주소로 보낸다.</li>
+  <li>MCP 클라이언트가 <code>/oauth/token</code>에서 JWT를 받는다. JWT에는 <code>tsid</code> claim이 있다.</li>
+</ol>
+<p>요청에 <code>prompt=consent</code>가 없을 때 내장 인가 서버는 4번과 5번을 건너뛰는 경우가 있다(<code>authorize.go:144</code>, 153행). 사전 승인 클라이언트의 요청이거나 기억된 승인이 있으면 바로 upstream IdP로 보낸다(6장).</p>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 540" width="760" height="540" role="img" aria-label="내장 인가 서버 로그인과 이후 MCP 요청 순서">
+    <defs>
+      <marker id="f2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+    </defs>
+    <rect class="d-box" x="20" y="14" width="160" height="50" rx="10"/>
+    <text x="100" y="36" font-size="14" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <text class="d-m" x="100" y="54" font-size="12" text-anchor="middle">브라우저 포함</text>
+    <rect class="d-acc" x="230" y="14" width="180" height="50" rx="10"/>
+    <text x="320" y="36" font-size="14" font-weight="600" text-anchor="middle">내장 인가 서버</text>
+    <text class="d-m" x="320" y="54" font-size="12" text-anchor="middle">proxy 안</text>
+    <rect class="d-box" x="450" y="14" width="140" height="50" rx="10"/>
+    <text x="520" y="44" font-size="14" font-weight="600" text-anchor="middle">upstream IdP</text>
+    <rect class="d-box" x="620" y="14" width="120" height="50" rx="10"/>
+    <text x="680" y="44" font-size="14" font-weight="600" text-anchor="middle">MCP 서버</text>
+
+    <line class="d-outer" x1="100" y1="64" x2="100" y2="528"/>
+    <line class="d-outer" x1="320" y1="64" x2="320" y2="528"/>
+    <line class="d-outer" x1="520" y1="64" x2="520" y2="528"/>
+    <line class="d-outer" x1="680" y1="64" x2="680" y2="528"/>
+
+    <line class="d-line" x1="100" y1="98" x2="317" y2="98" marker-end="url(#f2a)"/>
+    <text x="210" y="91" font-size="12" text-anchor="middle">① DCR 등록 또는 CIMD client_id</text>
+    <line class="d-line" x1="100" y1="136" x2="317" y2="136" marker-end="url(#f2a)"/>
+    <text x="210" y="129" font-size="12" text-anchor="middle">② /oauth/authorize, PKCE</text>
+    <line class="d-line" x1="320" y1="174" x2="103" y2="174" marker-end="url(#f2a)"/>
+    <text x="210" y="167" font-size="12" text-anchor="middle">③ 동의 화면</text>
+    <line class="d-line" x1="100" y1="212" x2="317" y2="212" marker-end="url(#f2a)"/>
+    <text x="210" y="205" font-size="12" text-anchor="middle">④ 승인, POST /oauth/consent</text>
+    <line class="d-line" x1="320" y1="250" x2="517" y2="250" marker-end="url(#f2a)"/>
+    <text x="420" y="243" font-size="12" text-anchor="middle">⑤ 브라우저를 IdP로 보냄</text>
+    <line class="d-line" x1="520" y1="288" x2="323" y2="288" marker-end="url(#f2a)"/>
+    <text x="420" y="281" font-size="12" text-anchor="middle">⑥ /oauth/callback, 인가 코드</text>
+    <line class="d-line" x1="320" y1="326" x2="517" y2="326" marker-end="url(#f2a)"/>
+    <text x="420" y="319" font-size="12" text-anchor="middle">⑦ 인가 코드 교환</text>
+    <line class="d-line" x1="520" y1="364" x2="323" y2="364" marker-end="url(#f2a)"/>
+    <text x="420" y="357" font-size="12" text-anchor="middle">upstream access token</text>
+    <rect class="d-warn" x="250" y="374" width="140" height="28" rx="6"/>
+    <text x="320" y="393" font-size="12" text-anchor="middle">token session 저장</text>
+    <line class="d-line" x1="320" y1="428" x2="103" y2="428" marker-end="url(#f2a)"/>
+    <text x="210" y="421" font-size="12" text-anchor="middle">⑧⑨ 인가 코드, JWT(tsid)</text>
+
+    <line class="d-line" x1="100" y1="476" x2="317" y2="476" marker-end="url(#f2a)"/>
+    <text class="d-a" x="210" y="469" font-size="12" text-anchor="middle">MCP 요청 + JWT</text>
+    <line class="d-line" x1="320" y1="514" x2="677" y2="514" marker-end="url(#f2a)"/>
+    <text class="d-a" x="600" y="507" font-size="12" text-anchor="middle">upstream access token</text>
+  </svg>
+  </div>
+  <figcaption>그림 2. 내장 인가 서버의 로그인 순서(①~⑨)와 이후 MCP 요청(파란 글자). 인가 코드는 두 구간에 따로 있고, upstream 구간에도 PKCE를 보낸다(<code>pkg/authserver/upstream/oauth2.go:711</code>). MCP 서버는 upstream access token만 본다.</figcaption>
+</figure>
+
+<p>내장 인가 서버는 아래 경로를 연다(source <code>pkg/authserver/server/handlers/handler.go:326</code>, 492행).</p>
+<div class="tbl"><table>
+<tr><th>경로</th><th>하는 일</th></tr>
+<tr><td><code>GET /oauth/authorize</code></td><td>OAuth 클라이언트와 콜백 주소를 검증하고 동의 화면을 연다.</td></tr>
+<tr><td><code>POST /oauth/consent</code></td><td>사용자의 승인이나 거부를 받는다.</td></tr>
+<tr><td><code>GET /oauth/callback</code></td><td>upstream IdP에서 돌아오는 곳.</td></tr>
+<tr><td><code>POST /oauth/token</code></td><td>인가 코드, refresh token, token exchange grant를 처리한다.</td></tr>
+<tr><td><code>POST /oauth/register</code></td><td>DCR.</td></tr>
+<tr><td><code>GET /.well-known/jwks.json</code></td><td>JWT 서명 공개 키.</td></tr>
+<tr><td><code>GET /.well-known/oauth-authorization-server</code></td><td>RFC 8414 메타데이터.</td></tr>
+<tr><td><code>GET /.well-known/openid-configuration</code></td><td>OIDC discovery.</td></tr>
+</table></div>
+<p>이 경로는 늘 호스트 루트에 붙기 때문에 <code>issuer</code>에는 경로 없이 호스트만 적어야 한다. 경로를 넣으면 discovery 문서가 실제로 열리지 않은 endpoint 주소를 알리고, 그 결과 모든 로그인이 "authorization header required" 오류로 실패한다(docs <code>guides-k8s/embedded-auth-server-k8s</code>).</p>
+<p><code>tlsListener</code>를 주면 proxy는 8443 포트에도 같은 경로를 연다(source <code>pkg/runner/runner.go:1342</code>). 포트 번호는 고정이고(<code>pkg/authserver/runner/embeddedauthserver.go:42</code>), MCP 트래픽은 그대로 평문 포트를 쓴다. CRD 주석은 operator가 아직 Service와 컨테이너에 8443 포트를 열지 않는다고 쓴다(<code>cmd/thv-operator/api/v1beta1/mcpexternalauthconfig_types.go:1035</code>). 이 listener는 SPIFFE X.509 인증에 쓸 준비 단계다(9장).</p>
+
+<h3>로그인 뒤의 요청</h3>
+<p>로그인 뒤에 proxy는 MCP 요청을 다음 순서로 처리한다(docs <code>concepts/embedded-auth-server</code>).</p>
+<ol>
+  <li>auth middleware가 JWT 서명을 검증하는데, 공개 키는 HTTP를 거치지 않고 프로세스 안에서 읽는다(<code>pkg/runner/runner.go:403</code>).</li>
+  <li>auth middleware가 <code>tsid</code>로 token session을 읽는다(<code>pkg/auth/token.go:1356</code>).</li>
+  <li>upstream access token이 만료됐으면 refresh token으로 갱신하고, 갱신이 실패하면 401을 준다(<code>token.go:1371</code>). upstream ID token만 만료된 경우에도 갱신하는데, 이때는 갱신이 실패하면 살아 있는 access token을 그대로 쓴다(<code>pkg/auth/upstreamtoken/service.go:308</code>, 334행).</li>
+  <li>token session에 쓸 수 있는 upstream access token이 하나도 없으면 401을 주고, 오류 코드는 <code>invalid_token</code>이다(<code>token.go:1410</code>). 이 경우 MCP 클라이언트는 다시 로그인해야 한다.</li>
+  <li>upstreamswap middleware가 <code>Authorization</code> 헤더를 upstream access token으로 바꾼다(<code>pkg/auth/upstreamswap/middleware.go:125</code>).</li>
+</ol>
+<p>MCP 클라이언트가 ToolHive refresh token으로 갱신을 요청하면 내장 인가 서버는 먼저 token session의 upstream 자격 증명을 본다. upstream refresh token이 확실히 죽었으면 <code>invalid_grant</code>로 거부한다. 근거는 <code>pkg/authserver/config.go:1684</code> 주석과 <code>docs/arch/11-auth-server-storage.md</code>의 "Upstream refresh guard"다. 네트워크 오류나 IdP의 5xx 같은 불확실한 실패는 거부하지 않는데, 이 검사가 없으면 MCP 클라이언트가 401과 refresh를 되풀이한다.</p>
+<p>MCP 서버가 인증 없는 공개 서버라면 <code>disableUpstreamTokenInjection: true</code>를 쓰는 방법이 있다. 이 설정을 켜면 proxy는 JWT를 검증한 뒤 <code>Authorization</code>, <code>Cookie</code>, <code>Proxy-Authorization</code> 헤더를 지운다. 다만 token exchange나 AWS STS와는 함께 쓰지 못하는데, 그 middleware가 지운 헤더를 다시 넣기 때문이다(source <code>pkg/runner/middleware.go:508</code>).</p>
+
+<h3>Kubernetes 설정</h3>
+<p>공식 가이드는 Kubernetes Secret 세 개와 CR 세 개를 만든다(docs <code>guides-k8s/embedded-auth-server-k8s</code>). Secret은 upstream client secret, 서명 키, HMAC 키이고, MCPOIDCConfig의 issuer는 내장 인가 서버의 issuer와 같아야 한다.</p>
+<pre><code>apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPExternalAuthConfig
+metadata:
+  name: embedded-auth-server
+  namespace: toolhive-system
+spec:
+  type: embeddedAuthServer
+  embeddedAuthServer:
+    issuer: 'https://mcp.example.com'          # 경로 없이 호스트만
+    signingKeySecretRefs:                      # 첫 키로 서명, 나머지는 검증용
+      - name: auth-server-signing-key
+        key: signing-key
+    hmacSecretRefs:                            # 인가 코드와 refresh token 서명
+      - name: auth-server-hmac-secret
+        key: hmac-key
+    tokenLifespans:
+      accessTokenLifespan: '1h'
+      refreshTokenLifespan: '168h'
+      authCodeLifespan: '10m'
+    upstreamProviders:
+      - name: google
+        type: oidc
+        oidcConfig:
+          issuerUrl: 'https://accounts.google.com'
+          clientId: '&lt;GOOGLE_CLIENT_ID&gt;'
+          clientSecretRef:
+            name: upstream-idp-secret
+            key: client-secret
+          redirectUri: 'https://mcp.example.com/oauth/callback'
+---
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPOIDCConfig
+metadata:
+  name: embedded-auth-oidc
+  namespace: toolhive-system
+spec:
+  type: inline
+  inline:
+    issuer: 'https://mcp.example.com'          # 내장 인가 서버 issuer와 같게
+---
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPServer
+metadata:
+  name: weather-server-embedded
+  namespace: toolhive-system
+spec:
+  image: ghcr.io/stackloklabs/weather-mcp/server
+  transport: streamable-http
+  proxyPort: 8080
+  authServerRef:
+    kind: MCPExternalAuthConfig
+    name: embedded-auth-server
+  oidcConfigRef:
+    name: embedded-auth-oidc
+    audience: 'https://mcp.example.com/mcp'
+    resourceUrl: 'https://mcp.example.com/mcp'</code></pre>
+<ul>
+  <li>수명 기본값은 access token 1시간, refresh token 7일, 인가 코드 10분이다(source <code>pkg/authserver/config.go:2527</code>).</li>
+  <li>서명 키와 HMAC 키를 빼면 ToolHive는 임시 키를 만드는데, 이 경우 pod가 재시작하면 이미 발급한 JWT가 모두 무효가 된다. 운영 환경에서는 두 키를 넣어야 한다.</li>
+  <li><code>type: oauth2</code>는 GitHub처럼 OIDC discovery가 없는 IdP에 쓰고, authorize, token, userinfo 주소를 직접 적는다.</li>
+  <li><code>dcrConfig</code>를 주면 내장 인가 서버가 upstream IdP에 DCR로 자기를 등록한다. 이것을 upstream DCR이라 부르는데, MCP 클라이언트의 DCR과는 다르다.</li>
+  <li>내장 인가 서버는 시작할 때 저장해 둔 upstream DCR 등록이 아직 유효한지 upstream IdP에 확인하는데, 확인 방법은 <code>dcrConfig.registrationProbe</code>로 고른다(source <code>mcpexternalauthconfig_types.go:1986</code>). upstream IdP가 등록을 지웠으면 새로 등록한다. <code>registrationProbeInterval</code>을 주면 실행 중에도 되풀이한다(2006행). <code>rotationKey</code> 값을 바꾸면 다음 시작 때 무조건 새로 등록하고(1966행), 이때 이전 client에 묶인 upstream refresh token은 더 쓰지 못한다.</li>
+  <li><code>tokenEndpointAuthMethod</code>를 <code>dcrConfig</code>와 함께 주면 그 방식으로 등록한다. 주지 않으면 upstream IdP가 알린 방식 중에서 고른다(source <code>pkg/authserver/config.go:1228</code> 주석).</li>
+  <li><code>omitScopeOnRefresh: true</code>를 주면 upstream refresh 요청에 <code>scope</code>를 보내지 않는다(source <code>mcpexternalauthconfig_types.go:1684</code>). Salesforce처럼 refresh에 <code>scope</code>를 거부하는 IdP용이다.</li>
+  <li>OAuth 2.0 upstream에 userinfo도 <code>identityFromToken</code>도 없으면 내장 인가 서버는 사용자를 알지 못한다. 이때는 access token 해시로 <code>tk-</code> 접두사 subject를 만든다(source <code>docs/arch/11-auth-server-storage.md</code>).</li>
+</ul>
+
+<h2 id="s6">6. 클라이언트 등록과 동의 화면</h2>
+<h3>DCR과 CIMD</h3>
+<p>upstream IdP가 있는 내장 인가 서버는 DCR 요청을 늘 받는다(docs <code>guides-k8s/embedded-auth-server-k8s</code>). token exchange만 하는 구성은 예외다(9장). 기본으로는 public client만 등록한다. 즉 <code>token_endpoint_auth_method</code>가 <code>none</code>이고 client secret을 주지 않는다.</p>
+<ul>
+  <li><code>allowConfidentialClientRegistration: true</code>를 켜면 client secret을 발급한다. <code>/oauth/register</code>는 인증이 없어서 endpoint에 닿는 사람이면 누구든 client secret을 발급받게 된다. 이 설정은 loopback이 아닌 https 콜백 주소만 허용한다.</li>
+  <li><code>/oauth/register</code>에는 속도 제한이 있는데, 기본값은 프로세스마다 초당 1회, 순간 5회이고(source <code>pkg/authserver/server/handlers/handler.go:145</code>) CRD의 <code>registrationRateLimit</code>으로 바꾼다. <code>maxTokens</code>가 순간 허용 수이고 <code>refillPeriod</code>마다 그만큼 다시 찬다(source <code>cmd/thv-operator/api/v1beta1/mcpexternalauthconfig_types.go:1259</code>). pod가 N개면 전체 한도도 약 N배가 된다.</li>
+  <li>DCR로 만든 클라이언트 수에는 상한이 있고 기본값은 10000이다(source <code>pkg/authserver/storage/config.go:63</code>). <code>storage.maxDCRClients</code>로 바꾸며 0은 무제한이다(<code>mcpexternalauthconfig_types.go:2223</code>). 상한에 닿으면 등록은 503으로 실패하고, 내장 인가 서버는 기존 클라이언트를 지우지 않는다(<code>handlers/dcr.go:151</code>). 한 번도 <code>/oauth/token</code>을 성공하지 못한 DCR 클라이언트는 24시간 뒤에 사라진다(<code>storage/config.go:56</code>).</li>
+  <li><code>cimd.enabled: true</code>를 켜면 https URL을 <code>client_id</code>로 받고, 내장 인가 서버가 그 URL에서 메타데이터 문서를 가져온다. 가져오기도 프로세스마다 초당 1회, 순간 5회이고, 넘치면 429를 준다(<code>handler.go:431</code>).</li>
+</ul>
+<p>CIMD 문서를 가져올 때 내장 인가 서버는 다음 규칙을 지킨다(docs <code>guides-k8s/embedded-auth-server-k8s</code>).</p>
+<ul>
+  <li>문서 안의 <code>client_id</code>는 가져온 URL과 정확히 같아야 한다.</li>
+  <li><code>token_endpoint_auth_method</code>는 <code>none</code>이거나 비어 있어야 한다. 다른 값이면 지원 목록에 <code>none</code>이 있어야 하고 서버가 <code>none</code>으로 낮춘다. 공유 비밀 방식은 늘 거부한다.</li>
+  <li>사설 IP를 막고 redirect를 따라가지 않는다. 시간 제한은 5초, 크기 제한은 10 KB다.</li>
+  <li>캐시는 기본 256개, TTL 5분이다. <code>Cache-Control</code> 헤더는 아직 따르지 않는다.</li>
+</ul>
+<p>upstream IdP는 MCP 클라이언트의 CIMD URL을 보지 못한다. 내장 인가 서버가 upstream IdP에 늘 자기 <code>client_id</code>로 가기 때문이다. 그래서 CIMD를 써도 upstream용 클라이언트 설정은 따로 있어야 하고, 이 점은 fastmcp OAuthProxy의 "등록이 두 층" 구조와 같다.</p>
+<p>Claude Code 같은 일부 MCP 클라이언트는 DCR에 좁은 scope를 적고 나서 <code>/oauth/authorize</code>에서 더 넓은 scope를 요청하는데, 내장 인가 서버는 이 요청을 <code>invalid_scope</code>로 거부한다. <code>baselineClientScopes</code>는 정해진 scope를 모든 DCR 클라이언트에 더해서 이 문제를 푼다. 공식 문서는 <code>openid</code>, <code>offline_access</code> 정도로 좁게 두라고 한다.</p>
+
+<h3>동의 화면</h3>
+<p>v0.63.0 내장 인가 서버는 upstream IdP로 보내기 전에 동의 화면을 열고, 기억된 승인이 있거나 사전 승인 클라이언트면 이 화면을 건너뛴다. 공식 문서 사이트는 이 동작을 아직 설명하지 않아서(2026-11-07 확인) 근거는 소스와 설계 문서다(source <code>docs/arch/11-auth-server-storage.md</code> "Interactive client approval"). 이 화면은 fastmcp OAuthProxy 동의 화면(OAuth 01편 7장 ④)과 같은 자리에 있다.</p>
+<p>내장 인가 서버는 동의 화면을 다음 순서로 다룬다(source <code>pkg/authserver/server/handlers/authorize.go:55</code>, <code>consent.go:203</code>).</p>
+<ol>
+  <li><code>/oauth/authorize</code>가 OAuth 클라이언트, 콜백 주소, resource 하나를 먼저 검증한다. resource는 그 클라이언트의 audience 안에 있어야 한다(<code>authorize.go:174</code>).</li>
+  <li>요청을 대기 기록으로 저장하고 브라우저에 일회용 쿠키를 심는다(<code>authorize.go:168</code>).</li>
+  <li>동의 화면을 보여 준다. 화면은 돌아갈 곳을 "this computer"처럼 사람이 읽는 말로 보여 준다. upstream IdP 이름은 RunConfig의 <code>display_name</code>이 있으면 그 값으로 보여 주는데(<code>consent.go:153</code>), CRD에는 아직 이 필드가 없다.</li>
+  <li>사용자가 버튼을 누르면 브라우저가 <code>POST /oauth/consent</code>를 보내고, 내장 인가 서버는 Origin과 쿠키를 확인한다(<code>consent.go:203</code>).</li>
+  <li>승인이면 upstream IdP로 보내고, 거부면 <code>access_denied</code>를 MCP 클라이언트에 돌려준다.</li>
+</ol>
+<ul>
+  <li>allowed audience가 여럿이면 MCP 클라이언트는 <code>/oauth/authorize</code>에서 <code>resource</code>를 하나 보내야 한다. <code>/oauth/token</code>에서 정하면 늦다.</li>
+  <li>대기 기록은 일회용이고 수명은 10분이다.</li>
+  <li>화면은 클라이언트 이름을 보여 주되 "앱이 적은 값이고 확인하지 않았다"고 표시한다.</li>
+  <li>폼이 받는 값은 <code>handle</code>, <code>decision</code>, <code>remember</code> 셋이다(<code>consent.go:274</code>). scope를 하나씩 고르는 기능은 없다.</li>
+</ul>
+<p>HTTPS 주소이고 저장소가 지원하면 "이 브라우저에서 다시 묻지 않기" 확인란이 생기고, 같은 앱이 같은 권한을 다시 요청하면 내장 인가 서버는 7일 동안 화면을 건너뛴다. 브라우저 기록은 7일, 사용자별 승인 기록은 30일 두고, 브라우저에는 <code>__Host-thv_consent_&lt;sha256&gt;</code> 쿠키만 남는다. MCP 클라이언트가 <code>prompt=consent</code>를 보내면 화면을 다시 연다.</p>
+<p>proxy는 이 쿠키를 MCP 서버로 넘기지 않는다(source <code>pkg/runner/runner.go:266</code>). 승인 기억을 지우는 화면은 없고, 기록은 수명이 끝나면 사라진다.</p>
+<p>내장 인가 서버를 Go 코드로 내장하는 쪽은 사전 승인 클라이언트 목록을 줄 수 있다(source <code>pkg/authserver/config.go:1590</code>). 목록에 있는 confidential 클라이언트의 code 요청은 동의 화면 없이 upstream IdP로 간다(<code>authorize.go:252</code>). 콜백 주소는 등록된 것 하나를 명시해야 하고, <code>prompt=consent</code>가 있으면 이 예외보다 화면이 우선한다. RunConfig와 CRD에는 이 설정이 없다. MCP 스펙은 동적 등록 클라이언트마다 사용자 동의를 받으라고 하는데, 설계 문서는 이 예외를 그 요구에서 일부러 벗어난 선택이라고 쓴다. 근거는 <code>docs/arch/11-auth-server-storage.md</code>의 "Administrator consent preauthorization"이다.</p>
+
+<h2 id="s7">7. 내장 인가 서버의 저장소</h2>
+<p>내장 인가 서버는 OAuth 상태를 저장소에 둔다(source <code>docs/arch/11-auth-server-storage.md</code>). 저장하는 것은 다음과 같다.</p>
+<ul>
+  <li>자기 access token, refresh token, 인가 코드, PKCE 값.</li>
+  <li>DCR 클라이언트, 사용자 계정, upstream IdP 계정 연결.</li>
+  <li>upstream access token(token session), 진행 중인 로그인, 승인 기억 기록.</li>
+  <li>exchange grant. token exchange로 발급한 refresh token의 기록으로(9장), fosite 저장소가 아니라 따로 둔다(source <code>pkg/authserver/storage/redis_keys.go:103</code>).</li>
+</ul>
+<div class="tbl"><table>
+<tr><th>저장소</th><th>특징</th><th>쓰는 곳</th></tr>
+<tr><td>memory(기본값)</td><td>재시작하면 모두 사라진다. pod끼리 나누지 못한다. DCR 클라이언트 상한을 pod마다 따로 센다. Redis는 pod 전체가 상한 하나를 나눈다(6장).</td><td>개발, pod 하나</td></tr>
+<tr><td>Redis standalone</td><td>endpoint 주소 하나로 붙는다.</td><td>GCP Memorystore Basic 등</td></tr>
+<tr><td>Redis cluster</td><td><code>clusterMode: true</code>로 켠다.</td><td>Memorystore Cluster, ElastiCache cluster mode</td></tr>
+<tr><td>Redis sentinel</td><td>sentinel이 master를 찾고 failover한다.</td><td>직접 운영하는 Redis</td></tr>
+</table></div>
+<pre><code>spec:
+  embeddedAuthServer:
+    storage:
+      type: redis
+      redis:
+        addr: redis.example.com:6379
+        aclUserConfig:
+          passwordSecretRef:
+            name: redis-acl-secret
+            key: password</code></pre>
+<p>Redis 키는 <code>thv:auth:{namespace:name}:</code> 접두사를 쓴다(source <code>pkg/authserver/storage/redis_keys.go:116</code>). 그래서 인가 서버 여럿이 Redis 하나를 나눠 쓸 수 있고, 설계 문서는 Redis ACL로 각 인가 서버를 자기 접두사에 묶는 방식을 적었다.</p>
+<div class="tbl"><table>
+<tr><th>Redis에 둔 값</th><th>기본 TTL</th></tr>
+<tr><td>access token</td><td>1시간</td></tr>
+<tr><td>refresh token(수명을 알 수 없을 때)</td><td>30일(<code>storage/config.go:28</code>)</td></tr>
+<tr><td>인가 코드, PKCE 값</td><td>10분</td></tr>
+<tr><td>진행 중인 로그인</td><td>시작부터 10분</td></tr>
+<tr><td>브라우저 기록 / 승인 기록</td><td>7일 / 30일</td></tr>
+<tr><td>DCR 클라이언트</td><td>등록 직후 24시간. <code>/oauth/token</code> 호출이 한 번 성공하면 30일이 되고 성공할 때마다 늘어난다(<code>storage/config.go:49</code>, 56행).</td></tr>
+<tr><td>exchange grant</td><td>grant의 만료 시각까지. 만료 판정은 Go 코드가 하고 Redis TTL은 정리용이다(<code>docs/arch/11-auth-server-storage.md</code> "Exchange grant storage").</td></tr>
+</table></div>
+<p>pod 여럿이 같은 upstream refresh token을 동시에 쓰는 경우가 생기는데, ToolHive는 두 장치로 이 경쟁을 줄인다.</p>
+<ul>
+  <li>한 프로세스 안에서는 singleflight로 갱신을 한 번만 한다.</li>
+  <li>pod 사이에서는 compare-and-swap으로 저장해서 먼저 쓴 pod만 저장에 성공한다.</li>
+</ul>
+<p>이 장치는 저장 순서만 지키므로, 두 pod가 IdP에 같은 refresh token을 거의 동시에 낼 가능성은 남는다. refresh token을 한 번만 받는 IdP는 이것을 재사용 공격으로 보고 grant를 취소할 가능성이 있다. v0.63.0은 IdP가 <code>invalid_grant</code>를 답하면 저장된 행을 다시 읽고, 다른 pod가 이미 새 refresh token을 저장했으면 그 값을 쓴다(source <code>pkg/authserver/upstream/oauth2.go:355</code> 주석). 설계 문서 11번 "Upstream Refresh Rejections and the Refresh Grant" 절이 근거다. 분산 lock은 여전히 후속 과제다.</p>
+<p>fastmcp OAuthProxy도 pod가 둘 이상이면 Redis 같은 공유 저장소가 필요하다(OAuth 01편 7장). 이유도 같은데, 로그인 한 번이 두 구간에 걸치기 때문이다. fastmcp OAuthProxy와 내장 인가 서버는 둘 다 두 구간 사이의 상태를 저장한다.</p>
+
+<h2 id="s8">8. 나가는 인증</h2>
+<p>MCP 스펙은 MCP 서버가 외부 API에 어떻게 인증할지 정하지 않는다(docs <code>concepts/backend-auth</code>). ToolHive는 다음 방식 중 하나를 쓴다.</p>
+<div class="tbl"><table>
+<tr><th>상황</th><th>방식</th><th>설정</th></tr>
+<tr><td>외부 API가 API 키만 받는다</td><td>고정 자격 증명</td><td>secret(<a href="03-isolation-secret.html">03편</a>), 헤더 주입</td></tr>
+<tr><td>외부 API가 같은 IdP를 믿는다</td><td>token exchange(RFC 8693)</td><td><code>--token-exchange-*</code>, <code>type: tokenExchange</code></td></tr>
+<tr><td>외부 API가 연합된 IdP를 믿는다</td><td>연합 token exchange</td><td>AWS는 <code>type: awsSts</code></td></tr>
+<tr><td>외부 API와 연합 관계가 없다</td><td>내장 인가 서버(5장)</td><td><code>authServerRef</code></td></tr>
+<tr><td>원격 MCP 서버가 OAuth를 요구한다</td><td>proxy가 OAuth 클라이언트가 된다</td><td><code>--remote-auth-*</code></td></tr>
+</table></div>
+<p>MCPExternalAuthConfig의 <code>type</code>에는 다른 값도 있는데(source <code>cmd/thv-operator/api/v1beta1/mcpexternalauthconfig_types.go:18</code>), <code>bearerToken</code>, <code>unauthenticated</code>, <code>upstreamInject</code>, <code>xaa</code>, <code>obo</code>가 그것이고, 이 가운데 <code>obo</code>는 Stacklok Enterprise 빌드에서만 동작한다.</p>
+
+<h3>8.1 token exchange</h3>
+<p>token exchange에서 proxy는 들어온 access token을 IdP에 내고 외부 API용 access token을 받는다(docs <code>concepts/backend-auth</code>). <code>sub</code>는 그대로 두고 <code>aud</code>와 scope만 바뀐다. 이 변환은 IdP가 하므로 IdP가 RFC 8693을 지원해야 한다. 공식 문서는 Okta, Auth0, Keycloak을 예로 든다(docs <code>guides-cli/token-exchange</code>).</p>
+<pre><code>thv run \
+  --oidc-audience mcp-server \
+  --oidc-issuer https://dev-123456.okta.com/oauth2/aus1234567890 \
+  --oidc-jwks-url https://dev-123456.okta.com/oauth2/aus1234567890/v1/keys \
+  --token-exchange-url https://dev-123456.okta.com/oauth2/aus9876543210/v1/token \
+  --token-exchange-client-id 0oa0987654321fedcba \
+  --token-exchange-client-secret-file /path/to/client-secret \
+  --token-exchange-audience backend-api \
+  --token-exchange-scopes "api:read,api:write" \
+  &lt;서버 이름&gt;</code></pre>
+<ul>
+  <li>proxy는 교환한 access token을 기본으로 <code>Authorization</code> 헤더에 넣고, <code>--token-exchange-header-name</code>을 주면 그 헤더에 넣는다(source <code>pkg/oauthproto/tokenexchange/middleware.go:29</code>).</li>
+  <li>MCP 서버는 요청마다 그 헤더의 access token으로 외부 API를 불러야 하고, 고정 secret에 기대면 안 된다(docs <code>guides-cli/token-exchange</code>).</li>
+  <li>IdP 동의 화면은 나오지 않는다. 운영자가 신뢰 관계를 IdP에 미리 설정해 두기 때문이다.</li>
+</ul>
+
+<h3>8.2 AWS STS</h3>
+<p>AWS STS 방식은 OIDC access token을 AWS 임시 자격 증명으로 바꾼다(docs <code>integrations/aws-sts</code>). proxy는 요청마다 다음 순서로 처리한다.</p>
+<ol>
+  <li>들어온 JWT를 검증한다.</li>
+  <li>role mapper가 claim을 보고 IAM role을 고른다(source <code>pkg/auth/awssts/role_mapper.go:212</code>).</li>
+  <li><code>AssumeRoleWithWebIdentity</code>를 불러 임시 자격 증명을 받는다(<code>pkg/auth/awssts/exchange.go:61</code>).</li>
+  <li>요청에 SigV4 서명을 하고 AWS MCP Server로 보낸다(<code>pkg/auth/awssts/middleware.go:268</code>).</li>
+</ol>
+<pre><code>apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPExternalAuthConfig
+metadata:
+  name: aws-mcp-sts-auth
+  namespace: toolhive-system
+spec:
+  type: awsSts
+  awsSts:
+    region: us-east-1
+    service: aws-mcp
+    fallbackRoleArn: arn:aws:iam::&lt;ACCOUNT_ID&gt;:role/DefaultMCPRole
+    roleMappings:
+      - claim: s3-readers          # groups claim 안의 값
+        roleArn: arn:aws:iam::&lt;ACCOUNT_ID&gt;:role/S3ReadOnlyMCPRole
+        priority: 10               # 작은 수가 먼저</code></pre>
+<ul>
+  <li>role mapper는 기본으로 <code>groups</code> claim을 보는데(<code>pkg/auth/awssts/config.go:14</code>), <code>roleClaim</code>으로 바꿀 수 있다.</li>
+  <li>규칙은 priority 순서로 보고 처음 맞는 규칙의 IAM role을 쓴다. 맞는 규칙이 없으면 <code>fallbackRoleArn</code>을 쓴다.</li>
+  <li><code>matcher</code>에 CEL 식을 쓸 수도 있다. 예: <code>"admins" in claims["groups"]</code>.</li>
+  <li><code>claim</code> 규칙에서 role claim은 문자열이나 문자열 목록이어야 한다. 다른 모양이면 그 규칙은 오류가 되고, 다른 규칙이 맞지 않으면 403으로 거부한다(<code>role_mapper.go:272</code>). claim이 없으면 규칙이 맞지 않은 것으로 본다(<code>role_mapper.go:125</code>).</li>
+</ul>
+<p>AWS STS middleware는 Cedar 인가 뒤에 돌기 때문에 proxy는 거부된 요청으로는 STS를 부르지 않는다(source <code>pkg/runner/middleware.go:245</code> 주석).</p>
+
+<h3>8.3 헤더 주입과 Vault</h3>
+<p>원격 MCP 서버에는 고정 헤더를 붙이는 기능이 있다(docs <code>guides-cli/run-remote-mcp-servers</code>).</p>
+<pre><code>thv secret set my-api-key
+thv run https://api.example.com/mcp \
+  --name my-server \
+  --remote-forward-headers "X-Tenant-ID=tenant123" \
+  --remote-forward-headers-secret "X-Api-Key=my-api-key"</code></pre>
+<p>평문 헤더 값은 설정 파일에 남으므로 비밀 값은 <code>--remote-forward-headers-secret</code>으로 secret을 참조해야 한다. <code>Host</code>나 <code>X-Forwarded-For</code> 같은 헤더는 설정하지 못한다. Kubernetes에서는 MCPRemoteProxy의 <code>headerForward</code>가 같은 일을 한다.</p>
+<p>Vault 연동에서는 Vault Agent Injector가 secret 파일을 만든다(docs <code>integrations/vault</code>). 파일은 proxy pod 안에 생기고, 이 방식을 쓰면 Kubernetes 매니페스트에 비밀 값을 적지 않아도 된다. secret 관리는 <a href="03-isolation-secret.html">03편</a>이 다룬다.</p>
+
+<h3>8.4 원격 MCP 서버의 OAuth</h3>
+<p>원격 MCP 서버가 OAuth를 요구하면 proxy가 OAuth 클라이언트가 되는데, OAuth 01편에서 플랫폼 core가 하는 일을 여기서는 proxy가 한다. proxy는 다음 순서로 자격 증명을 고른다(source <code>pkg/auth/remote/handler.go:62</code>).</p>
+<ol>
+  <li>고정 bearer token이 설정됐으면 그것을 쓴다.</li>
+  <li>원격 서버를 불러 401의 <code>WWW-Authenticate</code>를 읽는다. 헤더가 없으면 well-known PRM 주소 두 곳을 차례로 읽는다.</li>
+  <li>PRM에서 인가 서버를 찾고 RFC 8414 메타데이터를 읽는다.</li>
+  <li>저장한 refresh token이 있으면 그것으로 로그인 상태를 되살린다.</li>
+  <li>없으면 브라우저를 열어 PKCE 흐름을 시작한다.</li>
+</ol>
+<p>5번에서 proxy는 <code>client_id</code>를 이렇게 정한다.</p>
+<ul>
+  <li><code>--remote-auth-client-id</code>를 주면 그 값을 쓴다.</li>
+  <li>인가 서버가 CIMD 지원을 알리면 <code>https://toolhive.dev/oauth/client-metadata.json</code>을 쓴다(source <code>pkg/oauthproto/cimd.go:16</code>, <code>pkg/auth/remote/handler.go:712</code>).</li>
+  <li>CIMD가 없거나 거부되면 DCR로 등록한다.</li>
+</ul>
+<p>proxy는 refresh token과 DCR 결과를 ToolHive secret 저장소에 남긴다(source <code>pkg/runner/runner.go:909</code>). 그래서 proxy를 다시 시작해도 사용자가 다시 로그인할 필요가 없다. 다만 secret 저장소가 없으면 저장하지 않고 WARN 로그만 남긴다. RFC 8707 <code>resource</code> 값은 기본으로 원격 서버 URL을 정규화해서 쓴다(source <code>docs/remote-mcp-authentication.md</code>).</p>
+<pre><code>thv run https://remote-mcp.example.com/mcp \
+  --name my-remote \
+  --remote-auth-issuer https://auth.example.com \
+  --remote-auth-client-id my-client-id \
+  --remote-auth-client-secret-file ./client-secret \
+  --remote-auth-scopes "openid,profile"</code></pre>
+
+<h2 id="s9">9. 위임과 workload identity</h2>
+<h3>act claim 읽기</h3>
+<p>RFC 8693 위임 access token에는 <code>act</code> claim이 있는데, 이 claim은 "누가 누구를 대신하는지"를 적는다. ToolHive는 발급한 인가 서버와 상관없이 검증한 모든 JWT에서 <code>act</code>를 읽는다(source <code>pkg/auth/context.go:228</code>).</p>
+<ul>
+  <li>Cedar에서는 <code>principal.claim_act.sub</code>로 읽는다.</li>
+  <li>감사 로그는 요청마다 위임 체인 전체를 남기고 체인은 10단계까지 둔다. 자세한 내용은 <a href="06-observability-operations.html">06편</a>이 다룬다.</li>
+</ul>
+
+<h3>delegate client로 위임 access token 발급</h3>
+<p>내장 인가 서버에는 <code>act</code>를 넣은 access token을 직접 발급하는 기능도 있다(source <code>docs/arch/17-token-exchange-delegation.md</code>). 에이전트가 사용자를 대신해 MCP 서버를 부르는 경우를 겨냥한 기능이고, delegate client를 미리 선언해서 켠다.</p>
+<pre><code>spec:
+  embeddedAuthServer:
+    inboundGrants:
+      tokenExchange:
+        delegateClients:
+          - clientId: coding-agent
+            clientSecretRef:
+              name: coding-agent-secret
+              key: client-secret
+            audiences: ['https://mcp.example.com']
+            scopes: [openid]</code></pre>
+<p>delegate client가 사용자의 access token을 <code>subject_token</code>으로 내면 위임 access token을 받는다.</p>
+<ul>
+  <li><code>sub</code>는 사용자 그대로이고, <code>act.sub</code>에는 교환한 delegate client가 들어간다.</li>
+  <li>scope와 audience는 delegate client 설정과 원래 access token의 교집합으로 줄어든다.</li>
+  <li>만료는 원래 access token의 남은 시간과 위임 수명 중 짧은 쪽이고, 위임 수명 기본값은 15분이다(source <code>pkg/authserver/config.go:2539</code>).</li>
+</ul>
+<p>외부 IdP가 발급한 access token도 교환할 수 있는데, 이때는 <code>trustedIssuers</code>에 issuer를 적고 <code>issuerPolicies</code>로 조건을 붙인다.</p>
+
+<h3>delegate client의 추가 설정</h3>
+<p>v0.63.0의 RunConfig는 delegate client에 아래 항목을 더 받는다(source <code>pkg/authserver/config.go:342</code>). CRD의 <code>delegateClients</code>는 아직 <code>clientId</code>, <code>clientSecretRef</code>, <code>audiences</code>, <code>scopes</code>만 받아서(source <code>cmd/thv-operator/api/v1beta1/mcpexternalauthconfig_types.go:361</code>) 아래 항목은 Kubernetes에서는 아직 쓰지 못한다.</p>
+<div class="tbl"><table>
+<tr><th>항목</th><th>뜻</th><th>근거(<code>pkg/authserver/config.go</code>)</th></tr>
+<tr><td><code>token_endpoint_auth_method</code>, <code>jwks_file</code></td><td><code>private_key_jwt</code>를 고르면 client secret 대신 서명한 assertion으로 인증한다. 공개 키는 JWKS 파일에서 읽는다. 서명 알고리즘은 적지 않으면 키에서 유도한다.</td><td>342행, 347행, 354행</td></tr>
+<tr><td><code>grant_types</code>, <code>redirect_uris</code></td><td>token exchange 외에 <code>authorization_code</code>, <code>refresh_token</code>, JWT-bearer grant를 허용한다. 목록을 적으면 token exchange가 꼭 들어가야 한다.</td><td>364행</td></tr>
+<tr><td><code>token_exchange.self_issued_subject_tokens</code></td><td><code>any</code>면 내장 인가 서버가 발급한 어떤 subject token도 교환한다. <code>restricted</code>면 자기 자신이나 <code>allowed_source_clients</code>에 발급된 것만 교환한다. 외부 issuer의 subject token에는 적용되지 않는다.</td><td>402행, 416행, 441행</td></tr>
+<tr><td><code>token_exchange.subject_token_audiences</code></td><td>subject token이 가져야 하는 audience. 입력 조건이다. 발급할 access token의 audience(<code>audiences</code>)와 분리돼 있다.</td><td>452행</td></tr>
+<tr><td><code>token_exchange.exchange_refresh_tokens</code></td><td>token exchange로 refresh token을 발급한다. 아래에서 설명한다.</td><td>459행</td></tr>
+</table></div>
+<p>교환할 때 내장 인가 서버는 <code>restricted</code> 검사를 동의 신호 검사보다 먼저 한다(source <code>pkg/authserver/server/tokenexchange/handler.go:732</code>, 743행). <code>grant_types</code>를 적거나 <code>private_key_jwt</code>를 쓰는 client는 <code>token_exchange</code> 블록을 꼭 적어야 한다(<code>config.go:904</code>). 설정에서 뺀 delegate client는 다음 재시작부터 응답하지 않지만 저장된 행은 남는다(<code>docs/arch/11-auth-server-storage.md</code> "Configured clients across restarts"). 요청한 audience가 client의 audience 밖이면 오류 코드는 <code>invalid_target</code>이다(<code>handler.go:956</code>).</p>
+<p>exchange grant는 다음 순서로 연다(source <code>pkg/authserver/server/tokenexchange/refresh_token_handler.go:118</code>). 설계 문서 17번의 "Refresh tokens through token exchange"가 전체를 설명한다.</p>
+<ol>
+  <li>delegate client가 사용자의 로그인 access token을 <code>subject_token</code>으로 내고, <code>requested_token_type</code>에는 refresh token을 적는다.</li>
+  <li>subject token의 <code>client_id</code>는 <code>allowed_source_clients</code>에 있어야 한다. 이 경로에서는 delegate client 자신의 access token을 받지 않는다.</li>
+  <li>subject token의 scope에 <code>offline_access</code>나 <code>offline</code>이 있어야 한다(<code>refresh_token_handler.go:80</code>).</li>
+  <li>내장 인가 서버가 subject token의 <code>jti</code>를 grant와 함께 기록하고, 같은 access token으로 두 번째 grant를 열면 <code>token_used</code>로 거부한다(43행).</li>
+  <li>받은 refresh token은 <code>grant_type=refresh_token</code>으로 쓰지 못하고, token exchange의 <code>subject_token</code>으로 내서 자식 grant를 받는다.</li>
+</ol>
+<p><code>authorization_details</code>(RFC 9396)는 Go 코드로 registry를 등록했을 때만 처리한다(source <code>config.go:1788</code>). exchange grant 요청이 이 파라미터로 발급 종류와 만료를 적는다.</p>
+
+<h3>신뢰 경계</h3>
+<p>설계 문서는 서명, issuer, audience만으로는 부족하다고 쓴다. 이 셋은 그 access token이 ToolHive용이라는 사실만 증명하고, 어느 OAuth 클라이언트가 대신 행동해도 되는지는 증명하지 않기 때문이다. 이 틈을 두면 confused deputy가 되므로(CWE-863) 내장 인가 서버는 명시적 동의 신호를 요구한다(source <code>pkg/authserver/server/tokenexchange/handler.go:840</code>).</p>
+<div class="tbl"><table>
+<tr><th>subject token 출처</th><th>추가로 요구하는 것</th></tr>
+<tr><td>외부 issuer, <code>may_act</code> 있음</td><td>issuer에 <code>allowMayAct: true</code>. <code>may_act.sub</code>가 인증한 클라이언트와 같아야 한다.</td></tr>
+<tr><td>외부 issuer, <code>may_act</code> 없음</td><td><code>actorClaim</code> 값이 <code>allowedActors</code>에 있거나 <code>actorMatcher</code> CEL 식이 참이어야 한다.</td></tr>
+<tr><td>외부 issuer 공통</td><td><code>allowedDelegateClients</code>에 인증한 클라이언트가 있어야 한다. 이 필드는 필수다.</td></tr>
+<tr><td>내장 인가 서버 자신</td><td>access token의 <code>client_id</code>가 인증한 클라이언트와 같아야 한다. <code>any</code> 모드 delegate client는 이 검사를 건너뛴다. <code>restricted</code> 모드면 <code>client_id</code>가 자기 자신이나 <code>allowed_source_clients</code>에 있어야 한다(<code>handler.go:732</code>).</td></tr>
+<tr><td>그 밖</td><td>거부한다.</td></tr>
+</table></div>
+<ul>
+  <li><code>actorClaim</code> 기본값은 <code>azp</code>다. Entra ID v1은 <code>appid</code>, Okta는 <code>cid</code>를 쓴다.</li>
+  <li><code>allowedActors</code>에는 ToolHive의 client ID가 아니라 외부 IdP의 client ID를 적는다. 설계 문서는 이것을 가장 흔한 설정 실수로 꼽는다.</li>
+  <li><code>actorMatcher</code>는 사용자가 고칠 수 있는 claim에 걸면 안 되고, 부서 이름 대신 <code>azp</code> 같은 클라이언트 식별자를 써야 한다.</li>
+  <li><code>any</code> 모드 delegate client는 어떤 사용자의 ToolHive access token도 교환하는데, 운영자가 시작 설정에서 선언한 클라이언트만 이 권한을 받는다. v0.63.0에서는 <code>restricted</code>로 이 범위를 좁힐 수 있고, 좁히지 않은 client가 있으면 내장 인가 서버는 시작할 때 WARN 로그를 남긴다. 근거는 설계 문서 17번의 "Source policy and subject token audiences"다.</li>
+  <li>access token 교환에는 <code>jti</code> 일회 사용 검사가 없어서 재사용은 수명으로만 제한한다. exchange grant를 열 때만 subject token을 한 번만 받는다(<code>refresh_token_handler.go:102</code> 주석).</li>
+</ul>
+<p>upstream IdP 없이 token exchange만 하는 내장 인가 서버를 만들 수도 있는데, 이때 <code>/oauth/authorize</code>는 <code>unsupported_response_type</code>을 준다. <code>allowPrivateKeyJWTRegistration</code>을 켜면 에이전트가 공개 키를 DCR로 등록하고, 그 뒤로는 client secret 없이 서명한 assertion으로 인증한다.</p>
+
+<h3>SPIFFE</h3>
+<p>SPIFFE ID로 OAuth 클라이언트를 인증하는 설계가 있다(source <code>docs/arch/18-spiffe-association-declarations.md</code>). 설정은 <code>spiffeTrustDomains</code>와 <code>inboundGrants.spiffeClientAuth</code>이고, SPIFFE ID 패턴 하나를 <code>client_id</code> 하나에 묶는다. 이렇게 묶인 클라이언트는 token exchange grant만 받는다.</p>
+<p>v0.63.0에서도 이 설정은 시작 단계에서 거부된다(source <code>pkg/authserver/config.go:647</code>). 실제 SVID를 검증하는 코드가 아직 연결되지 않았기 때문이다. 설정만 받으면 운영자가 인증이 켜졌다고 오해할 가능성이 있어서 ToolHive는 이 설정을 일부러 막았고, 이 기능은 아직 켤 수 없는 설계로 남아 있다.</p>
+<p>v0.63.0은 준비 단계를 더 들여서, 인가 서버용 TLS listener가 8443 포트에 열린다(5장). 그 listener의 middleware는 클라이언트 인증서의 SPIFFE ID를 읽어 요청 context에 싣기만 하고 인증서를 검증하지는 않는다(source <code>pkg/authserver/spiffe/middleware.go:20</code>). bundle source에는 ConfigMap 파일을 읽는 <code>type: file</code>이 생겼다(source <code>cmd/thv-operator/api/v1beta1/mcpexternalauthconfig_types.go:611</code>). 설계 문서는 X.509-SVID 검증이 아직 없고 SPIFFE 인증은 배포할 수 없다고 쓴다(<code>docs/arch/18-spiffe-association-declarations.md</code>).</p>
+
+<h2 id="s10">10. Cedar 인가</h2>
+<p>인가 middleware는 MCP 파서 뒤에서 돌고, authorizer 종류는 둘이다(source <code>docs/authz.md</code>). <code>cedarv1</code>은 proxy 안에서 Cedar policy를 평가하고, <code>httpv1</code>은 외부 PDP에 판정을 맡긴다.</p>
+
+<h3>요청을 Cedar 요청으로 바꾸기</h3>
+<p>Cedar authorizer는 MCP 요청 하나를 Cedar 요청 하나로 바꾼다(source <code>pkg/authz/authorizers/cedar/core.go:1294</code>).</p>
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 290" width="760" height="290" role="img" aria-label="검증된 claim과 MCP 요청 본문이 Cedar의 principal, action, resource, context로 바뀌는 모습">
+    <defs>
+      <marker id="f3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+    </defs>
+    <rect class="d-box" x="20" y="24" width="220" height="104" rx="10"/>
+    <text x="130" y="50" font-size="14" font-weight="600" text-anchor="middle">검증된 claim</text>
+    <text class="d-m" x="130" y="76" font-size="12" text-anchor="middle">sub: alice</text>
+    <text class="d-m" x="130" y="96" font-size="12" text-anchor="middle">groups: [mcp-read]</text>
+    <text class="d-m" x="130" y="116" font-size="12" text-anchor="middle">email, act, scope ...</text>
+
+    <rect class="d-box" x="20" y="162" width="220" height="104" rx="10"/>
+    <text x="130" y="188" font-size="14" font-weight="600" text-anchor="middle">MCP 요청 본문</text>
+    <text class="d-m" x="130" y="214" font-size="12" text-anchor="middle">method: tools/call</text>
+    <text class="d-m" x="130" y="234" font-size="12" text-anchor="middle">name, arguments</text>
+    <text class="d-m" x="130" y="254" font-size="12" text-anchor="middle">+ tools/list annotation</text>
+
+    <rect class="d-acc" x="450" y="14" width="290" height="56" rx="10"/>
+    <text class="d-a" x="466" y="36" font-size="12" font-weight="700">principal</text>
+    <text x="466" y="58" font-size="12">Client::"alice" in THVGroup::"mcp-read"</text>
+    <rect class="d-acc" x="450" y="80" width="290" height="56" rx="10"/>
+    <text class="d-a" x="466" y="102" font-size="12" font-weight="700">action</text>
+    <text x="466" y="124" font-size="12">Action::"call_tool"</text>
+    <rect class="d-acc" x="450" y="146" width="290" height="56" rx="10"/>
+    <text class="d-a" x="466" y="168" font-size="12" font-weight="700">resource</text>
+    <text x="466" y="190" font-size="12">Tool::"이름" in MCP::"서버", arg_*</text>
+    <rect class="d-acc" x="450" y="212" width="290" height="56" rx="10"/>
+    <text class="d-a" x="466" y="234" font-size="12" font-weight="700">context</text>
+    <text x="466" y="256" font-size="12">claim_*, arg_*, thv_claim_source</text>
+
+    <line class="d-line" x1="240" y1="58" x2="447" y2="42" marker-end="url(#f3a)"/>
+    <line class="d-line" x1="240" y1="100" x2="447" y2="232" marker-end="url(#f3a)"/>
+    <line class="d-line" x1="240" y1="196" x2="447" y2="108" marker-end="url(#f3a)"/>
+    <line class="d-line" x1="240" y1="230" x2="447" y2="176" marker-end="url(#f3a)"/>
+  </svg>
+  </div>
+  <figcaption>그림 3. tools/call 요청 하나가 Cedar 요청 네 칸이 된다. claim은 principal과 context로 가고, 요청 본문은 action과 Cedar resource로 간다.</figcaption>
+</figure>
+<div class="tbl"><table>
+<tr><th>Cedar 칸</th><th>값</th><th>근거(<code>cedar/</code>)</th></tr>
+<tr><td>principal</td><td><code>Client::"&lt;sub&gt;"</code>. <code>sub</code>가 없으면 거부한다. 부모 entity는 IdP 그룹과 role로 만든 <code>THVGroup</code>이다.</td><td><code>core.go:886</code></td></tr>
+<tr><td>action</td><td><code>call_tool</code>, <code>get_prompt</code>, <code>read_resource</code>, <code>get_skill</code></td><td><code>core.go:1082</code>, 1136, 1175, 1227행</td></tr>
+<tr><td>Cedar resource</td><td><code>Tool::</code>, <code>Prompt::</code>, <code>Resource::</code>, <code>Skill::</code>. 부모 entity는 <code>MCP::"&lt;서버 이름&gt;"</code>이다. vMCP의 tool은 <code>Backend::"&lt;backend 이름&gt;"</code> 부모가 하나 더 있다.</td><td><code>entity.go:199</code>, 36행</td></tr>
+<tr><td>속성과 context</td><td>모든 claim은 <code>claim_</code> 접두사를 붙인다. 인자는 <code>arg_</code> 접두사를 붙인다.</td><td><code>core.go:898</code>, <code>core.go:1033</code></td></tr>
+</table></div>
+<ul>
+  <li>IdP 그룹 claim은 <code>group_claim_name</code>, <code>groups</code>, <code>roles</code>, <code>cognito:groups</code> 순서로 찾는다(<code>core.go:1403</code>). <code>role_claim_name</code>을 주면 그 claim도 <code>THVGroup</code>에 더한다.</li>
+  <li>객체나 배열 인자는 값 대신 <code>arg_&lt;key&gt;_present: true</code>만 남긴다.</li>
+  <li>MCP resource는 URI를 바꾸지 않고 그대로 entity ID로 쓴다. 예: <code>Resource::"file:///data/config.json"</code>(<code>cedar/core.go:1177</code>). 같은 값을 <code>resource.uri</code>로도 읽는다. URI는 정규형이어야 하고, 인가 middleware는 정규형이 아닌 URI를 policy를 보기 전에 거부한다(<code>pkg/authz/middleware.go:149</code>). MCP 서버가 URI를 정규화해서 읽으면 exact match forbid가 비켜 가기 때문이다(<code>cedar/core.go:1184</code> 주석).</li>
+  <li>vMCP에서는 backend 하나의 tool을 한꺼번에 허용하는 기능이 있다(source <code>pkg/vmcp/core/admission.go:164</code>, <code>cedar/core.go:1105</code>). policy는 <code>resource in Backend::"github-mcp"</code>처럼 쓴다. 합성 tool에는 backend 부모가 없어서 backend 단위의 permit도 forbid도 합성 tool에는 맞지 않는다. 근거는 <code>docs/authz.md</code>의 "Allow tools from a specific vMCP backend"다.</li>
+  <li>tool annotation(<code>readOnlyHint</code> 등)은 MCP 서버의 <code>tools/list</code> 응답에서만 가져온다. proxy는 이 값을 cache에 두고 <code>tools/call</code> 판정에 쓰고(source <code>pkg/authz/annotation_cache.go:17</code>), 클라이언트가 요청 본문에 넣은 값은 쓰지 않는다.</li>
+  <li><code>thv_claim_source</code>는 claim의 출처를 알린다. 예: <code>upstream:okta</code>, <code>request</code>. 이 이름은 <code>claim_</code>으로 시작하지 않기 때문에 access token이 자기 출처를 속이지 못한다(<code>core.go:174</code>).</li>
+</ul>
+<p>내장 인가 서버를 쓰면 Cedar는 기본으로 upstream access token의 claim을 읽고, ToolHive JWT의 claim은 아래 예외에서만 쓴다(source <code>pkg/runner/middleware.go:563</code>). 그래서 Okta <code>groups</code> 같은 upstream claim으로 policy를 쓸 수 있다. upstream access token이 JWT가 아니면 Cedar는 요청 JWT의 claim으로 돌아간다(<code>cedar/core.go:715</code>). 이때 <code>thv_claim_source</code>는 <code>request:upstream-opaque</code>이고, GitHub access token이 이 경우다. 위임 access token처럼 upstream 로그인 없이 발급한 access token도 요청 JWT의 claim을 쓰는데, 이때 값은 <code>request:no-upstream-session</code>이다(<code>cedar/core.go:677</code>).</p>
+<div class="box warn">
+  <p>공식 문서 사이트는 upstream access token이 opaque면 판정을 거부한다고 쓰지만(docs <code>concepts/cedar-policies</code>), v0.63.0 코드와 <code>docs/authz.md</code>는 요청 JWT의 claim으로 돌아간다고 쓴다. 이 문서는 코드를 따랐다. 이 경우 upstream claim에만 있는 속성은 없으므로 그런 policy는 <code>has</code>로 감싸야 한다.</p>
+</div>
+
+<h3>메서드별 처리</h3>
+<p>인가 middleware는 MCP 메서드를 다섯 갈래로 나눈다(source <code>pkg/authz/middleware.go:36</code>, 222행).</p>
+<div class="tbl"><table>
+<tr><th>갈래</th><th>메서드</th><th>처리</th></tr>
+<tr><td>항상 허용</td><td><code>initialize</code>, <code>ping</code>, <code>features/list</code>, <code>roots/list</code>, <code>logging/setLevel</code>, <code>server/discover</code>, 알림 메서드</td><td>Cedar를 거치지 않는다.</td></tr>
+<tr><td>요청 판정</td><td><code>tools/call</code>, <code>prompts/get</code>, <code>resources/read</code>, <code>skills/get</code>, <code>resources/subscribe</code>, <code>resources/unsubscribe</code></td><td>Cedar로 판정한다. 거부하면 403이다. subscribe 두 메서드는 <code>read_resource</code>로 판정한다.</td></tr>
+<tr><td>파생 판정</td><td><code>completion/complete</code>, <code>subscriptions/listen</code></td><td>본문이 가리키는 prompt나 MCP resource의 권한으로 판정한다(<code>derived_authz.go:96</code>).</td></tr>
+<tr><td>응답 필터</td><td><code>tools/list</code>, <code>prompts/list</code>, <code>resources/list</code>, <code>resources/templates/list</code>, <code>skills/list</code></td><td>요청은 통과시킨다. 응답에서 허용된 항목만 남긴다.</td></tr>
+<tr><td>기본 거부</td><td><code>elicitation/create</code>, <code>sampling/createMessage</code>, <code>tasks/*</code>, 모르는 메서드</td><td>늘 403이다(<code>middleware.go:263</code>).</td></tr>
+</table></div>
+<ul>
+  <li>응답 필터는 항목마다 해당 action을 판정한다. 예를 들어 <code>tools/list</code>는 tool마다 <code>call_tool</code>을 판정하기 때문에(source <code>pkg/authz/response_filter.go:783</code>) 목록용 policy를 따로 쓰지 않는다.</li>
+  <li>목록 응답을 거르려면 본문을 읽어야 해서 proxy는 이 메서드의 요청에서 <code>Accept-Encoding</code>을 떼고 MCP 서버로 보낸다(<code>middleware.go:350</code>). MCP 서버가 그래도 압축한 2xx 응답을 보내면 proxy는 500과 JSON-RPC 오류로 바꾸고, 거르지 못한 목록을 그대로 넘기지 않는다(<code>pkg/authz/response_filter.go:194</code>).</li>
+  <li>대상 이름이나 URI가 없는 요청은 policy를 보기 전에 거부한다(<code>middleware.go:137</code>). <code>tools/call</code>, <code>prompts/get</code>, <code>resources/read</code>, <code>skills/get</code>이 해당한다. 빈 이름에 맞는 permit이 있어도 통과하지 못한다.</li>
+  <li>거부 응답은 HTTP 403과 JSON-RPC 오류이고, 메시지는 늘 "Unauthorized"다. policy 내용은 서버 로그에만 남는다(<code>middleware.go:174</code>).</li>
+  <li>POST가 아닌 HTTP 요청은 인가 middleware를 그냥 지나간다(<code>middleware.go:117</code>). 다만 그런 요청에 본문이 있으면 MCP 파서가 먼저 400을 준다(<code>pkg/mcp/parser.go:111</code>).</li>
+  <li>MCP 파서는 <code>Content-Type</code>과 상관없이 모든 POST를 JSON-RPC로 해석한다(source <code>pkg/mcp/parser.go:300</code>). 형식이 깨진 본문은 400이고, <code>params</code>가 JSON 객체로 풀리지 않는 요청도 400이다(<code>parser.go:346</code>).</li>
+</ul>
+
+<h3>평가 규칙과 policy 예</h3>
+<p>Cedar는 세 규칙으로 판정한다(docs <code>concepts/cedar-policies</code>).</p>
+<ol>
+  <li>맞는 <code>forbid</code>가 하나라도 있으면 거부한다.</li>
+  <li>그렇지 않고 맞는 <code>permit</code>가 있으면 허용한다.</li>
+  <li>맞는 policy가 없으면 거부한다.</li>
+</ol>
+<p>없는 속성을 읽으면 평가 오류가 나고, ToolHive는 평가 오류를 거부로 다룬다. 그래서 annotation이나 선택 claim은 <code>has</code>로 먼저 확인해야 한다.</p>
+<pre><code>// 누구나 weather tool을 부른다
+permit(principal, action == Action::"call_tool", resource == Tool::"weather");
+
+// IdP 그룹 engineering은 analytics 서버의 모든 tool을 부른다
+permit(principal in THVGroup::"engineering",
+       action == Action::"call_tool",
+       resource in MCP::"analytics-server");
+
+// admin role이 아니면 파괴적 tool을 막는다
+forbid(principal, action == Action::"call_tool", resource)
+when { resource has destructiveHint &amp;&amp; resource.destructiveHint == true &amp;&amp;
+       !(principal.claim_roles.contains("admin")) };
+
+// calculator는 add와 subtract만 허용한다
+permit(principal, action == Action::"call_tool", resource == Tool::"calculator")
+when { resource.arg_operation == "add" || resource.arg_operation == "subtract" };
+
+// 특정 에이전트가 위임받은 요청만 허용한다
+permit(principal, action == Action::"call_tool", resource)
+when { principal has claim_act &amp;&amp; principal.claim_act.sub == "agent-orchestrator" };</code></pre>
+<p>설정 파일은 JSON이나 YAML이다(docs <code>reference/authz-policy-reference</code>).</p>
+<pre><code>{
+  "version": "1.0",
+  "type": "cedarv1",
+  "cedar": {
+    "policies": [
+      "permit(principal, action == Action::\"call_tool\", resource == Tool::\"weather\");"
+    ],
+    "entities_json": "[]",
+    "group_claim_name": "",
+    "role_claim_name": "",
+    "multi_valued_claims": ["scope", "scp"]
+  }
+}</code></pre>
+<p><code>multi_valued_claims</code>는 scope처럼 문자열이나 배열로 오는 claim을 맞춘다. 이 목록에 넣은 claim은 <code>claimset_&lt;이름&gt;</code> 집합 속성이 생기고, 기존 <code>claim_&lt;이름&gt;</code>는 공백으로 이은 문자열이 된다. 기존 <code>like</code> policy가 더 넓게 맞을 가능성이 있으므로 넣기 전에 policy를 점검해야 한다.</p>
+
+<h3>외부 PDP</h3>
+<p><code>type: httpv1</code>을 쓰면 proxy가 외부 PDP에 판정을 묻는다(source <code>docs/authz.md</code>). proxy는 <code>&lt;url&gt;/decision</code>에 PORC JSON을 POST하고(source <code>pkg/authz/authorizers/http/http_client.go:24</code>), PDP는 <code>{"allow": true}</code>나 <code>false</code>로 답한다.</p>
+<div class="tbl"><table>
+<tr><th>PORC 필드</th><th>값의 형식</th></tr>
+<tr><td>principal</td><td><code>sub</code>, roles, groups, scopes. 이름 규칙은 <code>claim_mapping</code>이 정한다.</td></tr>
+<tr><td>operation</td><td><code>mcp:&lt;feature&gt;:&lt;operation&gt;</code>. 예: <code>mcp:tool:call</code></td></tr>
+<tr><td>resource</td><td><code>mrn:mcp:&lt;서버&gt;:&lt;feature&gt;:&lt;id&gt;</code>(<code>porc.go:118</code>)</td></tr>
+<tr><td>context</td><td><code>include_args</code>, <code>include_operation</code>을 켜면 인자와 operation 정보를 넣는다. tool 호출에는 annotation을 늘 넣는다(<code>http/core.go:120</code>).</td></tr>
+</table></div>
+<p><code>claim_mapping</code>은 <code>mpe</code>(Manetu PolicyEngine)와 <code>standard</code> 둘 중 하나이고, 판정 한 번의 기본 시간 제한은 30초다. VirtualMCPServer는 <code>cedarv1</code> MCPAuthzConfig만 받는다(docs <code>guides-k8s/authorization-k8s</code>).</p>
+<p>Kubernetes에서는 policy를 세 곳에 둔다. MCPServer 안에 직접 쓰거나, ConfigMap에 두거나, MCPAuthzConfig CR로 공유한다. MCPAuthzConfig는 MCPServer, MCPRemoteProxy, VirtualMCPServer가 함께 참조한다.</p>
+
+<h2 id="s11">11. 통합 예: Okta와 vMCP</h2>
+<h3>Okta로 role 기반 인가</h3>
+<p>공식 튜토리얼은 GitHub MCP 서버에 Okta 인증과 Cedar 인가를 붙인다(docs <code>integrations/okta</code>). 운영자는 다음 순서로 설정한다.</p>
+<ol>
+  <li>Okta에 OIDC Web Application을 만든다.</li>
+  <li>IdP 그룹 <code>mcp-read</code>와 <code>mcp-write</code>를 만든다. Alice는 read에만, Bob은 둘 다에 넣는다.</li>
+  <li>Okta authorization server에 <code>groups</code> claim을 더하고 access token에도 들어가게 한다.</li>
+  <li>MCPOIDCConfig에 issuer와 JWKS 주소를 적고, MCPServer는 <code>oidcConfigRef</code>로 audience <code>api://default</code>를 정한다.</li>
+  <li>Cedar policy를 ConfigMap에 넣고 MCPServer <code>authzConfig</code>로 참조한다.</li>
+</ol>
+<pre><code>"permit(principal, action, resource) when { principal.claim_groups.contains(\"mcp-write\") };",
+"permit(principal, action == Action::\"call_tool\", resource == Tool::\"list_commits\") when { principal.claim_groups.contains(\"mcp-read\") };"</code></pre>
+<p>결과를 보면 Bob의 <code>tools/list</code>에는 모든 tool이 보이고, Alice에게는 읽기 tool 7개만 보인다. Alice가 <code>create_pull_request</code>를 부르면 proxy가 403을 준다. 튜토리얼은 <code>claim_groups.contains</code>를 쓰는데, <code>principal in THVGroup::"mcp-write"</code>로 써도 같게 판정한다.</p>
+
+<h3>vMCP의 인증</h3>
+<p>vMCP는 같은 두 경계를 <code>vmcp</code> 프로세스 하나에서 처리한다(docs <code>guides-vmcp/authentication</code>). VirtualMCPServer는 들어오는 인증을 <code>oidc</code>나 <code>anonymous</code>로 명시해야 한다. vMCP는 Cedar 판정을 HTTP middleware가 아닌 내부 단계에서 하지만, 거부 결과는 단일 서버와 같은 403이다(source <code>docs/authz.md</code>). 나가는 인증은 backend마다 다르게 정한다. vMCP의 내장 인가 서버는 upstream IdP 여럿을 차례로 거치는 설정을 지원한다. VirtualMCPServer의 <code>authServerUpstreamFilter</code>는 뒤따르는 upstream 목록을 줄이는데(source <code>cmd/thv-operator/api/v1beta1/virtualmcpserver_types.go:136</code>), 기준은 첫 upstream이 준 groups claim이다. vMCP 자체 Cedar policy에서 <code>MCP::</code> entity 이름은 backend 이름이 아니라 vMCP 이름이고, backend 이름은 <code>Backend::</code> 부모 entity로 온다(10장). incoming OIDC 설정에는 client secret을 담은 환경 변수 이름을 적는 칸이 있다. vmcp 프로세스가 그 변수를 읽어 introspection에 쓰고, 변수가 비어 있으면 시작이 실패한다(source <code>pkg/vmcp/auth/factory/incoming.go:268</code>). 자세한 내용은 <a href="08-vmcp.html">08편</a>이 다룬다.</p>
+
+<h2 id="sQ">12. 자가 점검 문제</h2>
+<p>먼저 답을 생각해 보고, 그다음 펼쳐서 확인한다.</p>
+<details><summary>Q1. thv run에 OIDC flag 없이 MCP 서버를 띄우고 Cedar policy만 걸었다. 사용자별 인가가 되나?</summary>
+<p>되지 않는다. OIDC 설정이 없으면 proxy는 local 모드로 돌아서 모든 요청이 현재 OS 사용자 이름을 <code>sub</code>로 갖고, Cedar는 모든 요청을 같은 principal로 본다. 사용자별로 나누려면 OIDC를 켜야 한다.</p></details>
+<details><summary>Q2. --oidc-issuer만 주고 --oidc-audience를 뺐다. 어떤 JWT가 통과하나?</summary>
+<p>그 issuer가 서명했고 만료되지 않은 JWT는 모두 통과한다. proxy는 audience를 설정했을 때만 <code>aud</code>를 비교하기 때문이다. 같은 IdP가 다른 서비스용으로 발급한 JWT도 들어오므로 audience를 함께 주어야 한다.</p></details>
+<details><summary>Q3. 서명이 틀린 JWT가 왔다. introspection 주소도 설정돼 있다. proxy는 introspection을 부르나?</summary>
+<p>부르지 않는다. proxy는 access token이 JWT 형식이 아닐 때만 introspection으로 넘긴다. 서명이 틀린 JWT는 형식은 맞기 때문에 proxy는 그 자리에서 401을 준다.</p></details>
+<details><summary>Q4. 내장 인가 서버를 쓰는 MCPServer에서 MCP 서버 컨테이너는 Authorization 헤더로 무엇을 받나?</summary>
+<p>upstream IdP가 발급한 upstream access token을 받는다. MCP 클라이언트가 보낸 ToolHive JWT는 proxy에서 멈추고, upstreamswap middleware가 <code>tsid</code>로 찾은 값으로 헤더를 바꾼다. <code>disableUpstreamTokenInjection</code>을 켜면 헤더 없이 받는다.</p></details>
+<details><summary>Q5. 내장 인가 서버를 쓰는 proxy를 pod 두 개로 늘렸다. 저장소는 memory다. 어떤 문제가 생기나?</summary>
+<p>두 pod는 상태를 나누지 못해서, 한 pod가 저장한 진행 중 로그인과 token session을 다른 pod는 모른다. 콜백이나 이후 요청이 다른 pod로 가면 실패할 가능성이 있다. 재시작하면 상태도 모두 사라진다. pod를 늘리려면 Redis 저장소를 써야 한다.</p></details>
+<details><summary>Q6. tools/list 응답에 어떤 tool이 보일지는 무엇이 정하나?</summary>
+<p><code>call_tool</code> policy가 정한다. <code>tools/list</code> 요청은 Cedar 판정 없이 MCP 서버로 간다. proxy는 응답을 받은 뒤 tool마다 <code>call_tool</code>을 판정하고 허용된 tool만 남긴다. 그래서 목록용 policy는 따로 쓰지 않는다.</p></details>
+<details><summary>Q7. readOnlyHint가 true인 tool만 허용하는 policy가 있다. 악성 클라이언트가 tools/call 요청에 readOnlyHint: true를 넣으면 통과하나?</summary>
+<p>통과하지 않는다. proxy는 annotation을 MCP 서버의 <code>tools/list</code> 응답에서만 가져오고 클라이언트 요청 본문의 값은 쓰지 않는다. MCP 서버가 준 값이 true가 아니거나 값이 없으면 permit 조건은 거짓이 되고, 맞는 permit가 없으므로 proxy는 거부한다.</p></details>
+<details><summary>Q8. 외부 IdP의 access token을 내장 인가 서버에서 교환하려 한다. trustedIssuers에 issuer를 넣고 audience도 맞췄다. 이것으로 교환이 되나?</summary>
+<p>되지 않는다. 서명과 audience는 그 access token이 ToolHive용이라는 사실만 증명하고 어느 클라이언트가 대신 행동해도 되는지는 증명하지 않아서, 동의 신호가 따로 있어야 한다. <code>allowedActors</code>나 <code>actorMatcher</code>가 그 신호이고, <code>allowMayAct</code>를 켠 issuer에서는 <code>may_act</code> claim도 신호가 된다. <code>allowedDelegateClients</code>도 꼭 적어야 한다.</p></details>
+<details><summary>Q9. fastmcp OAuthProxy와 ToolHive 내장 인가 서버의 공통점과 차이를 하나씩 말하라.</summary>
+<p>공통점은 구조다. 둘 다 MCP 클라이언트에게는 인가 서버로 보이고 upstream IdP에게는 OAuth 클라이언트 하나로 보이며, IdP 쪽 access token은 서버에 두고 자기 JWT를 준다. 차이는 위치다. ToolHive는 이 일을 MCP 서버 밖의 proxy에서 하기 때문에 MCP 서버 코드에 OAuth 처리가 없어도 되고, MCP 서버는 헤더로 upstream access token을 받는다.</p></details>
+<details><summary>Q10. AWS STS 설정에서 사용자의 groups claim 값이 숫자 하나다. 어떻게 되나?</summary>
+<p><code>claim</code> 규칙만 있다면 요청이 403으로 실패한다. role claim은 문자열이나 문자열 목록이어야 하는데 숫자는 지원하지 않는 모양이다. role mapper는 이때 fallback을 쓰지 않고 거부한다. 다만 CEL <code>matcher</code> 규칙이 맞으면 그 규칙의 IAM role을 쓴다. <code>fallbackRoleArn</code>은 오류 없이 맞는 규칙이 하나도 없을 때 쓴다.</p></details>
+
+<h2 id="sR">13. 참고 자료</h2>
+<p>공식 문서는 2026-10-13에 docs-website main(commit 912bc05)의 mdx 원문을 읽었다. 2026-11-07에는 공개 사이트에서 <code>concepts/embedded-auth-server</code>(2026-11-02 갱신), <code>concepts/cedar-policies</code>, <code>guides-k8s/auth-k8s</code> 세 쪽만 다시 읽었다. 공개 주소는 <code>https://docs.stacklok.com/toolhive/</code> 뒤에 경로를 붙인다.</p>
+<ul>
+  <li><code>concepts/auth-framework</code>, <code>concepts/embedded-auth-server</code>, <code>concepts/backend-auth</code>, <code>concepts/cedar-policies</code></li>
+  <li><code>guides-cli/auth</code>, <code>guides-cli/token-exchange</code>, <code>guides-cli/run-remote-mcp-servers</code></li>
+  <li><code>guides-k8s/auth-k8s</code>, <code>guides-k8s/embedded-auth-server-k8s</code>, <code>guides-k8s/authorization-k8s</code></li>
+  <li><code>integrations/aws-sts</code>, <code>integrations/vault</code>, <code>integrations/okta</code></li>
+  <li><code>reference/authz-policy-reference</code>, <code>guides-vmcp/authentication</code></li>
+</ul>
+<p>ToolHive 소스는 v0.63.0 태그(commit 01f96bf)를 읽었고, v0.53.0 태그(commit fa7e344)와의 diff로 바뀐 동작을 찾았다. 이 문서에 반영한 PR은 다음과 같다.</p>
+<ul>
+  <li>들어오는 인증과 upstream 갱신: #6529, #6773, #6832, #6846, #6902, #6930</li>
+  <li>DCR 상한과 속도 제한, 요청 본문 제한: #6863, #6867, #7046</li>
+  <li>upstream DCR 재확인: #6822, #6825, #6834, #6948, #6986</li>
+  <li>동의 화면: #6882, #6929</li>
+  <li>delegate client 설정: #6918, #6945, #6952, #6953, #7004, #7006</li>
+  <li>delegate client 출처 제한과 audience: #6988, #7036, #7037, #7050</li>
+  <li>exchange grant: #6921, #6968, #6981, #6989, #7003, #7007, #7038</li>
+  <li>TLS listener와 SPIFFE: #6759, #6760, #6843, #6891, #7024</li>
+  <li>인가와 MCP 파서, vMCP: #6487, #6740, #6806, #6904, #6987</li>
+</ul>
+<p>읽은 파일은 다음과 같다.</p>
+<ul>
+  <li>설계 문서: <code>docs/arch/11-auth-server-storage.md</code>, <code>docs/arch/17-token-exchange-delegation.md</code>, <code>docs/arch/18-spiffe-association-declarations.md</code>, <code>docs/authz.md</code>, <code>docs/remote-mcp-authentication.md</code></li>
+  <li>들어오는 인증: <code>pkg/auth/utils.go</code>, <code>pkg/auth/token.go</code>, <code>pkg/auth/well_known.go</code>, <code>pkg/auth/context.go</code>, <code>pkg/auth/upstreamtoken/service.go</code>, <code>pkg/vmcp/auth/factory/incoming.go</code>, <code>cmd/thv/app/run_flags.go</code></li>
+  <li>내장 인가 서버: <code>pkg/authserver/config.go</code>, <code>pkg/authserver/runner/</code>, <code>pkg/authserver/server/handlers/</code>, <code>pkg/authserver/server/tokenexchange/</code>, <code>pkg/authserver/storage/</code>, <code>pkg/authserver/upstream/oauth2.go</code>, <code>pkg/authserver/spiffe/</code>, <code>pkg/runner/runner.go</code></li>
+  <li>나가는 인증: <code>pkg/auth/upstreamswap/</code>, <code>pkg/oauthproto/tokenexchange/</code>, <code>pkg/auth/awssts/</code>, <code>pkg/auth/remote/</code></li>
+  <li>인가: <code>pkg/authz/middleware.go</code>, <code>pkg/authz/response_filter.go</code>, <code>pkg/authz/authorizers/cedar/</code>, <code>pkg/authz/authorizers/http/</code>, <code>pkg/mcp/parser.go</code>, <code>pkg/vmcp/core/admission.go</code></li>
+  <li>middleware 순서: <code>pkg/runner/middleware.go</code>. CRD: <code>cmd/thv-operator/api/v1beta1/</code>, <code>deploy/charts/operator-crds/files/crds/</code></li>
+</ul>
+<p>OAuth 기초는 아래 문서를 따른다.</p>
+<ul>
+  <li><a href="../oauth/01-role-scope-oauthproxy.html">OAuth 01편 "role과 scope, 그리고 fastmcp OAuthProxy"</a></li>
+  <li><a href="../oauth/02-jwks-introspection.html">OAuth 02편 "JWKS와 introspection"</a></li>
+  <li><a href="../oauth/03-jwt-idp-token.html">OAuth 03편 "JWT와 IdP 토큰의 구성"</a></li>
+</ul>
+<div class="box warn" id="unchecked">
+  <p><b>대조한 것</b><br> 코드 인용의 행 번호는 v0.63.0 태그 트리(commit 01f96bf)에서 다시 확인했고, 인용한 파일마다 v0.53.0과의 diff를 읽고 바뀐 동작을 본문에 반영했다. 공식 문서 인용은 2026-10-13의 docs-website main(commit 912bc05) 대조 결과를 유지했고, 2026-11-07에는 위에 적은 세 쪽만 공개 사이트에서 다시 읽었다. 아무것도 실행하거나 빌드하지 않았다.</p>
+  <p><b>공식 문서와 소스가 다르거나 문서에 없는 것</b></p>
+  <ul>
+    <li>동의 화면과 사전 승인 클라이언트는 공식 문서 사이트에 없다(2026-11-07 확인). 설계 문서 11번과 <code>handlers/authorize.go</code>, <code>consent.go</code>만 근거다. 공식 문서 사이트는 refresh grant 거부와 ID token 만료 갱신은 설명하고, DCR 상한과 속도 제한은 필드 이름 없이 언급한다.</li>
+    <li>MCPOIDCConfig <code>kubernetesServiceAccount</code>의 <code>serviceAccount</code>, <code>namespace</code>가 검증에 쓰이는 코드를 찾지 못했다. <code>resolver.go</code>는 v0.53.0과 같다. 공식 문서의 "특정 service account만 허용" 설명은 시험하지 않았다.</li>
+    <li>refresh token 기본 수명은 7일이다(<code>pkg/authserver/config.go:2531</code>). Redis 표의 30일은 수명을 알 수 없을 때 쓰는 저장 TTL이다(<code>pkg/authserver/storage/config.go:28</code>). 설계 문서 표는 30일만 적어서 혼동할 가능성이 있다.</li>
+    <li>MCP resource URI는 v0.63.0 코드에서도 바꾸지 않고 entity ID가 된다. 공식 문서 사이트는 2026-11-07 기준으로 변환 규칙도 정규형 검사도 적지 않는다.</li>
+    <li>공식 문서 사이트는 Cedar를 켜면 JSON <code>Content-Type</code>이 필수라고 쓰지만(2026-11-07 확인), v0.63.0 코드(<code>pkg/mcp/parser.go:300</code>)와 <code>docs/authz.md</code>는 <code>Content-Type</code>과 상관없이 모든 POST를 해석한다.</li>
+    <li>introspection 전환 조건은 공식 문서보다 코드가 좁다. 이 문서는 코드를 따랐다.</li>
+    <li>upstream access token이 opaque일 때 공식 문서 사이트는 거부한다고 쓰지만(2026-11-07 확인), 코드(<code>cedar/core.go:715</code>)와 <code>docs/authz.md</code>는 요청 JWT의 claim으로 돌아간다고 쓰므로 이 문서는 코드를 따랐다.</li>
+    <li>공식 문서는 Cedar가 GitHub <code>login</code> 같은 upstream claim을 읽는다고 예를 든다. GitHub access token은 JWT가 아니므로 이 예는 위 fallback에 걸릴 것으로 보이는데, 실제로 시험하지는 않았다.</li>
+    <li>동의 화면의 upstream 표시 이름과 delegate client의 추가 설정(9장)은 RunConfig에만 있고 v0.63.0 CRD와 공식 문서 사이트에는 없다.</li>
+  </ul>
+  <p><b>대조하지 못한 것</b></p>
+  <ul>
+    <li>v0.63.0에서 새로 들어온 동작은 diff와 설계 문서로만 확인했다. DCR 상한의 503, 사전 승인 클라이언트, exchange grant는 실행하지 않았고, TLS listener와 upstream DCR 재확인도 실행하지 않았다.</li>
+    <li>fastmcp OAuthProxy 쪽 사실은 OAuth 01편을 그대로 따랐고 fastmcp 소스와 다시 대조하지 않았다.</li>
+    <li>pod 두 개와 memory 저장소의 실패 양상(Q5)은 저장 구조에서 추론한 것이고 실제로 재현하지는 않았다.</li>
+    <li>vMCP 인증은 공식 문서와 <code>incoming.go</code>, <code>pkg/vmcp/core/admission.go</code>만 읽었다. vMCP 코드의 나가는 인증은 08편이 확인한다.</li>
+    <li>RFC 8628 device flow 경로가 RunConfig <code>device_flow_enabled</code>로 켜진다(<code>pkg/authserver/config.go:206</code>). v0.63.0 CRD에도 이 필드가 없다.</li>
+    <li>access token의 <code>typ</code>을 <code>at+jwt</code>로 바꾸는 옵션은 Go 코드로만 켠다(<code>pkg/authserver/config.go:1741</code>). RFC 9493 <code>sub_id</code> claim도 같다(1732행). RunConfig와 CRD에 없어서 이 문서는 다루지 않았다.</li>
+    <li><code>docs/remote-mcp-authentication.md</code>의 "highly compliant"는 프로젝트 자신의 주장이다. 그 문서 안의 행 번호는 v0.63.0과 맞지 않을 가능성이 있다.</li>
+    <li>Stacklok Enterprise 기능은 확인하지 않았다. <code>obo</code> type과 RBAC를 Cedar로 바꾸는 기능은 회사 문서의 주장이다.</li>
+  </ul>
+</div>
+<p>다음 학습은 <a href="06-observability-operations.html">06편 "관측, 감사, 사용 제한"</a>이다.</p>
+
+<nav class="pager">
+<a class="prev" href="04-registry-group-client.html"><span class="k">이전 글</span><span class="t">registry, 그룹, 클라이언트 설정</span></a>
+<a class="next" href="06-observability-operations.html"><span class="k">다음 글</span><span class="t">관측, 감사, 사용 제한</span></a>
+</nav>
+
+<footer>2026-10-14 작성, 2026-11-07 갱신. 기준: ToolHive v0.63.0.</footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,811 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>관측, 감사, 사용 제한</title>
+<link rel="stylesheet" href="../assets/learn.css">
+</head>
+<body>
+<div class="masthead"><div class="bar"><a class="brand" href="../index.html">learn</a><span class="crumb"><a href="index.html">ToolHive</a></span></div></div>
+<div class="wrap">
+
+<header>
+  <h1>관측, 감사, 사용 제한</h1>
+  <p class="kicker">ToolHive 학습 06편 · 2026-10-14 작성</p>
+  <p>proxy가 요청마다 실행하는 middleware chain과 그 순서를 먼저 설명하고, 이어서 trace와 metric, 감사 로그, Kubernetes 로그 수집을 다룬다. 마지막으로 사용 제한, webhook, usage metrics를 정리한다.</p>
+  <p>기준 버전은 ToolHive v0.63.0(2026-11-06)이다. 처음에는 v0.53.0 기준으로 썼고 2026-11-07에 v0.63.0 기준으로 갱신했으며, 공식 문서도 2026-11-07 상태를 읽었다. ToolHive는 자주 바뀌므로 실제로 쓰기 전에 공식 문서를 다시 확인해야 한다.</p>
+</header>
+
+<div class="box key">
+  <span class="label">한 문장 요약</span>
+  <p>proxy는 요청마다 정해진 순서의 middleware chain을 실행한다. 감사 middleware는 거의 맨 바깥에 있어서 401, 403, 429 결과도 기록한다. telemetry, 사용 제한, webhook, 인가는 MCP parser 뒤에 있고, parser가 해석한 method와 tool 이름으로 판단한다.</p>
+</div>
+
+<div class="box key">
+  <span class="label">v0.63.0 갱신 요약</span>
+  <ul>
+    <li>transparent proxy는 모든 middleware보다 먼저 <code>Connection</code> header를 검사한다. hop-by-hop이 아닌 header 이름이 있으면 400으로 막고 감사 기록은 남기지 않는다(1장).</li>
+    <li>MCP parser가 본문이 있는 POST 이외 요청을 400으로 막는다(1장).</li>
+    <li>health check가 켜진 transparent proxy의 <code>/health</code>는 요청마다 MCP 서버에 ping하지 않고 health monitor의 마지막 결과를 돌려준다(8장).</li>
+    <li>operator 전역 기본 Redis에 TLS 설정이 생겼고, MCPServer가 <code>sessionStorage</code>를 생략해도 전역 기본 Redis가 사용 제한의 Redis 조건을 채운다(9장).</li>
+    <li>webhook의 <code>ignore</code> 정책은 호출 전 ToolHive 자체 오류에는 적용되지 않아서, 이 오류는 항상 거부다(10장).</li>
+    <li>내장 인가 서버가 DCR client 상한 metric 두 개를 낸다(5장). <code>--otel-env-vars</code>의 <code>이름=값</code> 항목은 무시한다(6장).</li>
+    <li>middleware 순서, 감사 필드, 사용 제한의 판단 과정, usage metrics는 바뀌지 않았고, 바뀐 파일의 줄 번호만 다시 맞췄다.</li>
+  </ul>
+</div>
+
+<nav class="toc">
+  <b>목차</b>
+  <ol>
+    <li><a href="#s0">용어집</a></li>
+    <li><a href="#s1">요청 경로와 middleware 순서</a></li>
+    <li><a href="#s2">두 가지 조립 경로: CLI와 operator</a></li>
+    <li><a href="#s3">관측의 구성: trace, metric, 로그</a></li>
+    <li><a href="#s4">trace: span 이름, 속성, 전파</a></li>
+    <li><a href="#s5">metric과 Prometheus endpoint</a></li>
+    <li><a href="#s6">telemetry 설정</a></li>
+    <li><a href="#s7">감사 로그</a></li>
+    <li><a href="#s8">Kubernetes 로그 수집</a></li>
+    <li><a href="#s9">사용 제한</a></li>
+    <li><a href="#s10">webhook</a></li>
+    <li><a href="#s11">usage metrics</a></li>
+    <li><a href="#sQ">자가 점검 문제</a></li>
+    <li><a href="#sR">참고 자료</a></li>
+  </ol>
+</nav>
+
+<h2 id="s0">0. 용어집</h2>
+<p>이 문서는 아래 용어를 아래 뜻으로만 쓴다. proxy, workload, backend, registry server처럼 표에 없는 시리즈 공통 용어는 공통 뜻을 따른다.</p>
+<div class="tbl"><table>
+<tr><th>용어</th><th>이 문서에서의 뜻</th></tr>
+<tr><td>middleware</td><td>proxy가 요청을 MCP 서버로 넘기기 전후에 실행하는 처리 단계. Go의 <code>http.Handler</code>를 감싸는 함수다.</td></tr>
+<tr><td>middleware chain</td><td>middleware를 정해진 순서로 겹쳐 감싼 묶음.</td></tr>
+<tr><td>바깥쪽 / 안쪽</td><td>바깥쪽 middleware가 요청을 먼저 받고 응답을 나중에 본다. 안쪽 middleware는 MCP 서버에 가깝다.</td></tr>
+<tr><td>OpenTelemetry (OTel)</td><td>trace와 metric을 만드는 표준 SDK와 규약.</td></tr>
+<tr><td>OTLP</td><td>OTel 데이터를 수신기로 밀어 보내는 전송 규약.</td></tr>
+<tr><td>관측 시스템</td><td>trace와 metric을 받아 저장하고 보여 주는 외부 시스템. Jaeger, Honeycomb, Datadog 등이다. 시리즈 용어 backend와 섞지 않는다.</td></tr>
+<tr><td>trace / span</td><td>span은 작업 하나의 기록이다. trace는 같은 요청에 속한 span의 묶음이다.</td></tr>
+<tr><td>metric</td><td>OTel이 만드는 수치 시계열. counter, histogram 등이 있다.</td></tr>
+<tr><td>속성</td><td>span이나 metric에 붙는 key=value 쌍. Prometheus는 metric 속성을 label이라 부른다.</td></tr>
+<tr><td>resource 속성</td><td>한 proxy가 내보내는 모든 신호에 붙는 속성. <code>service.name</code> 등이다.</td></tr>
+<tr><td>sampling</td><td>trace를 남길 요청의 비율을 정하는 것. 0.0에서 1.0 사이 값이다.</td></tr>
+<tr><td>Prometheus endpoint</td><td>Prometheus가 metric을 가져가는 <code>/metrics</code> 경로.</td></tr>
+<tr><td>transport 포트</td><td>proxy가 MCP 트래픽을 받는 포트.</td></tr>
+<tr><td>진단 포트</td><td><code>/metrics</code>만 제공하는 별도 listener의 포트. 기본값은 9464다.</td></tr>
+<tr><td>감사 로그 / 감사 이벤트</td><td>감사 이벤트는 요청 하나의 결과를 담은 JSON 한 줄이다. 감사 로그는 그 줄의 모음이다.</td></tr>
+<tr><td>운영 로그</td><td>감사 이벤트가 아닌 일반 로그. 시작, 경고, 오류 메시지 등이다.</td></tr>
+<tr><td>outcome</td><td>감사 이벤트의 결과 값. <code>success</code>, <code>denied</code>, <code>failure</code>, <code>error</code>, <code>application_error</code> 중 하나다.</td></tr>
+<tr><td>거부</td><td>인증, 인가, webhook이 요청을 막는 것. HTTP 401 또는 403이다.</td></tr>
+<tr><td>사용 제한</td><td>일정 시간에 허용하는 <code>tools/call</code> 수를 제한하는 기능. 영어 이름은 rate limiting이다.</td></tr>
+<tr><td>버킷</td><td>사용 제한 단위 하나. Redis hash 하나에 저장하는 token bucket이다.</td></tr>
+<tr><td>허가</td><td>버킷에 쌓이는 단위. 필드 이름은 <code>maxTokens</code>다. <code>tools/call</code> 하나가 허가 하나를 쓴다.</td></tr>
+<tr><td>제한 초과</td><td>버킷에 허가가 없어 proxy가 HTTP 429로 막는 것.</td></tr>
+<tr><td>fail-open / fail-closed</td><td>검사 자체가 오류로 끝났을 때 요청을 통과시키는 정책 / 막는 정책.</td></tr>
+<tr><td>webhook</td><td>proxy가 MCP 요청을 외부 HTTP 서비스에 보내 판단을 받는 기능. validating webhook과 mutating webhook이 있다.</td></tr>
+<tr><td>usage metrics</td><td>proxy가 익명 <code>tools/call</code> 수를 Stacklok 서버로 보내는 기능. OTel metric과 다른 기능이다.</td></tr>
+<tr><td>access token</td><td>인증에 쓰는 자격 증명. 버킷의 허가와 다르다.</td></tr>
+</table></div>
+
+<h2 id="s1">1. 요청 경로와 middleware 순서</h2>
+<p>proxy는 MCP 서버 앞에서 HTTP 요청을 받고(<a href="02-run-model-proxy.html">02편</a>), 요청을 MCP 서버로 넘기기 전에 middleware chain을 실행한다. chain은 middleware 설정 목록이 정하는데, 목록의 앞쪽 항목이 바깥쪽 wrapper가 된다(source <code>pkg/runner/config_builder.go:731</code>).</p>
+<p>그림 1은 operator 경로의 최종 순서이고, 이 순서는 <code>PopulateMiddlewareConfigs</code>가 만든다(source <code>pkg/runner/middleware.go:67</code>). 본문 크기 제한과 Origin 검사는 <code>runner.Run</code>이 맨 앞에 붙인다(source <code>pkg/runner/runner.go:350-362</code>).</p>
+<p>Origin 검사는 허용 목록이 비면 빠진다(source <code>pkg/runner/middleware.go:757</code>). operator 경로의 proxy는 기본으로 <code>0.0.0.0</code>에 바인드하는데(source <code>cmd/thv-operator/controllers/mcpserver_runconfig.go:30</code>), 이 경우 허용 Origin을 따로 주지 않으면 허용 목록이 비어서 Origin 검사가 빠진다.</p>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 540" width="760" height="540" role="img" aria-label="proxy middleware chain 순서. 위에서 아래로 요청이 진행한다.">
+    <defs><marker id="m06a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <line class="d-line" x1="40" y1="22" x2="40" y2="512" marker-end="url(#m06a)"/>
+    <text x="28" y="270" font-size="12" class="d-m" text-anchor="middle" transform="rotate(-90 28 270)">요청 진행 방향</text>
+    <rect class="d-outer" x="62" y="100" width="276" height="390" rx="8"/>
+    <rect class="d-box" x="74" y="14" width="252" height="22" rx="5"/>
+    <text x="200" y="30" font-size="12.5" text-anchor="middle">MCP 클라이언트의 HTTP 요청</text>
+    <rect class="d-warn" x="74" y="44" width="252" height="22" rx="5"/>
+    <text x="200" y="60" font-size="12.5" text-anchor="middle">본문 크기 제한</text>
+    <rect class="d-warn" x="74" y="74" width="252" height="22" rx="5"/>
+    <text x="200" y="90" font-size="12.5" text-anchor="middle">Origin 검사 (허용 목록이 있을 때만)</text>
+    <rect class="d-acc" x="74" y="104" width="252" height="22" rx="5"/>
+    <text x="200" y="120" font-size="12.5" font-weight="600" text-anchor="middle">감사 (점선 안쪽 전체를 감쌈)</text>
+    <rect class="d-warn" x="74" y="134" width="252" height="22" rx="5"/>
+    <text x="200" y="150" font-size="12.5" text-anchor="middle">인증</text>
+    <rect class="d-box" x="74" y="164" width="252" height="22" rx="5"/>
+    <text x="200" y="180" font-size="12.5" text-anchor="middle">upstream swap, token exchange</text>
+    <rect class="d-box" x="74" y="194" width="252" height="22" rx="5"/>
+    <text x="200" y="210" font-size="12.5" text-anchor="middle">tool filter, tool call filter</text>
+    <rect class="d-warn" x="74" y="224" width="252" height="22" rx="5"/>
+    <text x="200" y="240" font-size="12.5" text-anchor="middle">MCP parser</text>
+    <rect class="d-acc" x="74" y="254" width="252" height="22" rx="5"/>
+    <text x="200" y="270" font-size="12.5" text-anchor="middle">telemetry</text>
+    <rect class="d-warn" x="74" y="284" width="252" height="22" rx="5"/>
+    <text x="200" y="300" font-size="12.5" text-anchor="middle">사용 제한</text>
+    <rect class="d-warn" x="74" y="314" width="252" height="22" rx="5"/>
+    <text x="200" y="330" font-size="12.5" text-anchor="middle">mutating webhook</text>
+    <rect class="d-warn" x="74" y="344" width="252" height="22" rx="5"/>
+    <text x="200" y="360" font-size="12.5" text-anchor="middle">validating webhook</text>
+    <rect class="d-acc" x="74" y="374" width="252" height="22" rx="5"/>
+    <text x="200" y="390" font-size="12.5" text-anchor="middle">usage metrics</text>
+    <rect class="d-warn" x="74" y="404" width="252" height="22" rx="5"/>
+    <text x="200" y="420" font-size="12.5" text-anchor="middle">인가 (Cedar)</text>
+    <rect class="d-box" x="74" y="434" width="252" height="22" rx="5"/>
+    <text x="200" y="450" font-size="12.5" text-anchor="middle">AWS STS, header forward</text>
+    <rect class="d-box" x="74" y="464" width="252" height="22" rx="5"/>
+    <text x="200" y="480" font-size="12.5" text-anchor="middle">recovery</text>
+    <rect class="d-box" x="74" y="498" width="252" height="26" rx="5"/>
+    <text x="200" y="516" font-size="13" font-weight="600" text-anchor="middle">MCP 서버</text>
+    <text x="352" y="60" font-size="12" class="d-m">항상 있음. 초과하면 413. 감사 기록 없음</text>
+    <text x="352" y="90" font-size="12" class="d-m">허용 목록이 있을 때. 403. 감사 기록 없음</text>
+    <text x="352" y="120" font-size="12" class="d-a">설정할 때. 안쪽 결과를 모두 기록</text>
+    <text x="352" y="150" font-size="12" class="d-m">항상 있음. 실패하면 401</text>
+    <text x="352" y="180" font-size="12" class="d-m">내장 인가 서버, token exchange 설정 때</text>
+    <text x="352" y="210" font-size="12" class="d-m">tool 목록 제한이나 이름 변경 설정 때</text>
+    <text x="352" y="240" font-size="12" class="d-m">항상 있음. 잘못된 JSON-RPC는 400</text>
+    <text x="352" y="270" font-size="12" class="d-a">OTel 설정 때. 요청 span을 연다</text>
+    <text x="352" y="300" font-size="12" class="d-m">operator 경로만. 초과하면 429</text>
+    <text x="352" y="330" font-size="12" class="d-m">설정 때. 요청 본문을 고친다</text>
+    <text x="352" y="360" font-size="12" class="d-m">설정 때. 거부하면 403</text>
+    <text x="352" y="390" font-size="12" class="d-a">기본으로 켜짐. tools/call 수를 센다</text>
+    <text x="352" y="420" font-size="12" class="d-m">설정 때. 거부하면 403</text>
+    <text x="352" y="450" font-size="12" class="d-m">MCP 서버 직전에 자격 증명과 header를 넣음</text>
+    <text x="352" y="480" font-size="12" class="d-m">항상 있음. 안쪽 panic을 500으로 바꿈</text>
+  </svg>
+  </div>
+  <figcaption>그림 1. operator 경로의 middleware chain. 파란 상자는 관측 단계이고 주황 상자는 요청을 막을 가능성이 있는 단계다. 점선 상자는 감사 middleware가 감싸는 범위다(source <code>pkg/runner/middleware.go:77-293</code>).</figcaption>
+</figure>
+
+<p>이 순서에는 이유가 있는데, 소스 주석과 <code>docs/middleware.md</code>가 밝힌 규칙은 다음과 같다.</p>
+<ol>
+  <li>본문 크기 제한과 Origin 검사는 감사보다 바깥에 있다. 본문 크기 제한은 감사가 본문을 버퍼에 담기 전에 큰 요청을 막고, Origin 검사는 인증 전에 DNS rebinding을 막는 단계다. SSE와 streamable-http 서버 앞에는 transparent proxy가 서는데, 이 proxy는 그보다 먼저 <code>Connection</code> header를 검사해서 hop-by-hop이 아닌 header 이름이 담겨 있으면 400으로 막는다(source <code>pkg/transport/proxy/transparent/transparent_proxy.go:1650-1677</code>). 클라이언트가 middleware가 넣은 header를 <code>Connection</code>으로 지우지 못하게 하는 검사다. 세 검사가 모두 감사보다 먼저 실행되기 때문에 이 400, 413, Origin 403은 감사 기록에 남지 않는다(source <code>docs/middleware.md</code>). 그림 1에는 <code>Connection</code> 검사를 그리지 않았다.</li>
+  <li>감사는 나머지 chain 전체를 감싸기 때문에 인증 실패(401), 인가 거부(403), 제한 초과(429)도 감사 이벤트로 남는다(source <code>pkg/runner/middleware.go:83-90</code>).</li>
+  <li>MCP parser는 telemetry, 사용 제한, webhook, 인가보다 앞에 있다. 뒤 단계가 parser가 context에 넣은 method와 tool 이름을 읽기 때문이다. parser는 POST만 해석하고, 본문이 있는 GET이나 DELETE 요청은 400으로 막는다(source <code>pkg/mcp/parser.go:99-113</code>).</li>
+  <li>telemetry는 사용 제한보다 앞에 있다. 사용 제한이 진행 중인 span에 결과 속성을 붙이기 때문이다(source <code>pkg/runner/middleware.go:177-180</code>).</li>
+  <li>사용 제한은 webhook보다 앞에 있어서 제한 초과 요청은 외부 webhook을 호출하지 않는다.</li>
+  <li>mutating webhook은 validating webhook과 인가보다 앞에 있어서 인가는 고친 뒤의 요청으로 판단한다.</li>
+  <li>recovery는 맨 안쪽에 있어서 바깥 middleware의 panic을 잡지 못한다(source <code>pkg/runner/middleware.go:283-288</code>).</li>
+</ol>
+<p>감사는 인증과 parser보다 바깥에 있어서 안쪽 단계가 context에 넣은 값을 직접 읽지 못한다. 그래서 감사 middleware는 요청을 넘기기 전에 빈 holder를 context에 넣어 두고, 인증과 parser가 결과를 그 holder에 채우면 안쪽 chain이 끝난 뒤 holder를 읽는다(source <code>pkg/audit/auditor.go:185-202</code>).</p>
+<p>인증과 인가의 동작은 <a href="05-authn-authz.html">05편</a>이 자세히 다룬다. vMCP는 별도 처리 순서를 쓰는데, 그 순서는 <a href="08-vmcp.html">08편</a>을 보면 된다.</p>
+
+<h2 id="s2">2. 두 가지 조립 경로: CLI와 operator</h2>
+<p>chain을 조립하는 함수는 두 개이고, <code>thv run</code>의 flag 경로와 operator 경로가 서로 다른 함수를 쓴다. 두 경로의 차이는 아래 표와 같다.</p>
+<div class="tbl"><table>
+<tr><th>항목</th><th>CLI flag 경로</th><th>operator, proxyrunner 경로</th></tr>
+<tr><td>조립 함수</td><td><code>WithMiddlewareFromFlags</code> (source <code>pkg/runner/config_builder.go:715</code>)</td><td><code>PopulateMiddlewareConfigs</code> (source <code>pkg/runner/middleware.go:67</code>)</td></tr>
+<tr><td>사용 제한</td><td>없음</td><td>Redis session storage가 있을 때 추가</td></tr>
+<tr><td>usage metrics 위치</td><td>webhook보다 앞</td><td>webhook보다 뒤</td></tr>
+<tr><td>telemetry 위치</td><td>webhook보다 뒤, 인가보다 앞</td><td>parser 바로 뒤, 사용 제한과 webhook보다 앞</td></tr>
+<tr><td>tool filter 위치</td><td>인증보다 앞</td><td>인증과 access token 교환보다 뒤</td></tr>
+<tr><td>AWS STS</td><td>없음</td><td>설정할 때 추가</td></tr>
+<tr><td>header forward</td><td>secret 해석 뒤 <code>runner.Run</code>에서 추가</td><td>조립 함수 안에서 추가</td></tr>
+<tr><td>본문 크기 제한, Origin 검사</td><td colspan="2">두 경로 모두 <code>runner.Run</code>이 맨 앞에 붙인다. Origin 검사는 허용 목록이 비면 빠진다. operator 경로는 기본값에서 빠진다.</td></tr>
+</table></div>
+<p>CLI 경로의 바깥쪽부터 순서는 아래와 같다(source <code>pkg/runner/config_builder.go:741-809</code>, <code>:909-950</code>). 본문 크기 제한과 Origin 검사는 그 앞에 붙는다.</p>
+<ol>
+  <li>감사</li>
+  <li>tool filter, tool call filter</li>
+  <li>인증, token exchange</li>
+  <li>MCP parser</li>
+  <li>usage metrics</li>
+  <li>mutating webhook, validating webhook</li>
+  <li>telemetry</li>
+  <li>인가</li>
+  <li>recovery</li>
+</ol>
+<p>usage metrics의 위치가 달라서 생기는 차이가 하나 있는데, mutating webhook이 JSON-RPC method를 바꾸면 두 경로가 다른 값을 센다. CLI 경로는 바꾸기 전 method를, operator 경로는 바꾼 뒤 method를 센다(source <code>pkg/runner/config_builder.go:775-781</code>).</p>
+
+<h2 id="s3">3. 관측의 구성: trace, metric, 로그</h2>
+<p>ToolHive의 관측 신호는 세 가지다. telemetry middleware가 OTel SDK로 trace와 metric을 만들고(source <code>pkg/telemetry/middleware.go</code>), 감사 middleware는 OTel과 별개로 감사 이벤트를 JSON으로 쓴다. proxy가 MCP 요청을 직접 해석하기 때문에 MCP 서버 코드를 고치지 않아도 tool 단위 신호가 나온다(docs <code>concepts/observability</code>).</p>
+<p>trace와 metric을 내보내는 길은 두 가지다.</p>
+<ul>
+  <li>OTLP push: proxy가 수신기로 trace와 metric을 보내는 방식이고, 수신기는 OTel Collector나 관측 시스템이다.</li>
+  <li>Prometheus pull: Prometheus가 proxy의 <code>/metrics</code>를 주기적으로 읽는다.</li>
+</ul>
+<p>두 길은 함께 켜도 된다. 둘 다 꺼져 있으면 telemetry 설정 자체가 없어서(source <code>pkg/telemetry/config.go:242</code>) telemetry middleware가 chain에 들어가지 않는다.</p>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 260" width="760" height="260" role="img" aria-label="proxy가 telemetry를 내보내는 길. OTLP push, 진단 포트 pull, transport 포트.">
+    <defs><marker id="m06b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+    <marker id="m06c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head-w" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="d-box" x="20" y="150" width="130" height="50" rx="10"/>
+    <text x="85" y="180" font-size="14" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <rect class="d-acc" x="190" y="40" width="230" height="190" rx="12"/>
+    <text x="305" y="66" font-size="15" font-weight="600" text-anchor="middle">proxy</text>
+    <text x="305" y="88" font-size="12" class="d-m" text-anchor="middle">telemetry middleware</text>
+    <rect class="d-box" x="205" y="112" width="200" height="34" rx="6"/>
+    <text x="305" y="134" font-size="13" text-anchor="middle">진단 포트 9464: /metrics</text>
+    <rect class="d-box" x="205" y="160" width="200" height="50" rx="6"/>
+    <text x="305" y="181" font-size="13" text-anchor="middle">transport 포트</text>
+    <text x="305" y="199" font-size="11.5" class="d-m" text-anchor="middle">MCP 트래픽, 전환 기간의 /metrics</text>
+    <rect class="d-box" x="580" y="20" width="160" height="50" rx="10"/>
+    <text x="660" y="42" font-size="14" font-weight="600" text-anchor="middle">OTLP 수신기</text>
+    <text x="660" y="60" font-size="11.5" class="d-m" text-anchor="middle">trace, metric</text>
+    <rect class="d-box" x="580" y="100" width="160" height="50" rx="10"/>
+    <text x="660" y="122" font-size="14" font-weight="600" text-anchor="middle">Prometheus</text>
+    <text x="660" y="140" font-size="11.5" class="d-m" text-anchor="middle">주기적으로 읽음</text>
+    <rect class="d-box" x="580" y="190" width="160" height="50" rx="10"/>
+    <text x="660" y="220" font-size="14" font-weight="600" text-anchor="middle">MCP 서버</text>
+    <line class="d-line" x1="150" y1="180" x2="203" y2="182" marker-end="url(#m06b)"/>
+    <line class="d-line" x1="420" y1="60" x2="578" y2="45" marker-end="url(#m06b)"/>
+    <text x="500" y="44" font-size="11.5" class="d-m" text-anchor="middle">push</text>
+    <line class="d-line" x1="580" y1="125" x2="407" y2="129" marker-end="url(#m06b)"/>
+    <text x="492" y="119" font-size="11.5" class="d-m" text-anchor="middle">pull</text>
+    <line class="d-dash" x1="580" y1="140" x2="407" y2="168" marker-end="url(#m06c)"/>
+    <line class="d-line" x1="405" y1="196" x2="578" y2="214" marker-end="url(#m06b)"/>
+  </svg>
+  </div>
+  <figcaption>그림 2. telemetry를 내보내는 길. proxy는 OTLP 수신기로 밀어 보내고 Prometheus는 진단 포트를 읽는다. 주황 점선은 전환 기간에만 남은 transport 포트의 <code>/metrics</code>다(docs <code>guides-cli/telemetry-and-metrics</code>).</figcaption>
+</figure>
+
+<h2 id="s4">4. trace: span 이름, 속성, 전파</h2>
+<h3>span의 단위와 이름</h3>
+<p>telemetry middleware는 HTTP 요청마다 server span을 하나 연다(source <code>pkg/telemetry/middleware.go:219-223</code>). 처음 이름은 <code>POST /mcp</code> 같은 HTTP 이름이고, 안쪽 chain이 끝나면 middleware가 MCP 이름으로 바꾼다(source <code>pkg/telemetry/middleware.go:249</code>). 끝난 뒤에 바꾸는 것은 mutating webhook이 요청 도중 method나 tool을 바꿀 가능성이 있기 때문이다.</p>
+<div class="tbl"><table>
+<tr><th>span 이름 형식</th><th>쓰는 때</th><th>예</th></tr>
+<tr><td><code>{mcp.method.name} {대상}</code></td><td>대상이 있는 MCP 요청</td><td><code>tools/call fetch</code></td></tr>
+<tr><td><code>{mcp.method.name}</code></td><td>대상이 없는 MCP 요청</td><td><code>initialize</code></td></tr>
+<tr><td><code>{HTTP method} {경로}</code></td><td>MCP가 아닌 요청</td><td><code>GET /health</code></td></tr>
+<tr><td><code>sse.connection_established</code></td><td>SSE 연결 수립</td><td></td></tr>
+</table></div>
+<p>출처는 <code>docs/observability.md</code>의 Span Naming Conventions다.</p>
+
+<h3>주요 속성</h3>
+<p>span 속성은 OTel HTTP 규약과 MCP 규약을 따르며, 주요 속성은 아래와 같다(source <code>docs/observability.md</code>).</p>
+<div class="tbl"><table>
+<tr><th>묶음</th><th>속성</th></tr>
+<tr><td>HTTP</td><td><code>http.request.method</code>, <code>url.path</code>, <code>http.response.status_code</code>, <code>user_agent.original</code></td></tr>
+<tr><td>MCP</td><td><code>mcp.method.name</code>, <code>mcp.server.name</code>, <code>jsonrpc.request.id</code>, <code>mcp.session.id</code>, <code>mcp.protocol.version</code></td></tr>
+<tr><td>tool 호출</td><td><code>gen_ai.tool.name</code>, <code>gen_ai.operation.name</code>(값은 <code>execute_tool</code>), <code>gen_ai.tool.call.arguments</code></td></tr>
+<tr><td>네트워크</td><td><code>network.transport</code>(<code>tcp</code> 또는 <code>pipe</code>), <code>client.address</code>, <code>client.port</code></td></tr>
+<tr><td>사용 제한</td><td><code>rate_limit.decision</code>, <code>rate_limit.rejected_by</code>, <code>rate_limit.fail_open</code></td></tr>
+</table></div>
+<p>span 상태는 HTTP 상태로 정한다. 5xx는 <code>Error</code>이고 4xx는 <code>Unset</code>으로 남으며, 2xx와 3xx는 <code>Ok</code>다(source <code>pkg/telemetry/middleware.go:655-661</code>).</p>
+
+<h3>tool 인자의 가림과 길이 제한</h3>
+<p><code>gen_ai.tool.call.arguments</code>에는 tool 인자를 문자열로 넣는데, 이때 middleware가 민감한 key의 값을 가린다(source <code>pkg/telemetry/middleware.go:572-616</code>). 규칙은 다음과 같다.</p>
+<ul>
+  <li>key 이름에 민감한 단어가 들어 있으면 값을 <code>[REDACTED]</code>로 바꾼다. 단어는 <code>password</code>, <code>token</code>, <code>secret</code>, <code>key</code>, <code>auth</code>, <code>credential</code>, <code>private</code> 등이다.</li>
+  <li>값 하나가 100자를 넘으면 자른다.</li>
+  <li>전체 문자열이 200자를 넘으면 자른다.</li>
+</ul>
+<p>공식 문서의 trace 예는 아래와 같다(docs <code>concepts/observability</code>).</p>
+<pre><code>Span: tools/call create_issue (150ms)
+├── service.name: thv-github
+├── mcp.method.name: tools/call
+├── mcp.server.name: github
+├── jsonrpc.request.id: 5
+├── gen_ai.tool.name: create_issue
+├── gen_ai.operation.name: execute_tool
+├── gen_ai.tool.call.arguments: owner=stacklok, repo=toolhive, pullNumber=1131
+├── http.response.status_code: 202
+└── network.transport: tcp</code></pre>
+
+<h3>trace 전파</h3>
+<p>proxy는 W3C Trace Context를 두 곳에서 읽는다. 하나는 <code>traceparent</code>와 <code>tracestate</code> HTTP header이고 다른 하나는 JSON-RPC <code>params._meta</code> 필드다. 둘 다 있으면 <code>_meta</code>가 이기는데(source <code>pkg/telemetry/middleware.go:194-204</code>), MCP 규약이 <code>_meta</code>를 전파 위치로 정했기 때문이다.</p>
+<pre><code>{
+  "method": "tools/call",
+  "params": {
+    "name": "fetch",
+    "arguments": {"url": "https://example.com"},
+    "_meta": {
+      "traceparent": "00-abcdef1234567890abcdef1234567890-1234567890abcdef-01"
+    }
+  }
+}</code></pre>
+<p>vMCP는 backend로 요청을 보낼 때 <code>_meta</code>에 trace context를 넣는 함수를 쓴다(source <code>pkg/telemetry/propagation.go:73</code>).</p>
+
+<h3>legacy 속성 이름</h3>
+<p>ToolHive는 속성 이름을 OTel 규약에 맞게 바꿨지만, 기존 dashboard가 깨지지 않게 옛 이름도 같이 낸다. 이 동작은 <code>useLegacyAttributes</code>가 정하고 기본값은 <code>true</code>다(source <code>pkg/telemetry/config.go:120-126</code>). 소스 주석에는 이 기본값이 나중에 <code>false</code>로 바뀐다고 적혀 있으므로, 새 dashboard는 새 이름으로 만들어야 한다(source <code>docs/telemetry-migration-guide.md</code>).</p>
+
+<h2 id="s5">5. metric과 Prometheus endpoint</h2>
+<h3>metric 이름과 속성</h3>
+<p>telemetry middleware는 MCP 서버마다 아래 metric을 만든다(source <code>pkg/telemetry/middleware.go:90-131</code>).</p>
+<div class="tbl"><table>
+<tr><th>metric (OTel 이름)</th><th>종류</th><th>속성</th></tr>
+<tr><td><code>toolhive_mcp_requests</code></td><td>Counter</td><td><code>method</code>, <code>status_code</code>, <code>status</code>, <code>mcp_method</code>, <code>mcp_resource_id</code>, <code>server</code>, <code>transport</code></td></tr>
+<tr><td><code>toolhive_mcp_request_duration</code></td><td>Histogram, 초</td><td>위와 같음</td></tr>
+<tr><td><code>mcp.server.operation.duration</code></td><td>Histogram, 초</td><td><code>mcp.method.name</code>, <code>network.transport</code>, <code>error.type</code>, <code>gen_ai.tool.name</code> 등</td></tr>
+<tr><td><code>toolhive_mcp_tool_calls</code></td><td>Counter</td><td><code>server</code>, <code>tool</code>, <code>status</code></td></tr>
+<tr><td><code>toolhive_mcp_active_connections</code></td><td>UpDownCounter</td><td><code>server</code>, <code>transport</code>, <code>connection_type</code></td></tr>
+</table></div>
+<p><code>status</code>는 HTTP 상태가 400 이상이면 <code>error</code>이고 그 밖에는 <code>success</code>다(source <code>docs/observability.md</code>). Prometheus 형식에서는 이름이 조금 바뀐다. counter에는 <code>_total</code>이, 초 단위 histogram에는 <code>_seconds</code>가 붙고 점은 밑줄로 바뀐다(docs <code>concepts/observability</code>).</p>
+<pre><code># 서버별 요청 비율
+sum(rate(toolhive_mcp_requests_total[5m])) by (server)
+
+# 서버별 95번째 백분위 응답 시간
+histogram_quantile(0.95,
+  sum(rate(toolhive_mcp_request_duration_seconds_bucket[5m])) by (le, server))
+
+# tool별 호출 비율
+sum(rate(toolhive_mcp_tool_calls_total[5m])) by (tool, server)</code></pre>
+<p>사용 제한도 metric을 내는데, 이 metric은 <a href="#s9">9장</a>에서 다룬다. 내장 인가 서버는 DCR(동적 client 등록) client 상한에 관한 metric 두 개를 낸다. <code>toolhive_authserver_dcr_clients</code> gauge와 <code>toolhive_authserver_dcr_capacity_rejections</code> counter다(source <code>pkg/authserver/server/handlers/dcr_metrics.go:34-48</code>). 내장 인가 서버는 <a href="05-authn-authz.html">05편</a>의 범위이고, vMCP의 추가 metric은 <a href="08-vmcp.html">08편</a>의 범위다.</p>
+
+<div class="box warn">
+<p><code>mcp_method</code>와 <code>mcp_resource_id</code> 값은 클라이언트 입력에서 오고, <code>docs/observability.md</code>는 이 값의 길이를 제한한다고 적는다. OTel SDK는 instrument 하나에 속성 조합을 2000개까지만 두는데, 집계가 누적이라서 한 번 생긴 조합은 프로세스가 끝날 때까지 남는다(source <code>docs/observability.md</code>). 클라이언트가 정하는 새 값은 metric 속성이 아니라 span 속성에 넣어야 한다.</p>
+</div>
+
+<h3>Prometheus endpoint와 진단 포트</h3>
+<p>Prometheus endpoint를 켜면 proxy는 별도 listener에서 <code>/metrics</code>를 제공한다. 기본 포트는 9464이고(source <code>pkg/diagnostics/server.go:73</code>), 이 값은 OTel 규약의 Prometheus exporter 기본 포트다. 그 포트를 이미 쓰고 있으면 proxy는 빈 포트를 골라 시작 로그에 남긴다. 내장 인가 서버의 TLS listener를 켠 경우는 예외라서, 진단 포트가 그 listener 포트 8443과 같으면 proxy는 다른 포트를 고르지 않고 시작에 실패한다(source <code>pkg/runner/runner.go:1343-1356</code>).</p>
+<p>별도 포트를 쓰는 이유는 접근 통제다. Kubernetes NetworkPolicy는 포트를 기준으로 거르고 HTTP 경로로는 거르지 못하므로, <code>/metrics</code>가 transport 포트에 있으면 metric 수집만 막는 규칙을 쓸 수 없다(source <code>docs/observability.md</code>).</p>
+<div class="box warn">
+<p>진단 포트에는 middleware가 없어서 인증, 사용 제한, 감사도 모두 없다. 운영자는 NetworkPolicy로 진단 포트에 접근하는 pod를 제한해야 한다.</p>
+</div>
+<p>지금은 위치를 옮기는 전환 기간이라서 proxy가 <code>/metrics</code>를 transport 포트와 진단 포트 두 곳에서 제공한다. 이 기본값은 <code>DefaultMetricsOnTransportPort = true</code>다(source <code>pkg/telemetry/config.go:177</code>). 운영자는 다음 순서로 옮기면 된다(source <code>docs/observability.md</code>, Migration window).</p>
+<ol>
+  <li>scraper가 진단 포트를 읽게 바꾸고 metric이 들어오는지 확인한다.</li>
+  <li><code>metricsOnTransportPort: false</code>로 transport 포트의 복사본을 끈다.</li>
+  <li>그 뒤에도 옛 위치를 읽는 곳이 없는지 확인한다.</li>
+</ol>
+<p>값을 비워 두면 나중에 기본값이 바뀔 때 함께 바뀌고, 명시하면 기본값이 바뀌어도 그대로다. 끈 뒤에는 transport 포트의 <code>/metrics</code>는 404와 안내 문구를 돌려준다.</p>
+
+<h2 id="s6">6. telemetry 설정</h2>
+<h3>thv run flag</h3>
+<p>CLI에서는 <code>thv run</code> flag로 서버마다 telemetry를 켠다(source <code>cmd/thv/app/run_flags.go:274-300</code>).</p>
+<div class="tbl"><table>
+<tr><th>flag</th><th>기본값</th><th>뜻</th></tr>
+<tr><td><code>--otel-endpoint</code></td><td>없음</td><td>OTLP 수신기 주소. 문서는 scheme 없는 <code>host:port</code>를 권한다.</td></tr>
+<tr><td><code>--otel-service-name</code></td><td><code>thv-&lt;workload 이름&gt;</code></td><td><code>service.name</code> resource 속성</td></tr>
+<tr><td><code>--otel-tracing-enabled</code></td><td><code>true</code></td><td>endpoint가 있을 때 trace를 보낸다</td></tr>
+<tr><td><code>--otel-metrics-enabled</code></td><td><code>true</code></td><td>endpoint가 있을 때 metric을 보낸다</td></tr>
+<tr><td><code>--otel-sampling-rate</code></td><td><code>0.1</code></td><td>trace sampling 비율</td></tr>
+<tr><td><code>--otel-headers</code></td><td>없음</td><td>수신기 인증 header, <code>key=value</code></td></tr>
+<tr><td><code>--otel-insecure</code></td><td><code>false</code></td><td>HTTPS 대신 HTTP를 쓴다</td></tr>
+<tr><td><code>--otel-enable-prometheus-metrics-path</code></td><td><code>false</code></td><td>진단 포트에 <code>/metrics</code>를 연다</td></tr>
+<tr><td><code>--otel-metrics-on-transport-port</code></td><td><code>true</code></td><td>transport 포트에도 <code>/metrics</code>를 둔다</td></tr>
+<tr><td><code>--otel-env-vars</code></td><td>없음</td><td>span에 넣을 환경 변수 이름. <code>environment.이름</code> 속성이 된다. <code>이름=값</code> 형식 항목은 무시한다(source <code>pkg/telemetry/middleware.go:328-331</code>)</td></tr>
+<tr><td><code>--otel-custom-attributes</code></td><td>없음</td><td>resource 속성, <code>key=value</code></td></tr>
+<tr><td><code>--otel-use-legacy-attributes</code></td><td><code>true</code></td><td>옛 속성 이름도 같이 낸다</td></tr>
+</table></div>
+<pre><code>thv run \
+  --otel-endpoint localhost:4318 \
+  --otel-insecure \
+  --otel-sampling-rate 1.0 \
+  --otel-enable-prometheus-metrics-path \
+  fetch
+
+curl http://127.0.0.1:9464/metrics</code></pre>
+<p>service 이름을 비우면 ToolHive가 workload 이름에 <code>thv-</code>를 붙인다(source <code>pkg/telemetry/config.go:281-290</code>). endpoint가 있는데 trace와 metric을 모두 끄면 설정 확인 단계에서 오류가 난다(source <code>pkg/telemetry/config.go:429-436</code>).</p>
+
+<h3>전역 설정: thv config otel</h3>
+<p><code>thv config otel</code>은 모든 서버에 쓸 기본값을 설정 파일에 저장하는데, 설정 파일은 XDG 설정 디렉터리의 <code>toolhive/config.yaml</code>이다(source <code>pkg/config/config.go:171</code>). 하위 명령은 항목마다 <code>set-</code>, <code>get-</code>, <code>unset-</code> 세 가지다(source <code>cmd/thv/app/otel.go:203-226</code>).</p>
+<div class="tbl"><table>
+<tr><th>항목</th><th>set 명령</th><th>config.yaml key</th></tr>
+<tr><td>OTLP endpoint</td><td><code>set-endpoint</code></td><td><code>endpoint</code></td></tr>
+<tr><td>metric 전송</td><td><code>set-metrics-enabled</code></td><td><code>metrics-enabled</code></td></tr>
+<tr><td>trace 전송</td><td><code>set-tracing-enabled</code></td><td><code>tracing-enabled</code></td></tr>
+<tr><td>sampling 비율</td><td><code>set-sampling-rate</code></td><td><code>sampling-rate</code></td></tr>
+<tr><td>환경 변수</td><td><code>set-env-vars</code></td><td><code>env-vars</code></td></tr>
+<tr><td>HTTP 전송</td><td><code>set-insecure</code></td><td><code>insecure</code></td></tr>
+<tr><td>Prometheus endpoint</td><td><code>set-enable-prometheus-metrics-path</code></td><td><code>enable-prometheus-metrics-path</code></td></tr>
+</table></div>
+<pre><code>thv config otel set-endpoint localhost:4318
+thv config otel set-sampling-rate 0.25
+thv config otel set-insecure true
+thv config otel get-endpoint</code></pre>
+<p><code>set-endpoint</code>는 <code>http://</code>나 <code>https://</code>로 시작하는 값을 거부한다(source <code>cmd/thv/app/otel.go:232-235</code>). <code>thv run</code>에서 flag를 명시하면 flag 값이 설정 파일 값을 이기고, 명시하지 않은 flag만 설정 파일 값을 받는다(source <code>cmd/thv/app/run_flags.go:1176-1215</code>). service 이름, header, 사용자 속성은 전역 설정에 없다.</p>
+
+<h3>sampling</h3>
+<p>sampling 비율은 trace에만 쓰고(source <code>pkg/telemetry/config.go:57-62</code>), 기본값은 경로마다 다르다.</p>
+<ul>
+  <li><code>thv run</code> flag의 기본값은 0.1이다(source <code>cmd/thv/app/run_flags.go:282</code>).</li>
+  <li>CRD와 <code>DefaultConfig</code>의 기본값은 0.05다(source <code>pkg/telemetry/config.go:60</code>, <code>:219</code>).</li>
+</ul>
+<p>공식 문서는 개발에서 1.0, 트래픽이 많은 운영에서 0.01을 예로 든다(docs <code>guides-cli/telemetry-and-metrics</code>). trace가 안 보이면 먼저 1.0으로 올려 sampling 문제를 배제해야 한다.</p>
+
+<h3>Kubernetes: MCPTelemetryConfig</h3>
+<p>Kubernetes에서는 <code>MCPTelemetryConfig</code> 하나를 만들어 여러 서버가 참조하게 한다. 서버는 <code>spec.telemetryConfigRef</code>로 참조하고 <code>serviceName</code>만 따로 정한다(docs <code>guides-k8s/telemetry-and-metrics</code>). 서버 안에 직접 쓰는 <code>spec.telemetry</code>는 deprecated다(source <code>docs/observability.md</code>).</p>
+<pre><code>apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPTelemetryConfig
+metadata:
+  name: shared-otel
+  namespace: toolhive-system
+spec:
+  openTelemetry:
+    enabled: true
+    endpoint: otel-collector.monitoring.svc.cluster.local:4318
+    insecure: true
+    tracing:
+      enabled: true
+      samplingRate: "0.05"
+    metrics:
+      enabled: true
+    sensitiveHeaders:
+      - name: Authorization
+        secretKeyRef: {name: otel-credentials, key: api-key}
+  prometheus:
+    enabled: true
+    metricsOnTransportPort: false
+---
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPServer
+metadata:
+  name: gofetch
+  namespace: toolhive-system
+spec:
+  image: ghcr.io/stackloklabs/gofetch/server
+  transport: streamable-http
+  telemetryConfigRef:
+    name: shared-otel
+    serviceName: mcp-fetch-server</code></pre>
+<p>민감한 header 값은 <code>sensitiveHeaders</code>로 Kubernetes Secret에서 읽는다. 진단 포트에는 Service나 <code>containerPort</code> 선언이 없어서 Prometheus는 pod를 직접 찾아 주소를 <code>:9464</code>로 바꿔 읽어야 한다(docs <code>guides-k8s/telemetry-and-metrics</code>). CRD 구조 전체는 <a href="07-kubernetes-operator.html">07편</a>이 다룬다.</p>
+
+<h2 id="s7">7. 감사 로그</h2>
+<h3>켜는 방법</h3>
+<p>감사 로그는 기본으로 꺼져 있고, 켜는 방법은 실행 경로마다 다르다.</p>
+<div class="tbl"><table>
+<tr><th>경로</th><th>설정</th></tr>
+<tr><td>CLI, 기본 설정</td><td><code>thv run --enable-audit &lt;서버&gt;</code></td></tr>
+<tr><td>CLI, 설정 파일</td><td><code>thv run --audit-config audit.json &lt;서버&gt;</code></td></tr>
+<tr><td>MCPServer, MCPRemoteProxy</td><td><code>spec.audit.enabled: true</code></td></tr>
+<tr><td>VirtualMCPServer</td><td><code>spec.config.audit</code> 아래 전체 필드</td></tr>
+</table></div>
+<p>CLI flag의 출처는 <code>cmd/thv/app/run_flags.go:233-235</code>다. MCPServer CRD의 <code>audit</code>에는 <code>enabled</code> 필드 하나만 있다(source <code>cmd/thv-operator/api/v1beta1/mcpserver_types.go:920-926</code>). Kubernetes 쪽 출처는 docs <code>guides-k8s/logging</code>, <code>guides-vmcp/audit-logging</code>이다.</p>
+
+<h3>설정 필드</h3>
+<p>설정 파일의 필드는 아래와 같다(source <code>pkg/audit/config.go:21-67</code>, <code>:85-95</code>).</p>
+<div class="tbl"><table>
+<tr><th>필드</th><th>기본값</th><th>뜻</th></tr>
+<tr><td><code>component</code></td><td>CLI는 서버 이름</td><td>이벤트의 <code>component</code> 값</td></tr>
+<tr><td><code>logFile</code></td><td>stdout</td><td>파일 경로. 권한 0600으로 만든다</td></tr>
+<tr><td><code>eventTypes</code></td><td>전체</td><td>기록할 type 목록</td></tr>
+<tr><td><code>excludeEventTypes</code></td><td>없음</td><td>뺄 type 목록. <code>eventTypes</code>보다 우선한다</td></tr>
+<tr><td><code>includeRequestData</code></td><td><code>false</code></td><td>요청 본문을 넣는다</td></tr>
+<tr><td><code>includeResponseData</code></td><td><code>false</code></td><td>응답 본문을 넣는다</td></tr>
+<tr><td><code>maxDataSize</code></td><td>1024</td><td>본문을 담는 최대 byte 수</td></tr>
+<tr><td><code>detectApplicationErrors</code></td><td><code>true</code></td><td>200 응답 안의 JSON-RPC 오류를 찾는다</td></tr>
+<tr><td><code>maxDelegationDepth</code></td><td>10</td><td>위임 체인을 기록하는 최대 깊이</td></tr>
+</table></div>
+<p>CLI 경로는 <code>component</code>가 비어 있으면 서버 이름을 넣는다(source <code>pkg/audit/middleware.go:72-74</code>).</p>
+
+<h3>이벤트 형식</h3>
+<p>감사 이벤트는 JSON 한 줄이고, 아래는 공식 문서의 MCPServer 예다(docs <code>guides-k8s/logging</code>).</p>
+<pre><code>{
+  "time": "2024-01-01T12:00:00.123456789Z",
+  "level": "AUDIT",
+  "msg": "audit_event",
+  "audit_id": "550e8400-e29b-41d4-a716-446655440000",
+  "type": "mcp_tool_call",
+  "logged_at": "2024-01-01T12:00:00.123456Z",
+  "outcome": "success",
+  "component": "github-server",
+  "source": {"type": "network", "value": "10.0.1.5", "extra": {"user_agent": "node"}},
+  "subjects": {"user": "john.doe@example.com", "user_id": "user-123"},
+  "target": {"endpoint": "/messages", "method": "tools/call", "name": "search_issues", "type": "tool"},
+  "metadata": {"extra": {"duration_ms": 245, "transport": "http"}}
+}</code></pre>
+<p>필드 이름은 코드가 slog 속성으로 정한다(source <code>pkg/audit/event.go:190-231</code>). <code>msg</code>는 항상 <code>audit_event</code>이고, <code>level</code>은 INFO와 WARN 사이의 사용자 정의 레벨이다(source <code>pkg/audit/auditor.go:25-26</code>).</p>
+
+<h3>기록하는 내용</h3>
+<div class="tbl"><table>
+<tr><th>필드</th><th>값을 정하는 방법</th></tr>
+<tr><td><code>type</code></td><td>parser가 해석한 MCP method로 정한다. <code>tools/call</code>은 <code>mcp_tool_call</code>이다. parser 전에 막힌 요청은 <code>http_request</code>다(source <code>pkg/audit/auditor.go:386-436</code>).</td></tr>
+<tr><td><code>outcome</code></td><td>HTTP 상태로 정한다. 표는 바로 아래에 있다.</td></tr>
+<tr><td><code>source.value</code></td><td><code>X-Forwarded-For</code>의 첫 값, <code>X-Real-IP</code>, 연결 주소 순으로 고른다(source <code>pkg/audit/auditor.go:497-519</code>).</td></tr>
+<tr><td><code>subjects</code></td><td>access token claim에서 <code>sub</code>, 이름, client 정보를 읽는다. 이름이 없으면 <code>anonymous</code>를 넣는다(source <code>pkg/audit/auditor.go:614-627</code>).</td></tr>
+<tr><td><code>delegation</code></td><td>RFC 8693 위임 access token일 때만 <code>act</code> claim의 체인을 넣는다.</td></tr>
+<tr><td><code>target</code></td><td>URL 경로, MCP method, tool 이름이나 resource URI를 넣는다(source <code>pkg/audit/auditor.go:652-682</code>).</td></tr>
+<tr><td><code>metadata.extra</code></td><td>처리 시간, transport(<code>sse</code> 또는 <code>http</code>), vMCP의 backend 이름을 넣는다(source <code>pkg/audit/auditor.go:684-712</code>).</td></tr>
+<tr><td><code>data</code></td><td>본문 기록을 켰을 때만 요청과 응답 본문을 넣는다.</td></tr>
+</table></div>
+<p>outcome은 아래 규칙으로 정한다(source <code>pkg/audit/auditor.go:438-454</code>, <code>:296-310</code>).</p>
+<div class="tbl"><table>
+<tr><th>HTTP 상태</th><th>outcome</th><th>예</th></tr>
+<tr><td>2xx, 본문에 JSON-RPC 오류 없음</td><td><code>success</code></td><td>정상 tool 호출</td></tr>
+<tr><td>2xx, 본문에 JSON-RPC 오류 있음</td><td><code>application_error</code></td><td>MCP 서버가 오류 결과를 돌려줌</td></tr>
+<tr><td>401, 403</td><td><code>denied</code></td><td>인증 실패, 인가 거부, webhook 거부</td></tr>
+<tr><td>그 밖의 4xx</td><td><code>failure</code></td><td>제한 초과 429, 잘못된 요청 400</td></tr>
+<tr><td>5xx</td><td><code>error</code></td><td>MCP 서버 오류, recovery의 500</td></tr>
+</table></div>
+<div class="box warn">
+<p>인증 실패는 parser보다 먼저 일어나서 그 이벤트의 type은 <code>http_request</code>다. 그래서 <code>eventTypes</code>에 <code>mcp_*</code>만 넣으면 인증 실패 기록이 빠지고, 거부 기록이 필요하면 <code>http_request</code>도 넣어야 한다(source <code>docs/middleware.md</code>).</p>
+<p><code>source.value</code>는 클라이언트가 보낸 <code>X-Forwarded-For</code>를 먼저 쓰기 때문에, 앞단 load balancer가 이 header를 덮어쓰지 않으면 클라이언트가 정한 값이 기록될 가능성이 있다.</p>
+</div>
+<p>registry server에도 감사 로그가 있는데, <code>source.create</code>, <code>skill.read</code> 같은 API 단위 type을 쓴다. 여기서는 <code>source.value</code>가 연결 주소이고 <code>X-Forwarded-For</code>는 <code>extra</code>에 따로 둔다(docs <code>guides-registry/audit-logging</code>).</p>
+
+<h2 id="s8">8. Kubernetes 로그 수집</h2>
+<p>Kubernetes에서 ToolHive는 운영 로그와 감사 로그를 모두 stdout에 쓰고, 로그 수집기는 <code>msg</code>가 <code>audit_event</code>인 줄로 감사 이벤트를 고른다(docs <code>guides-k8s/logging</code>).</p>
+<div class="tbl"><table>
+<tr><th>구성 요소</th><th>container 이름</th><th>출력</th></tr>
+<tr><td>MCPServer, MCPRemoteProxy의 proxy</td><td><code>toolhive</code></td><td>JSON. 감사 이벤트 포함</td></tr>
+<tr><td>VirtualMCPServer</td><td><code>vmcp</code></td><td>JSON. 감사 이벤트 포함</td></tr>
+<tr><td>MCP 서버 프로세스</td><td><code>mcp</code></td><td>MCP 서버의 stdout 그대로. 평문일 가능성이 있다</td></tr>
+</table></div>
+<p>JSON parser는 <code>toolhive</code>와 <code>vmcp</code> container에만 걸어야 한다. <code>mcp</code> container에 걸면 평문 줄에서 parse 오류가 나기 때문이다. 공식 문서는 아래 경로 패턴을 예로 든다.</p>
+<pre><code>/var/log/containers/*_toolhive-system_toolhive-*.log
+/var/log/containers/*_toolhive-system_vmcp-*.log</code></pre>
+<p>운영 로그의 예는 아래와 같다(docs <code>guides-k8s/logging</code>).</p>
+<pre><code>{"level": "info", "ts": 1761934317.963125, "caller": "logger/logger.go:39",
+ "msg": "MCP server github started successfully"}</code></pre>
+<p>감사 이벤트의 <code>level</code> 값 <code>AUDIT</code>는 표준 레벨 이름이 아니라서 Grafana 같은 도구는 레벨을 <code>unknown</code>으로 표시할 가능성이 있다. 수집기 설정은 <code>level</code> 값 <code>AUDIT</code>나 <code>msg</code> 값으로 걸러야 하고, 공식 문서에 Fluent Bit, Grafana Alloy, OTel Collector <code>filelog</code> 설정 예가 있다.</p>
+<p>감사 로그를 파일로 쓰면 권한이 0600이라서, sidecar가 이 파일을 읽으려면 같은 사용자로 실행하거나 <code>fsGroup</code>을 맞춰야 한다(docs <code>guides-vmcp/audit-logging</code>).</p>
+<p>CLI의 운영 로그 형식은 <code>UNSTRUCTURED_LOGS</code>가 정한다. 기본값 <code>true</code>면 사람이 읽는 형식을 stderr에 쓰고, <code>false</code>면 JSON을 stdout에 쓴다(source <code>docs/logging.md</code>).</p>
+
+<h3>Kubernetes probe와 /health</h3>
+<p>transparent proxy는 transport 포트에서 <code>/health</code>를 제공한다. container 서버에서는 health check가 항상 켜져 있고, remote 서버에서는 <code>TOOLHIVE_REMOTE_HEALTHCHECKS=true</code>일 때만 켜진다(source <code>pkg/transport/http.go:224-232</code>). health check가 켜진 proxy는 요청마다 MCP 서버에 ping하지 않고 health monitor가 마지막으로 기록한 결과를 돌려준다(source <code>pkg/healthcheck/healthcheck.go:84-95</code>, <code>pkg/transport/proxy/transparent/transparent_proxy.go:514-527</code>). 그래서 느린 MCP 서버가 Kubernetes probe를 timeout까지 붙잡지 못하지만, 기본값에서 답은 최대 약 15초 전의 결과다(source <code>docs/arch/03-transport-architecture.md</code>). 첫 검사가 끝나기 전에는 <code>mcp</code> 항목 없이 <code>healthy</code>를 돌려준다. health check를 끈 proxy는 자신의 상태만 돌려주고, stdio 서버 앞의 proxy는 그대로 요청마다 답을 만든다.</p>
+
+<h2 id="s9">9. 사용 제한</h2>
+<h3>적용 범위와 전제 조건</h3>
+<p>사용 제한은 Kubernetes의 MCPServer와 VirtualMCPServer에만 있고, CLI flag 경로에는 사용 제한 middleware가 없다(source <code>docs/middleware.md</code>). 전제 조건은 두 가지다.</p>
+<ul>
+  <li>Redis session storage가 있어야 하고, 없으면 설정 단계에서 오류가 난다(source <code>pkg/runner/middleware.go:783-785</code>). MCPServer가 <code>spec.sessionStorage</code>를 생략해도 operator에 전역 기본 Redis가 있으면 그 Redis를 쓴다. 전역 기본값은 operator 환경 변수 <code>TOOLHIVE_DEFAULT_REDIS_ADDR</code>에서 오고, TLS는 <code>TOOLHIVE_DEFAULT_REDIS_TLS_ENABLED</code>와 CA Secret 참조로 정한다(source <code>cmd/thv-operator/pkg/controllerutil/defaultredis.go:37-79</code>, <code>cmd/thv-operator/controllers/mcpserver_runconfig.go:299-335</code>).</li>
+  <li>per-user 버킷을 쓰려면 인증이 켜져 있어야 한다. 사용자를 access token의 <code>sub</code> claim으로 구분하기 때문이다(source <code>pkg/ratelimit/limiter.go:57-63</code>).</li>
+</ul>
+<p>사용 제한은 <code>tools/call</code>에만 적용하고, <code>initialize</code>, <code>ping</code>, <code>tools/list</code> 같은 다른 method는 그대로 통과한다(source <code>pkg/ratelimit/middleware.go:133-137</code>).</p>
+
+<h3>버킷의 종류</h3>
+<p>버킷은 scope와 대상에 따라 네 종류이고, 요청 하나는 해당하는 버킷을 모두 통과해야 한다(docs <code>guides-k8s/rate-limiting</code>).</p>
+<div class="tbl"><table>
+<tr><th>설정 위치</th><th>scope</th><th>대상</th><th>Redis key 끝부분</th></tr>
+<tr><td><code>rateLimiting.shared</code></td><td>shared</td><td>서버 전체</td><td><code>shared</code></td></tr>
+<tr><td><code>rateLimiting.tools[].shared</code></td><td>shared</td><td>tool 하나</td><td><code>shared:tool:&lt;tool&gt;</code></td></tr>
+<tr><td><code>rateLimiting.perUser</code></td><td>per-user</td><td>서버 전체</td><td><code>user:&lt;sub&gt;</code></td></tr>
+<tr><td><code>rateLimiting.tools[].perUser</code></td><td>per-user</td><td>tool 하나</td><td><code>user-tool:&lt;tool&gt;:&lt;sub&gt;</code></td></tr>
+</table></div>
+<p>key 앞부분은 <code>thv:rl:{namespace:서버}:</code>다(source <code>pkg/ratelimit/internal/bucket/bucket.go:104-109</code>). 중괄호 부분은 Redis hash tag라서 한 서버의 key는 Redis Cluster의 같은 slot에 모인다. key의 만료 시간은 <code>refillPeriod</code>의 2배다.</p>
+<pre><code>spec:
+  oidcConfigRef:
+    name: ratelimit-oidc
+    audience: https://mcp.example.com/mcp
+  sessionStorage:
+    provider: redis
+    address: redis.toolhive-system.svc:6379
+  rateLimiting:
+    shared:
+      maxTokens: 1000
+      refillPeriod: 1m0s
+    perUser:
+      maxTokens: 100
+      refillPeriod: 1m0s
+    tools:
+      - name: expensive_search
+        perUser:
+          maxTokens: 10
+          refillPeriod: 1m0s</code></pre>
+<p>이 예에서 사용자 한 명은 1분에 <code>tools/call</code>을 100번까지 보낼 수 있고, 그중 <code>expensive_search</code>는 10번까지다. 서버 전체로는 1분에 1000번까지다. 채우는 속도는 <code>maxTokens / refillPeriod</code>다.</p>
+
+<h3>판단 과정</h3>
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 300" width="760" height="300" role="img" aria-label="사용 제한 판단 과정. 버킷 목록을 만들고 Redis Lua script가 한 번에 판단한다.">
+    <defs><marker id="m06d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+    <marker id="m06e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head-w" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="d-box" x="16" y="105" width="140" height="64" rx="10"/>
+    <text x="86" y="132" font-size="14" font-weight="600" text-anchor="middle">tools/call 요청</text>
+    <text x="86" y="152" font-size="11.5" class="d-m" text-anchor="middle">다른 method는 통과</text>
+    <rect class="d-box" x="196" y="105" width="170" height="64" rx="10"/>
+    <text x="281" y="132" font-size="14" font-weight="600" text-anchor="middle">버킷 목록 만들기</text>
+    <text x="281" y="152" font-size="11.5" class="d-m" text-anchor="middle">sub가 없으면 per-user 제외</text>
+    <rect class="d-acc" x="406" y="70" width="190" height="134" rx="12"/>
+    <text x="501" y="94" font-size="14" font-weight="600" text-anchor="middle">Redis Lua script 1회</text>
+    <text x="420" y="122" font-size="12">1. 모든 버킷을 시간만큼 채움</text>
+    <text x="420" y="146" font-size="12">2. 1 미만인 버킷이 있으면</text>
+    <text x="434" y="164" font-size="12">아무것도 차감하지 않음</text>
+    <text x="420" y="188" font-size="12">3. 없으면 모두 1씩 차감</text>
+    <rect class="d-ok" x="630" y="40" width="120" height="50" rx="10"/>
+    <text x="690" y="62" font-size="13.5" font-weight="600" text-anchor="middle">통과</text>
+    <text x="690" y="80" font-size="11" class="d-m" text-anchor="middle">다음 middleware</text>
+    <rect class="d-no" x="630" y="112" width="120" height="50" rx="10"/>
+    <text x="690" y="134" font-size="13.5" font-weight="600" text-anchor="middle">429 제한 초과</text>
+    <text x="690" y="152" font-size="11" class="d-m" text-anchor="middle">Retry-After header</text>
+    <rect class="d-warn" x="630" y="184" width="120" height="50" rx="10"/>
+    <text x="690" y="206" font-size="13.5" font-weight="600" text-anchor="middle">Redis 오류</text>
+    <text x="690" y="224" font-size="11" class="d-m" text-anchor="middle">fail-open으로 통과</text>
+    <line class="d-line" x1="156" y1="137" x2="194" y2="137" marker-end="url(#m06d)"/>
+    <line class="d-line" x1="366" y1="137" x2="404" y2="137" marker-end="url(#m06d)"/>
+    <line class="d-line" x1="596" y1="100" x2="628" y2="72" marker-end="url(#m06d)"/>
+    <line class="d-line" x1="596" y1="137" x2="628" y2="137" marker-end="url(#m06d)"/>
+    <line class="d-dash" x1="596" y1="176" x2="628" y2="202" marker-end="url(#m06e)"/>
+    <text x="16" y="262" font-size="12" class="d-m">Redis key 예: thv:rl:{toolhive-system:weather}:user-tool:expensive_search:alice</text>
+    <text x="16" y="284" font-size="12" class="d-m">시간 기준은 Redis 서버의 TIME 명령이다. proxy replica마다 시계가 달라도 결과가 같다.</text>
+  </svg>
+  </div>
+  <figcaption>그림 3. 사용 제한 판단 과정. Lua script는 모든 버킷을 먼저 검사하고 그다음 차감하기 때문에 per-tool 버킷이 막는 요청은 서버 버킷의 허가도 쓰지 않는다(source <code>pkg/ratelimit/internal/bucket/bucket.go:16-82</code>).</figcaption>
+</figure>
+<p>사용 제한 middleware는 다음 순서로 판단한다(source <code>pkg/ratelimit/limiter.go:188-275</code>).</p>
+<ol>
+  <li>요청에 해당하는 버킷 목록을 만든다. access token의 <code>sub</code>가 없으면 per-user 버킷을 목록에서 뺀다.</li>
+  <li>목록이 비어 있으면 그대로 통과시킨다.</li>
+  <li>Redis Lua script 한 번으로 모든 버킷을 경과 시간만큼 채운다.</li>
+  <li>허가가 1 미만인 버킷이 하나라도 있으면 어떤 버킷에서도 차감하지 않고, 첫 번째로 부족한 버킷이 거절 이유가 된다.</li>
+  <li>모든 버킷에 허가가 있으면 각 버킷에서 허가 1개를 뺀다.</li>
+</ol>
+<p>신원이 없는 요청은 per-user 버킷을 건너뛰고 shared 버킷만 거친다(source <code>pkg/ratelimit/limiter.go:57-63</code>). 그래서 MCPServer CRD에는 per-user 설정이 있으면 <code>oidcConfigRef</code>나 <code>externalAuthConfigRef</code>가 있어야 한다는 CEL 규칙이 있다(source <code>cmd/thv-operator/api/v1beta1/mcpserver_types.go:230-231</code>).</p>
+
+<h3>제한 초과 응답</h3>
+<p>제한 초과이면 proxy는 HTTP 429와 <code>Retry-After</code> header를 돌려주고, 본문은 JSON-RPC 오류다(source <code>pkg/ratelimit/middleware.go:157-196</code>). 오류 code는 429다(source <code>pkg/ratelimit/errors.go:24</code>).</p>
+<pre><code>HTTP/1.1 429 Too Many Requests
+Retry-After: 12
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":7,"error":{"code":429,"message":"Rate limit exceeded",
+ "data":{"retryAfterSeconds":12}}}</code></pre>
+<p>vMCP의 제한 초과는 HTTP 200에 같은 JSON-RPC 오류를 담는다(docs <code>guides-k8s/rate-limiting</code>). 그래서 클라이언트는 HTTP 상태가 아니라 JSON-RPC <code>error.code</code>를 봐야 한다.</p>
+
+<h3>Redis 오류와 fail-open</h3>
+<p>요청 처리 중 Redis 검사가 실패하면 middleware는 경고 로그를 남기고 요청을 통과시키는데(source <code>pkg/ratelimit/middleware.go:146-149</code>), 이것이 fail-open이다. 이때 <code>toolhive_rate_limit_fail_open</code> counter가 오르고 span에 <code>rate_limit.fail_open=true</code>가 붙는다(source <code>pkg/ratelimit/limiter.go:180-183</code>).</p>
+<p>proxy 시작 때는 동작이 다르다. middleware는 생성 단계에서 Redis에 5초 제한으로 ping을 보내고, ping이 실패하면 middleware 생성이 실패해서 proxy가 시작하지 않는다(source <code>pkg/ratelimit/middleware.go:75-85</code>, <code>pkg/runner/runner.go:421-423</code>).</p>
+
+<h3>사용 제한 metric</h3>
+<div class="tbl"><table>
+<tr><th>metric</th><th>종류</th><th>속성 (모두 <code>namespace</code>, <code>server</code> 포함)</th></tr>
+<tr><td><code>toolhive_rate_limit_decisions</code></td><td>Counter</td><td><code>decision</code>, <code>scope</code>, <code>operation_type</code></td></tr>
+<tr><td><code>toolhive_rate_limit_redis_errors</code></td><td>Counter</td><td><code>error_type</code>(<code>timeout</code>, <code>connection</code>, <code>auth</code>, <code>other</code>)</td></tr>
+<tr><td><code>toolhive_rate_limit_fail_open</code></td><td>Counter</td><td>추가 속성 없음</td></tr>
+<tr><td><code>toolhive_rate_limit_check_latency</code></td><td>Histogram, 초</td><td>추가 속성 없음</td></tr>
+</table></div>
+<p>출처는 <code>pkg/ratelimit/observability.go:63-162</code>이다. 통과한 요청은 해당 버킷마다 <code>decisions</code>를 1씩 올리고, 거절된 요청은 처음 거절한 버킷 하나만 올린다. 경보는 <code>fail_open</code>에 거는 편이 나은데, 이 값이 실제로 제한 없이 통과한 요청 수이기 때문이다(docs <code>guides-k8s/rate-limiting</code>).</p>
+
+<h2 id="s10">10. webhook</h2>
+<h3>기능과 종류</h3>
+<p>webhook은 MCP 요청을 외부 HTTP 서비스에 보내 판단을 받는 기능으로, Cedar 정책으로 표현하기 어려운 규칙이나 외부 정책 엔진의 판단을 붙일 때 쓴다(docs <code>guides-cli/webhooks</code>). 종류는 두 가지다.</p>
+<ul>
+  <li>mutating webhook: JSON Patch로 요청을 고치고, 요청을 거부하는 기능도 있다.</li>
+  <li>validating webhook: 요청을 허용하거나 거부한다.</li>
+</ul>
+
+<h3>실행 시점과 순서</h3>
+<p>operator 경로에서 webhook은 MCP parser, telemetry, 사용 제한 뒤에서 실행하고(그림 1), CLI 경로에서는 telemetry가 webhook 뒤에 온다. 두 경로 모두 webhook은 인가보다 앞이다. 실행 조건과 순서는 다음과 같다.</p>
+<ol>
+  <li>parser가 해석한 MCP POST 요청이면 <code>tools/call</code>이 아니어도 요청마다 실행하고, 해석 결과가 없는 요청은 건너뛴다(source <code>pkg/webhook/validating/middleware.go:97-101</code>).</li>
+  <li>mutating webhook을 설정 순서대로 먼저 호출한다.</li>
+  <li>validating webhook을 설정 순서대로 호출하고, 하나라도 거부하면 바로 끝난다(source <code>pkg/webhook/validating/middleware.go:139-172</code>).</li>
+</ol>
+<p>공식 문서는 "tool call마다"라고 쓰지만 코드는 <code>initialize</code>와 <code>tools/list</code>도 보낸다. 그래서 문서의 예제 webhook도 이 method들을 허용 목록에 넣는다(docs <code>guides-cli/webhooks</code>).</p>
+
+<h3>요청과 응답 형식</h3>
+<p>proxy가 보내는 요청 본문은 아래와 같고, <code>version</code>은 <code>v0.1.0</code>이다(source <code>pkg/webhook/types.go:19</code>).</p>
+<pre><code>{
+  "version": "v0.1.0",
+  "uid": "550e8400-e29b-41d4-a716-446655440000",
+  "timestamp": "2025-04-13T10:15:30.123Z",
+  "principal": {"sub": "user@example.com", "email": "user@example.com"},
+  "mcp_request": {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "fetch"}},
+  "context": {"server_name": "fetch", "source_ip": "127.0.0.1", "transport": "streamable-http"}
+}</code></pre>
+<pre><code>// validating 응답
+{"version": "v0.1.0", "uid": "550e8400-...", "allowed": false,
+ "message": "Tool call denied by policy", "reason": "insufficient_permissions"}
+
+// mutating 응답. patch 경로는 /mcp_request/ 로 시작해야 한다.
+{"version": "v0.1.0", "uid": "550e8400-...", "allowed": true,
+ "patch_type": "json_patch",
+ "patch": [{"op": "add", "path": "/mcp_request/params/context", "value": "injected"}]}</code></pre>
+<p>validating webhook이 거부하면 proxy는 403과 <code>Request denied by policy</code>를 돌려주고, webhook의 <code>message</code>는 클라이언트에 전하지 않는다. 소스 주석은 정보 유출 방지가 목적이라고 적는다(source <code>pkg/webhook/validating/middleware.go:165-170</code>).</p>
+
+<h3>오류 처리</h3>
+<p><code>failure_policy</code>는 webhook 호출 자체가 실패했을 때의 동작을 정한다.</p>
+<div class="tbl"><table>
+<tr><th>상황</th><th>validating</th><th>mutating</th></tr>
+<tr><td>호출 오류, <code>fail</code></td><td>403으로 거부</td><td>500으로 거부</td></tr>
+<tr><td>호출 오류, <code>ignore</code></td><td>다음 webhook으로 진행</td><td>고치지 않은 본문으로 진행</td></tr>
+<tr><td>호출 전 ToolHive 자체 오류</td><td>정책과 관계없이 403</td><td>정책과 관계없이 500</td></tr>
+<tr><td>webhook이 422 응답</td><td>정책과 관계없이 403</td><td>정책과 관계없이 422</td></tr>
+<tr><td><code>allowed: false</code></td><td>403</td><td>403</td></tr>
+</table></div>
+<p>출처는 <code>pkg/webhook/validating/middleware.go:142-170</code>와 <code>pkg/webhook/mutating/middleware.go:210-233</code>다. 호출 오류는 timeout, 네트워크 오류, 잘못된 응답이다. ToolHive 자체 오류는 본문 인코딩, 요청 생성, HMAC secret 해석의 실패다. 이때는 webhook이 판단한 적이 없으므로 <code>ignore</code>여도 거부한다(source <code>pkg/webhook/types.go:52-58</code>, <code>pkg/webhook/errors.go:68-78</code>).</p>
+
+<h3>설정: CLI와 Kubernetes</h3>
+<p>CLI에서는 <code>--webhook-config</code>로 YAML이나 JSON 파일을 준다. flag를 여러 번 주면 ToolHive가 파일을 합치는데, 같은 <code>name</code>은 뒤 파일이 이긴다.</p>
+<pre><code>validating:
+  - name: policy-check
+    url: https://policy.example.com/validate
+    failure_policy: fail
+    timeout: 5s
+    hmac_secret_ref: /etc/toolhive/webhook-hmac
+    tls_config:
+      ca_bundle_path: /etc/toolhive/pki/webhook-ca.crt
+mutating:
+  - name: request-enricher
+    url: https://enrichment.example.com/mutate
+    failure_policy: ignore</code></pre>
+<ul>
+  <li><code>timeout</code>은 1초에서 30초 사이이고 기본값은 10초다(source <code>pkg/webhook/types.go:21-28</code>).</li>
+  <li>HMAC secret을 주면 proxy가 본문에 서명한다. header는 <code>X-ToolHive-Signature</code>와 <code>X-ToolHive-Timestamp</code>다(source <code>pkg/webhook/signing.go:14-23</code>).</li>
+  <li>ToolHive는 시작 때 설정을 모두 확인하고, 잘못된 설정이 있으면 시작하지 않는다(docs <code>guides-cli/webhooks</code>).</li>
+</ul>
+<p>Kubernetes에서는 <code>MCPWebhookConfig</code>를 만들고 MCPServer의 <code>spec.webhookConfigRef</code>로 참조한다. 이 리소스의 저장 버전은 <code>v1alpha1</code>이고 short name은 <code>mwc</code>다(source <code>cmd/thv-operator/api/v1alpha1/types.go:313-322</code>). CRD의 <code>failurePolicy</code> 기본값은 <code>fail</code>이다(source <code>cmd/thv-operator/api/v1beta1/mcpwebhookconfig_types.go:63</code>). CA, client 인증서, HMAC 키는 Kubernetes Secret에서 읽는다.</p>
+<pre><code>apiVersion: toolhive.stacklok.dev/v1alpha1
+kind: MCPWebhookConfig
+metadata:
+  name: policy-hooks
+spec:
+  validating:
+    - name: policy-check
+      url: https://policy.policy-system.svc/validate
+      timeout: 5s
+      hmacSecretRef: {name: webhook-hmac, key: secret}
+      tlsConfig:
+        caSecretRef: {name: webhook-ca, key: ca.crt}
+---
+# MCPServer 쪽
+spec:
+  webhookConfigRef:
+    name: policy-hooks</code></pre>
+
+<h3>알려진 한계</h3>
+<ul>
+  <li>tool filter와 사용 제한은 mutating webhook보다 앞에 있어서 고치기 전 요청을 본다. 따라서 tool 이름을 바꾸는 mutating webhook은 tool filter를 우회할 가능성이 있다(source <code>docs/middleware.md</code>).</li>
+  <li>mutating webhook은 JSON 본문만 고치기 때문에 <code>Mcp-Name</code> header는 원래 tool 이름으로 남는다. 2026-07-28 규약을 따르는 MCP 서버는 불일치를 보고 요청을 거부한다.</li>
+</ul>
+
+<h2 id="s11">11. usage metrics</h2>
+<p>usage metrics는 ToolHive 개발 팀이 사용량을 파악하는 기능으로, proxy가 <code>tools/call</code> 수를 세서 Stacklok 서버로 보낸다(source <code>pkg/usagemetrics/middleware.go:38-44</code>). 기본으로 켜져 있고 OTel metric과는 별개의 기능이다.</p>
+<h3>보내는 내용</h3>
+<div class="tbl"><table>
+<tr><th>항목</th><th>값</th></tr>
+<tr><td>대상 주소</td><td><code>https://updates.stacklok.com/api/v1/toolcount</code> (source <code>pkg/usagemetrics/client.go:22</code>)</td></tr>
+<tr><td>본문</td><td><code>{"count": 42, "timestamp": "2026-10-14T03:15:00Z"}</code> (source <code>pkg/usagemetrics/types.go:13-16</code>)</td></tr>
+<tr><td><code>X-Instance-ID</code></td><td>proxy 프로세스마다 새로 만드는 UUID</td></tr>
+<tr><td><code>X-Anonymous-Id</code></td><td>업데이트 확인 파일에 저장된 익명 ID. operator가 띄운 proxy는 <code>operator-proxy</code></td></tr>
+<tr><td><code>User-Agent</code></td><td><code>toolhive/[local|operator] 버전 빌드종류 (os/arch)</code></td></tr>
+</table></div>
+<p>header 출처는 <code>pkg/usagemetrics/client.go:59-134</code>다. tool 이름, 인자, 사용자 정보는 보내지 않고, 로컬에서 익명 ID 파일이 아직 없으면 전송을 건너뛴다(source <code>pkg/usagemetrics/client.go:63-71</code>).</p>
+<p>proxy는 15분마다 값을 보낸다(source <code>pkg/usagemetrics/collector.go:18</code>). count는 하루 누적 값이라서 UTC 날짜가 바뀌면 전날 값을 <code>23:59:00Z</code> 시각으로 보내고 0으로 돌린다. count가 0이어도 보낸다(source <code>pkg/usagemetrics/collector.go:84-150</code>).</p>
+<h3>끄는 방법</h3>
+<p>사용자는 아래 방법 중 하나로 끈다(source <code>pkg/usagemetrics/collector.go:27-50</code>).</p>
+<ol>
+  <li>설정 파일에 영구 저장: <code>thv config usage-metrics disable</code>. 설정 key는 <code>disable_usage_metrics</code>다.</li>
+  <li>현재 셸에서만: <code>export TOOLHIVE_USAGE_METRICS_ENABLED=false</code>.</li>
+  <li>업데이트 확인까지 끄기: <code>TOOLHIVE_SKIP_UPDATE_CHECK=true</code>. CI 환경 변수가 있을 때도 자동으로 꺼진다(source <code>pkg/updates/client.go:164-175</code>).</li>
+</ol>
+<p>이미 실행 중인 서버는 다시 시작해야 설정이 반영된다(docs <code>faq</code>). 다시 켜려면 <code>thv config usage-metrics enable</code>을 실행해야 한다.</p>
+
+<h2 id="sQ">12. 자가 점검 문제</h2>
+<p>먼저 답을 생각해 본 다음 펼쳐서 확인한다.</p>
+<details><summary>Q1. 감사 middleware는 인증보다 바깥에 있다. 그래도 감사 이벤트에 사용자 정보가 들어가는 이유는 무엇인가?</summary>
+<p>감사 middleware가 요청을 넘기기 전에 빈 holder를 context에 넣어 두면, 인증 middleware가 확인한 신원을 그 holder에 채운다. 감사는 안쪽 chain이 끝난 뒤 holder를 읽어 <code>subjects</code>를 만든다. 감사가 바깥에 있으므로 401 거부도 기록에 남는다.</p></details>
+<details><summary>Q2. 감사 설정의 <code>eventTypes</code>에 <code>mcp_tool_call</code>만 넣었다. 인증 실패 기록이 남는가?</summary>
+<p>남지 않는다. 인증 실패는 MCP parser보다 먼저 일어나서 그 이벤트의 type이 <code>http_request</code>인데, 이 type이 <code>eventTypes</code>에 없으므로 감사 middleware가 기록을 버린다. 인증 실패 기록이 필요하면 <code>http_request</code>를 목록에 넣어야 한다.</p></details>
+<details><summary>Q3. 본문이 너무 큰 요청이 413으로 막혔다. 감사 로그에 이 요청이 남는가?</summary>
+<p>남지 않는다. 본문 크기 제한 middleware는 감사보다 바깥에 있는데, 감사가 본문을 버퍼에 담기 전에 큰 요청을 막도록 순서를 정했기 때문이다. Origin 검사도 감사보다 바깥에 있으므로 그 403도 남지 않는다. transparent proxy의 <code>Connection</code> header 검사도 감사보다 먼저 일어나므로 그 400도 남지 않는다.</p></details>
+<details><summary>Q4. 서버 per-user 버킷에는 허가가 남아 있다. 같은 사용자의 <code>expensive_search</code> 버킷은 비었다. 이 tool 호출은 서버 버킷의 허가를 쓰는가?</summary>
+<p>쓰지 않는다. Lua script는 모든 버킷을 먼저 검사하고, 하나라도 1 미만이면 어떤 버킷에서도 차감하지 않는다. 그래서 요청은 429로 끝나고 서버 버킷의 허가는 그대로다.</p></details>
+<details><summary>Q5. 요청 처리 중 Redis 연결이 끊겼다. proxy를 시작할 때 Redis가 없었다. 두 경우의 결과는 각각 무엇인가?</summary>
+<p>요청 처리 중 끊기면 fail-open이라서 middleware가 경고 로그를 남기고 요청을 통과시키며, 이때 <code>toolhive_rate_limit_fail_open</code>이 오른다. 시작할 때 Redis ping이 실패하면 middleware 생성이 실패해서 proxy가 시작하지 않는다.</p></details>
+<details><summary>Q6. ToolHive가 <code>/metrics</code>를 transport 포트에서 진단 포트로 옮기는 이유는 무엇인가?</summary>
+<p>NetworkPolicy는 포트로만 거르고 HTTP 경로로는 거르지 못해서, <code>/metrics</code>가 transport 포트에 있으면 MCP 트래픽과 metric 수집을 따로 통제할 수 없다. 별도 포트로 옮기면 이 제약이 사라지고, 운영자는 진단 포트에만 적용하는 NetworkPolicy를 만들면 된다. 진단 포트 자체에는 인증이 없으므로 이 정책이 유일한 보호 수단이다.</p></details>
+<details><summary>Q7. <code>thv run</code>으로 OTLP endpoint만 주고 sampling을 정하지 않았다. MCPTelemetryConfig에서 sampling을 정하지 않았다. 두 경우의 trace sampling 비율은 각각 얼마인가?</summary>
+<p><code>thv run</code>은 flag 기본값 0.1을 쓰지만, 전역 설정 파일에 sampling 비율이 있으면 그 값을 쓴다. MCPTelemetryConfig는 CRD 기본값 0.05를 쓴다.</p></details>
+<details><summary>Q8. mutating webhook이 <code>tools/call</code>의 tool 이름을 <code>a</code>에서 <code>b</code>로 바꿨다. 사용 제한과 Cedar 인가는 각각 어떤 이름을 보는가?</summary>
+<p>사용 제한은 mutating webhook보다 앞에 있어서 <code>a</code>의 버킷에서 허가를 쓴다. 인가는 mutating webhook보다 뒤에 있어서 Cedar는 <code>b</code>로 판단한다. 감사 이벤트와 span 이름도 끝난 뒤 다시 읽은 값인 <code>b</code>를 쓴다.</p></details>
+<details><summary>Q9. usage metrics는 무엇을 보내는가? 회사 정책상 끄려면 무엇을 해야 하는가?</summary>
+<p>usage metrics는 하루 누적 <code>tools/call</code> 수와 시각을 15분마다 보낸다. header에는 프로세스 UUID, 익명 ID, 버전과 플랫폼이 들어가고, tool 이름과 인자는 보내지 않는다. 끄려면 <code>thv config usage-metrics disable</code>을 실행하거나 <code>TOOLHIVE_USAGE_METRICS_ENABLED=false</code>를 설정한 다음 실행 중인 서버를 다시 시작해야 한다.</p></details>
+<details><summary>Q10. 로컬에서 <code>thv run</code>으로 띄운 서버에 사용 제한을 걸 수 있는가?</summary>
+<p>v0.63.0 기준으로 걸 수 없다. CLI flag 경로의 조립 함수에 사용 제한 middleware가 없기 때문이다. 사용 제한은 Redis session storage가 있는 MCPServer와 VirtualMCPServer에서만 쓴다.</p></details>
+
+<h2 id="sR">13. 참고 자료</h2>
+<ul>
+  <li>공식 문서 concepts/observability, guides-cli/telemetry-and-metrics, guides-k8s/telemetry-and-metrics, integrations/opentelemetry</li>
+  <li>공식 문서 guides-k8s/logging, guides-vmcp/audit-logging, guides-registry/audit-logging</li>
+  <li>공식 문서 guides-k8s/rate-limiting, guides-cli/webhooks, reference/crds/mcpwebhookconfig, faq</li>
+  <li>toolhive v0.63.0 <code>docs/middleware.md</code>, <code>docs/observability.md</code>, <code>docs/telemetry-migration-guide.md</code>, <code>docs/logging.md</code>, <code>docs/arch/03-transport-architecture.md</code></li>
+  <li>toolhive v0.63.0 <code>pkg/runner/middleware.go</code>, <code>pkg/runner/config_builder.go</code>, <code>pkg/runner/runner.go</code>, <code>pkg/mcp/parser.go</code>, <code>pkg/transport/proxy/transparent/transparent_proxy.go</code>, <code>pkg/healthcheck/healthcheck.go</code></li>
+  <li>toolhive v0.63.0 <code>pkg/telemetry/</code>, <code>pkg/diagnostics/server.go</code>, <code>pkg/authserver/server/handlers/dcr_metrics.go</code>, <code>cmd/thv/app/otel.go</code>, <code>cmd/thv/app/run_flags.go</code></li>
+  <li>toolhive v0.63.0 <code>pkg/audit/</code>, <code>pkg/ratelimit/</code>, <code>pkg/webhook/</code>, <code>pkg/usagemetrics/</code>, <code>pkg/updates/client.go</code></li>
+  <li>toolhive v0.63.0 <code>cmd/thv-operator/api/v1beta1/mcpserver_types.go</code>, <code>mcpwebhookconfig_types.go</code>, <code>cmd/thv-operator/api/v1alpha1/types.go</code>, <code>cmd/thv-operator/pkg/controllerutil/defaultredis.go</code></li>
+  <li>v0.53.0 이후 이 문서와 관련된 변경: <code>/health</code> 응답 방식(PR #7001, #7005), webhook 자체 오류 거부(PR #7055), operator 전역 Redis TLS(PR #6838), POST 이외 본문 거부(PR #6806), DCR client 상한 metric(PR #6863, #6867)</li>
+</ul>
+<div class="box warn" id="unchecked">
+  <p><b>대조한 내용은 다음과 같다.</b> middleware 순서는 <code>pkg/runner/middleware.go</code>, <code>config_builder.go</code>, <code>runner.go</code>와 대조했고, metric 이름과 속성은 <code>pkg/telemetry/middleware.go</code>와 <code>pkg/ratelimit/observability.go</code>와 대조했다. 감사 필드, outcome, 기본값은 <code>pkg/audit/</code>와 대조했다. 사용 제한 동작은 <code>pkg/ratelimit/</code>의 Lua script와 middleware를 읽었고, webhook 동작은 두 middleware와 <code>pkg/webhook/types.go</code>, <code>signing.go</code>를 읽었다. usage metrics의 본문과 header는 <code>pkg/usagemetrics/</code>와 대조했다. 모든 줄 번호는 v0.63.0 트리에서 확인했고, v0.53.0과 v0.63.0 사이에 바뀐 파일은 두 트리의 diff를 읽었다. middleware 순서를 정하는 두 조립 함수의 파일은 바뀌지 않았다. 공식 문서는 rate-limiting, webhooks, logging, k8s telemetry-and-metrics 안내 4쪽을 2026-11-07에 다시 읽었다.</p>
+  <p><b>문서와 코드가 다른 곳은 아래와 같다.</b> 이 문서는 코드를 따랐고, 아래 항목은 2026-11-07의 공식 문서에서도 그대로다.</p>
+  <ul>
+    <li><code>docs/observability.md</code>는 <code>--otel-service-name</code> 기본값을 <code>toolhive-mcp-proxy</code>로 적고, 공식 문서 guides-k8s/telemetry-and-metrics도 같은 값을 적는다. 코드의 CLI 경로는 <code>thv-&lt;이름&gt;</code>을 쓴다(source <code>pkg/runner/config_builder.go:1114</code>). operator 경로는 MCPServer 이름을 그대로 쓰는데, operator가 builder보다 먼저 이 값을 넣기 때문이다(source <code>cmd/thv-operator/controllers/mcpserver_runconfig.go:179</code>).</li>
+    <li>공식 rate-limiting 문서는 <code>toolhive_rate_limit_fail_open</code>에 <code>error_type</code> 속성이 있다고 적지만 코드는 <code>namespace</code>, <code>server</code>만 붙인다.</li>
+    <li>guides-k8s/logging은 인증이 없을 때 <code>user_id</code>가 <code>local</code>이라고 적지만, 감사 코드는 사용자 이름이 없으면 <code>user</code>에 <code>anonymous</code>를 넣는다. 인증 middleware가 어떤 신원을 넣는지는 끝까지 추적하지 않았다.</li>
+    <li><code>docs/middleware.md</code>의 감사 예는 <code>transport</code>를 <code>streamable-http</code>로 적지만 코드는 <code>sse</code> 아니면 <code>http</code>만 쓴다.</li>
+    <li>webhook 문서는 "tool call마다"라고 적지만 코드는 parser가 해석한 모든 POST 요청을 보낸다.</li>
+    <li>webhook 문서는 <code>ignore</code>가 webhook 오류를 모두 통과시킨다고 적지만, 코드는 호출 전 ToolHive 자체 오류를 <code>ignore</code>여도 거부한다. 공식 문서는 이 예외를 아직 적지 않는다.</li>
+  </ul>
+  <p><b>대조하지 못한 내용은 다음과 같다.</b> registry server의 감사 로그는 별도 저장소의 코드라서 이번 갱신에서 다시 대조하지 않았다. <code>/health</code> 답의 최대 지연 15초는 트리 안의 <code>docs/arch/03-transport-architecture.md</code>만 따랐고, 공식 문서 사이트에서는 확인하지 않았다. <code>pkg/authz</code>에는 자체 metric 계측 코드가 없어서 v0.60.0의 인가 metric 테스트 수정은 이 문서에 반영할 내용이 없다. trace sampler의 종류는 확인하지 못했는데, parent-based 여부를 정하는 코드가 toolhive-core 패키지 안에 있기 때문이다. 감사 로그의 <code>time</code>, <code>level</code> 형식도 toolhive-core가 만들어서 이 둘은 공식 문서의 예만 따랐다. operator가 띄운 proxy pod에서 usage metrics를 끄는 Helm 설정은 확인하지 못했다. FAQ는 operator에 <code>TOOLHIVE_SKIP_UPDATE_CHECK</code>를 넣으라고만 적는다.</p>
+</div>
+<p>다음 학습은 <a href="07-kubernetes-operator.html">07편 "Kubernetes operator"</a>다.</p>
+
+<nav class="pager">
+<a class="prev" href="05-authn-authz.html"><span class="k">이전 글</span><span class="t">인증과 인가</span></a>
+<a class="next" href="07-kubernetes-operator.html"><span class="k">다음 글</span><span class="t">Kubernetes operator</span></a>
+</nav>
+
+<footer>2026-10-14 작성, 2026-11-07 갱신. 기준: ToolHive v0.63.0.</footer>
+</div>
+</body>
+</html>

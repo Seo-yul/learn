@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>우리 MCP 플랫폼과 비교</title>
+<link rel="stylesheet" href="../assets/learn.css">
+</head>
+<body>
+<div class="masthead"><div class="bar"><a class="brand" href="../index.html">learn</a><span class="crumb"><a href="index.html">ToolHive</a></span></div></div>
+<div class="wrap">
+
+<header>
+  <h1>우리 MCP 플랫폼과 비교</h1>
+  <p class="kicker">ToolHive 학습 10편 · 2026-10-14 작성 · 2026-11-07 갱신</p>
+  <p>이 문서는 01편부터 09편까지 본 ToolHive를 우리 MCP 플랫폼과 나란히 놓고, 같은 문제를 두 플랫폼이 어떻게 다르게 푸는지 본다. 우리가 가져올 만한 점은 추천으로 정리한다.</p>
+  <p>ToolHive 쪽 기준은 v0.63.0(2026-11-06)이고, 우리 쪽 기준은 각 저장소의 개발 브랜치다. 두 쪽 모두 2026-11-07에 다시 읽고 갱신했으며, 우리 쪽에서 읽은 커밋의 날짜는 다음과 같다.</p>
+  <ul>
+    <li>우리 operator: 2026-11-05 커밋</li>
+    <li>MCP 서버 이미지: 2026-11-05 커밋</li>
+    <li>core: 2026-11-06 커밋</li>
+  </ul>
+</header>
+
+<div class="box key">
+  <span class="label">한 문장 요약</span>
+  <p>ToolHive는 남이 만든 MCP 서버를 안전하게 실행하는 데서 출발하고, 우리 플랫폼은 OpenAPI 스펙으로 MCP 서버를 만들어 내는 데서 출발한다. 그래서 ToolHive의 격리 기능은 우리에게 덜 급하지만, 나가는 인증과 인가, 관측은 바로 참고할 만하다.</p>
+</div>
+
+<div class="box key">
+  <span class="label">v0.63.0 갱신 요약</span>
+  <ul>
+    <li>우리 쪽: 위임 설계가 MCP 서버 이미지와 core에 구현됐다. 동의 화면이 scope 체크박스를 보여 주고, tool 호출과 tool 목록을 위임된 scope로 거른다. 이에 맞춰 9장과 추천 4를 다시 썼다.</li>
+    <li>우리 쪽: core가 CR에 채우는 MCP 서버 자원 기본값이 CPU 100m/500m, 메모리 256Mi로 바뀌어서 3장 표에 행을 더했다.</li>
+    <li>ToolHive 쪽: 동의 화면이 upstream의 표시 이름을 보여 주고, 미리 허용한 클라이언트는 동의 화면을 건너뛴다. DCR 클라이언트 수에도 상한이 생겼다. 7장에 적었다.</li>
+    <li>ToolHive 쪽: 내장 인가 서버가 token exchange grant로 위임 토큰을 내고, authorization_details와 exchange 전용 refresh token도 다룬다. 7장에 적었다.</li>
+    <li>ToolHive 쪽: 인가 응답 필터가 거를 수 없는 응답을 막고, vMCP는 backend 단위 Cedar 정책을 받는다. 9장에 적었다.</li>
+    <li>ToolHive 쪽: 인가 서버에 TLS listener가 생겨서 7장 표에 행을 더했다.</li>
+    <li>5장, 8장, 10장, 11장의 결론은 그대로이고, 인용 행 번호는 새 커밋에 맞췄다.</li>
+  </ul>
+</div>
+
+<nav class="toc">
+  <b>목차</b>
+  <ol>
+    <li><a href="#s0">용어집</a></li>
+    <li><a href="#s1">출발점의 차이</a></li>
+    <li><a href="#s2">구성 요소 대응표</a></li>
+    <li><a href="#s3">Kubernetes 리소스 비교</a></li>
+    <li><a href="#s4">transport와 proxy</a></li>
+    <li><a href="#s5">격리와 secret</a></li>
+    <li><a href="#s6">registry와 클라이언트 설정</a></li>
+    <li><a href="#s7">들어오는 인증</a></li>
+    <li><a href="#s8">나가는 인증</a></li>
+    <li><a href="#s9">인가</a></li>
+    <li><a href="#s10">관측, 감사, 사용 제한</a></li>
+    <li><a href="#s11">집계와 optimizer</a></li>
+    <li><a href="#s12">추천 정리</a></li>
+    <li><a href="#sQ">자가 점검 문제</a></li>
+    <li><a href="#sR">참고 자료</a></li>
+  </ol>
+</nav>
+
+<h2 id="s0">0. 용어집</h2>
+<p>이 문서는 아래 용어를 아래 뜻으로만 쓴다.</p>
+<div class="tbl"><table>
+<tr><th>용어</th><th>이 문서에서의 뜻</th></tr>
+<tr><td>우리 플랫폼</td><td>우리가 만드는 에이전트와 MCP 플랫폼. 구성 요소는 studio, core, 우리 operator, MCP 서버 이미지다.</td></tr>
+<tr><td>studio</td><td>우리 플랫폼의 웹 UI와 API 서비스.</td></tr>
+<tr><td>core</td><td>우리 플랫폼의 서버 쪽 라이브러리. MCP 서버를 배포한다. 에이전트로서 MCP 클라이언트로도 동작한다.</td></tr>
+<tr><td>우리 operator</td><td>우리 McpServer와 AiAgent를 reconcile하는 우리 플랫폼의 operator. API group은 이 문서에서 <code>platform.example.com/v1</code>로 적는다.</td></tr>
+<tr><td>ToolHive MCPServer, 우리 McpServer</td><td>두 operator의 MCP 서버 kind. 이름이 비슷해서 이 문서는 항상 앞에 소속을 붙인다.</td></tr>
+<tr><td>MCP 서버 이미지</td><td>우리 MCP 서버가 쓰는 이미지 하나. fastmcp로 만들었다.</td></tr>
+<tr><td>REST API 서버</td><td>우리 MCP 서버가 tool을 실행할 때 부르는 서버. studio에서는 Backend Server라고 부른다. 02편의 API 서버(<code>thv serve</code>)와 다르다.</td></tr>
+<tr><td>프로필</td><td>어느 REST API 서버의 어느 API를 tool로 낼지 담은 설정. ConfigMap으로 pod에 들어간다.</td></tr>
+<tr><td>proxy</td><td>ToolHive가 MCP 서버 앞에 붙이는 프로세스. 우리 플랫폼에는 이 프로세스가 없다.</td></tr>
+<tr><td>egress proxy</td><td>ToolHive 네트워크 격리에서 나가는 연결을 거르는 컨테이너. 로컬 실행에만 있다(03편 4장, 6장).</td></tr>
+<tr><td>OAuthProxy</td><td>fastmcp의 인가 서버 구현. 우리 MCP 서버 이미지 안에서 돈다.</td></tr>
+<tr><td>동의 화면</td><td>인가 서버가 사용자에게 허용 여부를 묻는 화면. 우리 플랫폼의 UI 문서는 승인 화면이라고 부른다. 이 문서는 두 플랫폼 모두 동의 화면이라고 쓴다.</td></tr>
+<tr><td>노출 방식</td><td>MCP 서버에 클러스터 밖에서 닿는 방식. core는 <code>internal</code>, <code>ingress</code>, <code>gateway</code> 셋으로 나눈다.</td></tr>
+<tr><td>registry</td><td>ToolHive가 읽는 MCP 서버 목록.</td></tr>
+<tr><td>registry server</td><td>registry를 HTTP API로 내보내는 별도 서버(04편 4장).</td></tr>
+<tr><td>upstream 형식</td><td>MCP 공식 서버 스키마에 ToolHive 확장을 더한 registry 형식(04편 2장).</td></tr>
+<tr><td>McpRegistry</td><td>core가 관리하는 우리 MCP 서버 목록. 이 문서는 코드 이름 그대로 부른다.</td></tr>
+<tr><td>들어오는 인증, 나가는 인증</td><td>MCP 클라이언트가 MCP 서버에 하는 인증과, MCP 서버가 REST API 서버에 하는 인증.</td></tr>
+<tr><td>access token, LLM 토큰</td><td>인증에 쓰는 자격 증명, LLM이 처리하는 텍스트 단위. 이 문서는 "토큰"만 따로 쓰지 않는다.</td></tr>
+<tr><td>위임 설계</td><td>tool별 scope를 MCP 클라이언트에 위임하는 우리 설계. MCP 서버 이미지(2026-10-27 릴리스)와 core에 구현됐다.</td></tr>
+<tr><td>위임 토큰</td><td>ToolHive 내장 인가 서버가 token exchange로 발급하는 access token. <code>sub</code>는 사용자이고 <code>act</code>는 대신 행동하는 클라이언트다. 우리 위임 설계와 다른 뜻이다.</td></tr>
+<tr><td>추천</td><td>이 문서가 제안하는 방향. 결정된 사항이 아니다.</td></tr>
+</table></div>
+
+<h2 id="s1">1. 출발점의 차이</h2>
+<p>두 플랫폼은 MCP 서버의 코드를 누가 쓰는지가 다르고, 뒤에 나오는 차이 대부분이 여기서 생긴다.</p>
+<div class="tbl"><table>
+<tr><th>질문</th><th>ToolHive</th><th>우리 플랫폼</th></tr>
+<tr><td>MCP 서버 코드는 누가 쓰나?</td><td>제3자. ToolHive는 이미 만들어진 이미지를 실행한다.</td><td>우리. 이미지는 하나이고 프로필이 tool을 정한다.</td></tr>
+<tr><td>tool은 어디서 오나?</td><td>MCP 서버 구현이 정한다.</td><td>OpenAPI 스펙의 API를 고르면 tool이 된다.</td></tr>
+<tr><td>지원하는 언어와 transport</td><td>아무 언어. stdio, SSE, streamable HTTP를 모두 받는다.</td><td>Python 이미지 하나. 기본 transport는 streamable HTTP다.</td></tr>
+<tr><td>가장 큰 위험</td><td>믿을 수 없는 코드가 파일과 네트워크에 닿는 것</td><td>tool 호출이 REST API 서버에 잘못된 권한으로 닿는 것</td></tr>
+<tr><td>관리 단위</td><td>workload(02편)</td><td>MCP 서버 인스턴스. 우리 McpServer 하나가 하나를 만든다.</td></tr>
+</table></div>
+<p>MCP 서버 이미지는 컨테이너 안에서 컨테이너용 실행 모듈로 뜨고, 이때 기본 transport는 <code>http</code>다. fastmcp에서 <code>http</code>는 streamable HTTP를 뜻한다. core는 배포할 때 stateless HTTP 모드를 켜는 환경 변수도 넣는다.</p>
+
+<h2 id="s2">2. 구성 요소 대응표</h2>
+<p>ToolHive의 구성 요소는 01편 3장에서 봤다. 아래 표에는 각 구성 요소에 대응하는 우리 쪽 구성 요소를 적었다.</p>
+<div class="tbl"><table>
+<tr><th>ToolHive</th><th>우리 플랫폼</th><th>차이</th></tr>
+<tr><td>thv CLI, ToolHive UI</td><td>studio</td><td>thv CLI와 ToolHive UI는 로컬 실행이 주 용도다. studio는 클러스터 배포만 다룬다.</td></tr>
+<tr><td>Kubernetes operator(07편)</td><td>우리 operator</td><td>3장에서 비교한다.</td></tr>
+<tr><td>proxy(02편)</td><td>없다. MCP 서버 이미지 안의 fastmcp가 같은 일을 한다.</td><td>4장에서 비교한다.</td></tr>
+<tr><td>registry, registry server(04편)</td><td>McpRegistry</td><td>6장에서 비교한다.</td></tr>
+<tr><td>클라이언트 설정 편집(04편)</td><td>McpRegistry 항목의 설정 조각</td><td>ToolHive는 클라이언트 파일을 직접 고친다. 우리는 붙여 넣을 JSON을 준다.</td></tr>
+<tr><td>내장 인가 서버(05편)</td><td>OAuthProxy</td><td>구조가 거의 같다. 7장에서 비교한다.</td></tr>
+<tr><td>vMCP(08편)</td><td>없다.</td><td>11장에서 비교한다.</td></tr>
+<tr><td>skill, plugin(09편)</td><td>core의 내장 skill</td><td>이 문서는 다루지 않는다.</td></tr>
+</table></div>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 860 300" width="860" height="300" role="img" aria-label="ToolHive와 우리 플랫폼의 요청 경로 비교">
+    <defs>
+      <marker id="c1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+    </defs>
+    <text class="d-a" x="20" y="28" font-size="14" font-weight="600">ToolHive (Kubernetes)</text>
+    <rect class="d-box" x="20" y="44" width="150" height="70" rx="10"/>
+    <text x="95" y="76" font-size="14" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <text class="d-m" x="95" y="96" font-size="12" text-anchor="middle">외부 클라이언트, vMCP</text>
+    <rect class="d-acc" x="230" y="36" width="270" height="86" rx="10"/>
+    <text x="365" y="62" font-size="14" font-weight="600" text-anchor="middle">proxy pod</text>
+    <text class="d-m" x="365" y="84" font-size="12" text-anchor="middle">인증, Cedar 인가, 감사, telemetry,</text>
+    <text class="d-m" x="365" y="102" font-size="12" text-anchor="middle">사용 제한, 나가는 인증</text>
+    <rect class="d-box" x="560" y="44" width="280" height="70" rx="10"/>
+    <text x="700" y="74" font-size="14" font-weight="600" text-anchor="middle">MCP 서버 pod</text>
+    <text class="d-m" x="700" y="96" font-size="12" text-anchor="middle">제3자 이미지. 언어와 transport 무관</text>
+    <path class="d-line" d="M170,79 L228,79" marker-end="url(#c1)"/>
+    <path class="d-line" d="M500,79 L558,79" marker-end="url(#c1)"/>
+
+    <text class="d-a" x="20" y="176" font-size="14" font-weight="600">우리 플랫폼</text>
+    <rect class="d-box" x="20" y="192" width="150" height="70" rx="10"/>
+    <text x="95" y="224" font-size="14" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <text class="d-m" x="95" y="244" font-size="12" text-anchor="middle">core 에이전트, 외부</text>
+    <rect class="d-acc" x="230" y="184" width="390" height="86" rx="10"/>
+    <text x="425" y="210" font-size="14" font-weight="600" text-anchor="middle">MCP 서버 pod (우리 이미지)</text>
+    <text class="d-m" x="425" y="232" font-size="12" text-anchor="middle">OAuthProxy, scope 검사, 프로필로 만든 tool,</text>
+    <text class="d-m" x="425" y="250" font-size="12" text-anchor="middle">REST API 서버 호출과 나가는 인증</text>
+    <rect class="d-box" x="680" y="192" width="160" height="70" rx="10"/>
+    <text x="760" y="224" font-size="14" font-weight="600" text-anchor="middle">REST API 서버</text>
+    <text class="d-m" x="760" y="244" font-size="12" text-anchor="middle">Backend Server</text>
+    <path class="d-line" d="M170,227 L228,227" marker-end="url(#c1)"/>
+    <path class="d-line" d="M620,227 L678,227" marker-end="url(#c1)"/>
+  </svg>
+  </div>
+  <figcaption>그림 1. 요청 경로 비교. ToolHive는 공통 기능을 별도 proxy pod에 두고, 우리는 같은 기능을 MCP 서버 이미지 안에 둔다.</figcaption>
+</figure>
+
+<h2 id="s3">3. Kubernetes 리소스 비교</h2>
+<p>두 operator가 MCP 서버 하나마다 만드는 객체 묶음은 서로 다르다. ToolHive 쪽 내용은 07편 5장과 6장에 자세히 적었다.</p>
+<div class="tbl"><table>
+<tr><th>항목</th><th>ToolHive MCPServer</th><th>우리 McpServer</th></tr>
+<tr><td>API group</td><td><code>toolhive.stacklok.dev/v1beta1</code></td><td><code>platform.example.com/v1</code></td></tr>
+<tr><td>operator가 만드는 객체</td><td>proxy Deployment, proxy Service, RunConfig ConfigMap, proxy용 ServiceAccount와 RBAC, MCP 서버용 ServiceAccount</td><td>Deployment, Service, Ingress(선택), HPA(선택)</td></tr>
+<tr><td>MCP 서버를 돌리는 객체</td><td>StatefulSet. proxy가 server-side apply로 만든다.</td><td>위의 Deployment. 컨테이너가 하나다.</td></tr>
+<tr><td>설정 전달</td><td>operator가 만든 RunConfig ConfigMap</td><td>core가 만든 프로필 ConfigMap과 스펙 ConfigMap을 projected volume으로 붙인다.</td></tr>
+<tr><td>설정 변경 반영</td><td>RunConfig checksum annotation</td><td>ConfigMap 데이터 해시를 pod template annotation에 넣는다.</td></tr>
+<tr><td>비밀 값 전달</td><td><code>spec.secrets</code>가 가리키는 Kubernetes Secret을 pod patch로 MCP 서버 환경 변수에 넣는다(03편 9장).</td><td><code>envSecretRef</code>가 가리키는 Kubernetes Secret을 환경 변수로 넣는다.</td></tr>
+<tr><td>확장</td><td>proxy replica와 MCP 서버 replica를 따로 정한다. proxy가 둘 이상이면 Redis 세션 저장소가 필요하다(07편 12장).</td><td><code>scaling</code> 필드로 HPA를 만든다.</td></tr>
+<tr><td>컨테이너 자원 기본값</td><td>operator는 <code>spec.resources</code>를 그대로 옮기고 기본값을 넣지 않는다(<code>cmd/thv-operator/pkg/controllerutil/resources.go:22~46</code>).</td><td>core가 CR에 값을 채운다. 클러스터 설정의 기본값은 CPU requests 100m과 limits 500m이다. 메모리는 requests와 limits 모두 256Mi다. CR에 값이 없을 때만 operator가 기본값을 넣는다. 그 값은 requests 200m/256Mi, limits 500m/512Mi다.</td></tr>
+<tr><td>CRD 수</td><td>10종이 넘는다(07편 3장).</td><td>McpServer와 AiAgent 2종</td></tr>
+</table></div>
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 860 330" width="860" height="330" role="img" aria-label="MCP 서버 하나에서 생기는 Kubernetes 객체 비교">
+    <defs>
+      <marker id="c2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+    </defs>
+    <rect class="d-acc" x="120" y="12" width="200" height="40" rx="10"/>
+    <text x="220" y="38" font-size="14" font-weight="600" text-anchor="middle">ToolHive MCPServer</text>
+    <rect class="d-outer" x="20" y="84" width="190" height="230" rx="12"/>
+    <text class="d-m" x="115" y="104" font-size="12" text-anchor="middle">operator가 만든다</text>
+    <rect class="d-box" x="34" y="116" width="162" height="36" rx="8"/>
+    <text x="115" y="139" font-size="12.5" text-anchor="middle">proxy Deployment</text>
+    <rect class="d-box" x="34" y="162" width="162" height="36" rx="8"/>
+    <text x="115" y="185" font-size="12.5" text-anchor="middle">proxy Service</text>
+    <rect class="d-box" x="34" y="208" width="162" height="36" rx="8"/>
+    <text x="115" y="231" font-size="12.5" text-anchor="middle">RunConfig ConfigMap</text>
+    <rect class="d-box" x="34" y="254" width="162" height="36" rx="8"/>
+    <text x="115" y="277" font-size="12.5" text-anchor="middle">ServiceAccount, RBAC</text>
+    <rect class="d-outer" x="240" y="84" width="180" height="184" rx="12"/>
+    <text class="d-m" x="330" y="104" font-size="12" text-anchor="middle">proxy가 만든다</text>
+    <rect class="d-warn" x="254" y="116" width="152" height="36" rx="8"/>
+    <text x="330" y="139" font-size="12.5" text-anchor="middle">StatefulSet (MCP 서버)</text>
+    <rect class="d-box" x="254" y="162" width="152" height="36" rx="8"/>
+    <text x="330" y="185" font-size="12.5" text-anchor="middle">Service</text>
+    <rect class="d-box" x="254" y="208" width="152" height="36" rx="8"/>
+    <text x="330" y="231" font-size="12.5" text-anchor="middle">headless Service</text>
+    <path class="d-line" d="M220,52 L220,70 L115,70 L115,84" marker-end="url(#c2)"/>
+    <path class="d-line" d="M196,134 L252,134" marker-end="url(#c2)"/>
+
+    <rect class="d-acc" x="550" y="12" width="200" height="40" rx="10"/>
+    <text x="650" y="38" font-size="14" font-weight="600" text-anchor="middle">우리 McpServer</text>
+    <rect class="d-outer" x="450" y="84" width="190" height="230" rx="12"/>
+    <text class="d-m" x="545" y="104" font-size="12" text-anchor="middle">우리 operator가 만든다</text>
+    <rect class="d-warn" x="464" y="116" width="162" height="36" rx="8"/>
+    <text x="545" y="139" font-size="12.5" text-anchor="middle">Deployment (MCP 서버)</text>
+    <rect class="d-box" x="464" y="162" width="162" height="36" rx="8"/>
+    <text x="545" y="185" font-size="12.5" text-anchor="middle">Service</text>
+    <rect class="d-box" x="464" y="208" width="162" height="36" rx="8"/>
+    <text x="545" y="231" font-size="12.5" text-anchor="middle">Ingress (선택)</text>
+    <rect class="d-box" x="464" y="254" width="162" height="36" rx="8"/>
+    <text x="545" y="277" font-size="12.5" text-anchor="middle">HPA (선택)</text>
+    <rect class="d-outer" x="670" y="84" width="180" height="184" rx="12"/>
+    <text class="d-m" x="760" y="104" font-size="12" text-anchor="middle">core가 미리 만든다</text>
+    <rect class="d-box" x="684" y="116" width="152" height="36" rx="8"/>
+    <text x="760" y="139" font-size="12.5" text-anchor="middle">프로필 ConfigMap</text>
+    <rect class="d-box" x="684" y="162" width="152" height="36" rx="8"/>
+    <text x="760" y="185" font-size="12.5" text-anchor="middle">스펙 ConfigMap</text>
+    <rect class="d-box" x="684" y="208" width="152" height="36" rx="8"/>
+    <text x="760" y="231" font-size="12.5" text-anchor="middle">Secret (환경 변수)</text>
+    <path class="d-line" d="M650,52 L650,70 L545,70 L545,84" marker-end="url(#c2)"/>
+    <path class="d-dash" d="M626,134 L682,134" marker-end="url(#c2)"/>
+    <text class="d-w" x="760" y="290" font-size="12" text-anchor="middle">점선 화살표: 참조</text>
+  </svg>
+  </div>
+  <figcaption>그림 2. MCP 서버 하나에서 생기는 객체. 주황 상자가 MCP 서버를 실제로 돌리는 객체다. ToolHive에서는 proxy가 이 객체를 만들고, 우리 쪽에서는 operator가 직접 만들면서 core가 만든 ConfigMap과 Secret을 참조한다.</figcaption>
+</figure>
+<p>우리 쪽 내용은 operator와 core의 코드에서 확인했다. ConfigMap과 Secret은 core의 Kubernetes 리소스 관리 코드가 만들고, 객체 소유와 ConfigMap 마운트, 해시 계산은 operator의 McpServer controller에 있다. spec 필드는 operator의 CRD 타입 정의에 있다.</p>
+<p>ToolHive가 proxy와 MCP 서버를 다른 객체로 나눈 이유는 4장에서 보는데, 우리는 MCP 서버 이미지를 직접 만들기 때문에 이 분리가 필요 없었다.</p>
+
+<h2 id="s4">4. transport와 proxy</h2>
+<p>ToolHive는 MCP 서버의 코드를 고치지 못해서 인증, 인가, 감사, telemetry를 MCP 서버 밖의 proxy에 둔다. proxy는 stdio 서버를 HTTP로 바꾸는 일도 한다(02편 6장).</p>
+<p>우리 플랫폼은 MCP 서버 이미지를 직접 만들기 때문에 같은 기능을 fastmcp의 middleware와 OAuthProxy로 프로세스 안에 넣었다. 우리 이미지는 처음부터 streamable HTTP로 응답하므로 stdio를 바꿀 일도 없다.</p>
+<div class="tbl"><table>
+<tr><th>관점</th><th>별도 proxy (ToolHive)</th><th>프로세스 안 (우리)</th></tr>
+<tr><td>적용 대상</td><td>어떤 MCP 서버에도 같은 기능을 건다.</td><td>우리 이미지에만 건다.</td></tr>
+<tr><td>홉 수</td><td>요청마다 proxy를 한 번 더 지난다.</td><td>추가 홉이 없다.</td></tr>
+<tr><td>기능 추가 비용</td><td>proxy 하나만 고치면 모든 서버가 얻는다.</td><td>이미지를 고치고 모든 MCP 서버를 다시 배포해야 한다.</td></tr>
+<tr><td>외부 MCP 서버</td><td>원격 서버 앞에도 proxy를 둔다(02편 8장).</td><td>우리 이미지가 아닌 서버에는 같은 기능을 걸지 못한다.</td></tr>
+</table></div>
+<p>표에서는 마지막 행이 중요하다. 우리 플랫폼에도 외부 MCP 서버를 McpRegistry에 등록하는 기능이 있고, 항목의 <code>resource_type</code>이 <code>external</code>이면 외부 서버다. 이런 서버에는 우리 인증과 관측이 닿지 않는다.</p>
+
+<h2 id="s5">5. 격리와 secret</h2>
+<p>ToolHive는 믿을 수 없는 코드를 전제로 한다. 로컬 실행에서는 컨테이너마다 권한 프로필을 걸고, 네트워크 격리도 기본으로 켜져 있어서 egress proxy가 프로필의 허용 목록대로 나가는 연결을 거른다(03편 2장~6장). 다만 기본 <code>network</code> 프로필은 나가는 연결을 모두 허용한다.</p>
+<p>Kubernetes에서는 사정이 다르다. operator는 권한 프로필을 무시하고 네트워크 격리도 하지 않는 대신 컨테이너 보안 기본값을 넣는다(03편 6장, 7장). 아래 표는 이 Kubernetes 경로를 우리 McpServer pod와 비교한 것이다.</p>
+<div class="tbl"><table>
+<tr><th>항목</th><th>ToolHive (Kubernetes MCP 컨테이너)</th><th>우리 McpServer pod</th></tr>
+<tr><td>Linux capability</td><td>모두 제거</td><td>operator가 설정하지 않는다.</td></tr>
+<tr><td>권한 상승</td><td><code>allowPrivilegeEscalation: false</code></td><td>operator가 설정하지 않는다.</td></tr>
+<tr><td>실행 사용자</td><td>root 금지, UID 1000</td><td>Dockerfile에 <code>USER</code>가 없어서 이미지 기본값(root)으로 돈다.</td></tr>
+<tr><td>루트 파일 시스템</td><td>읽기 전용</td><td>쓰기 가능</td></tr>
+<tr><td>seccomp</td><td><code>RuntimeDefault</code></td><td>operator가 설정하지 않는다.</td></tr>
+<tr><td>나가는 연결 제한</td><td>operator가 하지 않는다. 설계 문서는 NetworkPolicy를 따로 정의하라고 쓴다(03편 6장).</td><td>operator 코드에서 NetworkPolicy를 찾지 못했다.</td></tr>
+</table></div>
+<p>ToolHive 열은 03편 6장과 7장을 따랐고, 우리 열은 operator 개발 브랜치 코드에서 <code>securityContext</code>와 <code>NetworkPolicy</code>를 검색한 결과다. operator README도 securityContext를 넣지 않는다고 적고 있다. 실행 사용자 행의 근거는 MCP 서버 이미지의 Dockerfile이다. <code>podOverrides</code>는 노드 배치와 이미지 pull secret만 다루는 필드라서 여기에도 보안 필드가 없다.</p>
+<div class="box key">
+  <span class="label">추천 1. pod 보안 기본값을 operator에 넣는다</span>
+  <p>우리는 MCP 서버 이미지를 직접 만들기 때문에 ToolHive보다 호환성을 확인하기 쉽다. 비용이 작고 효과도 분명하다.</p>
+  <p>다만 전제가 있다. 이미지는 root가 아닌 사용자로 돌아야 하고 디스크에 쓰는 경로에는 emptyDir을 붙여야 한다. 우리 이미지는 Redis가 없으면 OAuth 상태를 <code>/application/.fastmcp/server/oauth-proxy</code>에 쓴다.</p>
+</div>
+<p>나가는 연결 제한은 비용이 크다. Kubernetes NetworkPolicy는 IP와 포트로 거르고 host 이름을 모르기 때문에, REST API 서버가 클러스터 밖에 있으면 egress proxy 같은 구성 요소가 필요할 가능성이 있다. ToolHive operator도 이 기능을 넣지 않았다. 그래서 이 항목은 검토 후보로만 둔다.</p>
+
+<h2 id="s6">6. registry와 클라이언트 설정</h2>
+<p>ToolHive의 registry 항목은 upstream 형식을 따르고, ToolHive만의 필드는 <code>_meta</code>의 publisher-provided 영역에 둔다(04편 2장). registry server는 이 형식을 <code>/registry/{name}/v0.1/servers</code> 경로로 낸다(04편 4장).</p>
+<p>우리 McpRegistry는 자체 형식이고, 주요 필드는 다음과 같다.</p>
+<ul>
+  <li>설명: <code>description</code>, <code>usage_doc</code>, <code>categories</code>, <code>icon_url</code></li>
+  <li>연결: <code>mcp_server_json</code>, <code>internal_mcp_server_json</code>, <code>transport_type</code></li>
+  <li>인증: <code>oauth_required</code>, <code>mcp_server_dcr_supported</code></li>
+  <li>공개: <code>is_published</code>, <code>shared_target</code></li>
+  <li>내용: <code>tools</code>, <code>profile_id</code>, <code>profile_version</code></li>
+</ul>
+<p><code>mcp_server_json</code>은 MCP 클라이언트 설정에 붙여 넣을 JSON 조각이고, 여기에는 REST API 서버별 자격 증명 헤더 자리가 들어 있다. 헤더 이름은 <code>&lt;REST API 서버 이름&gt;---&lt;헤더 이름&gt;</code> 형식이다. 이 헤더를 쓰는 조건과 방법은 8장에서 본다.</p>
+<div class="tbl"><table>
+<tr><th>관점</th><th>ToolHive</th><th>우리 플랫폼</th></tr>
+<tr><td>목록 형식</td><td>upstream 형식과 확장 <code>_meta</code></td><td>자체 형식</td></tr>
+<tr><td>목록 API</td><td>registry server의 표준 경로</td><td>studio API</td></tr>
+<tr><td>클라이언트 연결</td><td>thv가 클라이언트 설정 파일을 직접 고친다.</td><td>사용자가 JSON 조각을 복사해 붙인다.</td></tr>
+<tr><td>공유 대상</td><td>registry server의 인가 규칙(04편 6장)</td><td><code>shared_target</code></td></tr>
+</table></div>
+<div class="box key">
+  <span class="label">추천 2. McpRegistry를 upstream 형식으로도 낸다</span>
+  <p>upstream 형식 API가 있으면 다른 도구가 우리 목록을 읽을 가능성이 생긴다. 예를 들어 thv는 지정한 URL 뒤에 <code>/v0.1/servers</code>를 붙여 목록을 읽는다(04편 3.2절). 우리만의 필드(<code>usage_doc</code>, <code>shared_target</code>)는 ToolHive처럼 <code>_meta</code>에 넣으면 되고, 기존 studio API는 그대로 둔다.</p>
+</div>
+
+<h2 id="s7">7. 들어오는 인증</h2>
+<p>두 플랫폼이 가장 비슷한 영역이다. ToolHive의 내장 인가 서버는 fastmcp OAuthProxy와 같은 일을 하는데(05편 5장), 둘 다 MCP 클라이언트에게는 인가 서버처럼 보이고 뒤에서는 IdP 앱 하나로 IdP에 붙는다.</p>
+<div class="tbl"><table>
+<tr><th>항목</th><th>ToolHive</th><th>우리 플랫폼</th></tr>
+<tr><td>위치</td><td>proxy 안</td><td>MCP 서버 이미지 안</td></tr>
+<tr><td>access token만 확인하는 모드</td><td>있다. OIDC 모드(05편 2장, 3장)</td><td>없다. 인증을 켜면 항상 OAuthProxy를 쓴다.</td></tr>
+<tr><td>상태 저장소</td><td>메모리 또는 Redis(05편 7장)</td><td>디스크 또는 Redis</td></tr>
+<tr><td>클라이언트 등록</td><td>DCR, CIMD(05편 6장). v0.63.0은 DCR로 만든 클라이언트 수를 제한한다. 기본 상한은 10000이고, 한 번도 쓰지 않은 클라이언트는 24시간 뒤 만료된다(<code>cmd/thv-operator/api/v1beta1/mcpexternalauthconfig_types.go:2203~2222</code>).</td><td>fastmcp 4.0.3의 DCR, CIMD. Redis를 쓰면 DCR 클라이언트는 14일 동안 쓰지 않을 때 만료된다.</td></tr>
+<tr><td>동의 화면</td><td>있다(05편 6장). v0.63.0은 upstream에 표시 이름을 두면 그 이름을 동의 화면에 보여 준다(<code>pkg/authserver/config.go:1091~1096</code>). 설정의 허용 목록에 둔 클라이언트는 동의 화면을 건너뛴다(<code>pkg/authserver/config.go:1578~1588</code>).</td><td>이미지 기본값은 꺼짐이다. core가 배포할 때 켠다(<a href="../oauth/01-role-scope-oauthproxy.html">OAuth 1편</a> 7장). 서버 이름 자리에는 core가 넣은 표시 이름을 보여 준다. 프로필에 scope가 있으면 scope 체크박스도 보여 준다(9장).</td></tr>
+<tr><td>인가 서버 TLS</td><td>v0.63.0부터 8443 포트에 TLS listener를 더할 수 있다. MCP 트래픽과 probe는 HTTP에 남는다(<code>cmd/thv-operator/api/v1beta1/mcpexternalauthconfig_types.go:1024~1035</code>).</td><td>없다. 이미지는 HTTP로만 듣는다. TLS는 Ingress의 <code>tlsSecretName</code>이나 gateway의 listener가 맡는다.</td></tr>
+</table></div>
+<p>우리 이미지는 Keycloak, Okta, Google, GitHub, Azure의 IdP 다섯 종을 지원한다. 이 구조의 상세는 <a href="../oauth/index.html">OAuth 학습 시리즈</a>에 있다.</p>
+<p>v0.63.0의 내장 인가 서버는 RFC 8693 token exchange grant도 받는다. 미리 등록한 confidential client가 사용자의 access token을 내면 인가 서버가 위임 토큰을 발급한다(<code>pkg/authserver/server/tokenexchange/handler.go:53~58</code>). 이 요청에는 RFC 9396 <code>authorization_details</code>를 실을 수 있고, 응답으로 exchange 전용 refresh token도 받을 수 있다(<code>docs/arch/17-token-exchange-delegation.md:1384</code>, <code>:1464</code>). 이 grant는 8장의 나가는 token exchange와 다른 기능이다. fastmcp 4.0.3 OAuthProxy에는 이 grant가 없고 authorization_code와 refresh_token만 낸다(fastmcp <code>server/auth/oauth_proxy/proxy.py:960</code>).</p>
+
+<h2 id="s8">8. 나가는 인증</h2>
+<p>두 플랫폼의 차이가 큰 영역이다. 우리 MCP 서버 이미지는 REST API 서버마다 아래 세 방식 중 하나로 자격 증명을 붙이는데, 어느 방식을 쓸지는 프로필의 인증 설정이 정한다.</p>
+<ol>
+  <li>프로필의 API 키. 인증 방식이 API 키이고 프로필에 키 값이 있으면 그 값을 헤더로 붙인다.</li>
+  <li>클라이언트가 보낸 API 키. 프로필에 키 값이 없으면 6장의 <code>&lt;REST API 서버 이름&gt;---&lt;헤더 이름&gt;</code> 헤더를 쓰는데, 이미지가 앞부분을 떼고 그 헤더를 붙인다.</li>
+  <li>access token 전달. 인증 방식이 Bearer이고 토큰 전달 설정이 켜져 있으면 IdP access token을 그대로 붙인다.</li>
+</ol>
+<p>core는 프로필에 API 키의 헤더 이름만 넣고 값은 넣지 않아서, core가 배포한 MCP 서버에서 API 키는 2번 방식으로 들어온다. 토큰 전달 설정 값은 core가 프로필의 MCP 서버 노드 설정에서 읽어 환경 변수로 넣는다. core의 설정 조각에는 Basic과 Bearer용 헤더 자리도 있지만, MCP 서버 이미지에는 이 두 헤더를 바꿔 붙이는 코드가 없다.</p>
+<p>ToolHive는 3번 대신 token exchange를 쓴다(05편 8.1). proxy가 들어온 access token을 IdP에 내고 외부 API용 access token을 새로 받는 방식이고, 이때 <code>sub</code>는 그대로 두고 <code>aud</code>와 scope만 바뀐다.</p>
+<div class="box key">
+  <span class="label">추천 3. access token 전달 대신 token exchange를 둔다</span>
+  <p>지금 REST API 서버가 받는 access token은 MCP 서버의 IdP 앱 앞으로 발급된 것이라서, REST API 서버를 대상으로 발급되었다는 보장이 없다. REST API 서버가 <code>aud</code>를 검사하지 않으면 다른 서비스용 access token도 받아들일 가능성이 있다. token exchange는 <code>aud</code>와 scope를 REST API 서버에 맞춘다.</p>
+  <p>전제는 IdP가 RFC 8693을 지원해야 한다는 점이다. ToolHive 문서는 Okta, Auth0, Keycloak을 예로 든다(05편 8.1). 기존 전달 방식은 설정으로 남겨 두는 안이다.</p>
+</div>
+
+<h2 id="s9">9. 인가</h2>
+<p>ToolHive는 Cedar policy로 tool 호출마다 판정한다(05편 10장). principal은 access token의 <code>sub</code>이고 resource는 tool 이름이며, claim은 <code>claim_</code> 접두사를 붙여 판정에 쓴다. 허용되지 않은 tool은 목록 응답에서도 지운다(<code>pkg/authz/middleware.go:207~211</code>). v0.63.0은 이 응답 필터를 다시 썼는데, 압축 인코딩이 남아 있어 거를 수 없는 목록 응답은 통과시키지 않고 500으로 막는다(<code>pkg/authz/response_filter.go:96~105</code>). vMCP에서는 tool의 원래 backend가 Cedar resource의 부모가 되기 때문에 backend 하나의 tool을 한 정책으로 허용할 수 있다(<code>pkg/authz/authorizers/cedar/core.go:1100~1106</code>, <code>docs/authz.md:361~379</code>).</p>
+<p>우리 MCP 서버 이미지는 프로필에 scope가 없으면 서버 단위로만 검사한다. IdP access token에 required_scopes가 모두 있어야 통과한다. 이 scope 목록은 core가 환경 변수로 넣는다.</p>
+<p>프로필에 scope가 있으면 위임 설계가 동작한다. 이 설계는 2026-10-27에 MCP 서버 이미지에 들어갔고, 동작 순서는 다음과 같다.</p>
+<ol>
+  <li>core는 tool마다 필요한 scope를 프로필에 적고, scope가 있는 프로필은 <code>mcp_profile_v2_</code> 이름으로 ConfigMap에 넣는다. 옛 이미지는 이 파일을 읽지 못해 시작하지 않는다.</li>
+  <li>이미지는 scope가 있는 tool에 <code>&lt;접두사&gt;:&lt;scope&gt;</code> 형식의 tag를 붙인다.</li>
+  <li>동의 화면은 프로필의 scope를 체크박스로 보여 주고, 사용자가 고른 scope만 MCP 서버가 발급하는 access token에 들어간다. IdP에는 로그인 scope만 요청한다.</li>
+  <li>fastmcp AuthMiddleware가 tool의 tag와 access token의 scope를 검사한다. 맞지 않는 tool은 tools/list에서 빠지고 호출은 거부된다(fastmcp <code>server/middleware/authorization.py:170~196</code>, <code>:198~254</code>).</li>
+</ol>
+<div class="tbl"><table>
+<tr><th>항목</th><th>ToolHive</th><th>우리 플랫폼(위임 설계)</th></tr>
+<tr><td>판정 단위</td><td>tool 호출 하나</td><td>tool 호출 하나</td></tr>
+<tr><td>판정 근거</td><td>사용자의 claim과 그룹, 요청 인자</td><td>사용자가 그 클라이언트에 위임한 scope</td></tr>
+<tr><td>정책 언어</td><td>Cedar, 또는 외부 PDP</td><td>tool마다 필요한 scope 하나</td></tr>
+<tr><td>목록 필터링</td><td>한다.</td><td>한다. fastmcp AuthMiddleware가 거른다.</td></tr>
+</table></div>
+<div class="box key">
+  <span class="label">추천 4. 위임 설계에 목록 필터링을 넣는다(구현됨)</span>
+  <p>호출만 막고 목록에는 남기면 LLM이 쓸 수 없는 tool을 고를 가능성이 있고, 그러면 호출이 실패해서 대화가 한 번 더 돈다. 그래서 ToolHive처럼 tools/list 응답에서 위임되지 않은 tool을 지우는 편이 낫다. 정책 언어는 지금처럼 scope로 충분한데, 우리 목표가 사용자 권한 판정이 아니라 위임된 scope 판정이기 때문이다.</p>
+  <p>이 추천은 2026-10-27에 MCP 서버 이미지에 구현됐다. 위임되지 않은 tool이 목록에서 빠지는지는 이미지의 시험 코드가 확인한다.</p>
+</div>
+
+<h2 id="s10">10. 관측, 감사, 사용 제한</h2>
+<p>ToolHive proxy는 telemetry, 감사, 사용 제한 middleware를 설정에 따라 붙인다(06편 1장). 감사 middleware는 거의 맨 바깥에 있어서 401, 403, 429 응답도 기록한다. 사용 제한은 Kubernetes에서만 있고 Redis가 필요하다(06편 9장).</p>
+<p>우리 MCP 서버 이미지의 개발 브랜치 코드에서는 OpenTelemetry와 Prometheus 설정을 찾지 못했고, 2026-11-07에 다시 검색해도 같았다. 우리 operator는 controller metric을 내지만 tool 호출 단위의 trace와 감사 로그는 없다.</p>
+<p>fastmcp 4.0.3은 OpenTelemetry 계측을 내장하고 있어서 tool 호출마다 <code>tools/call &lt;tool 이름&gt;</code> span을 연다(fastmcp <code>server/server.py:1455</code>). 이 이름 형식은 ToolHive span 이름과 같다(06편 4장). 다만 SDK와 exporter를 설정하지 않으면 span은 기록되지 않는다(fastmcp <code>settings.py:154</code>). 우리 이미지의 의존성에는 SDK가 없고, fastmcp를 따라 OpenTelemetry API 패키지만 들어온다.</p>
+<div class="box key">
+  <span class="label">추천 5. tool 호출 단위의 trace와 감사 로그를 넣는다</span>
+  <p>지금은 어떤 사용자가 어느 tool을 불렀고 결과가 무엇이었는지 MCP 서버 쪽에서 볼 수 없다. trace는 fastmcp에 들어 있는 계측을 켜는 안이 비용이 가장 작은데, 이미지에 SDK와 exporter를 넣고 설정하면 span이 기록된다. 감사 로그는 새로 만들어야 하고, ToolHive의 감사 이벤트 형식(06편 7장)을 참고할 수 있다.</p>
+  <p>사용 제한은 그다음 순서다. 우리 이미지는 Redis를 이미 선택적으로 쓰고 있어서 전제 조건 하나는 갖춘 셈이다.</p>
+</div>
+
+<h2 id="s11">11. 집계와 optimizer</h2>
+<p>vMCP는 그룹에 속한 MCP 서버를 endpoint 하나로 묶는다(08편). 그래서 외부 MCP 클라이언트는 설정 하나로 여러 서버를 쓴다.</p>
+<p>우리 플랫폼에는 이 집계 계층이 없고, core 에이전트는 MCP 서버를 하나씩 노드로 연결한다. 노출 방식 <code>gateway</code>도 집계가 아니다. core 코드는 이 방식을 "비활성 Ingress에 host만 둔 상태"로 정의하고, 이때 우리 operator는 Ingress를 만들지 않는다.</p>
+<p>그래서 vMCP 자체는 지금 들여올 이유가 약하지만 optimizer는 사정이 다르다. 에이전트에 tool이 많으면 LLM 토큰이 많이 드는데, optimizer는 tool 목록 대신 <code>find_tool</code>과 <code>call_tool</code> 두 개만 보여 준다(08편 9장). 이 방식은 에이전트 쪽에서도 쓸모가 있을 가능성이 있다. 다만 절감 수치는 Stacklok의 주장이므로 우리 데이터로 다시 재야 한다.</p>
+
+<h2 id="s12">12. 추천 정리</h2>
+<p>아래 표에 이 문서의 추천을 비용 대비 효과 순서로 모았다. 모두 추천이며 결정된 사항이 아니다. 마지막 열은 2026-11-07에 머리말의 커밋에서 확인한 상태다.</p>
+<div class="tbl"><table>
+<tr><th>추천</th><th>이유</th><th>전제와 비용</th><th>참고할 ToolHive 편</th><th>2026-11-07 상태</th></tr>
+<tr><td>1. pod 보안 기본값</td><td>우리 이미지라서 호환성 확인이 쉽다. 효과도 분명하다.</td><td>root가 아닌 사용자, 쓰기 경로에 emptyDir</td><td>03편 7장</td><td>추천 유지. operator는 securityContext를 넣지 않고, Dockerfile에 <code>USER</code>가 없다(5장).</td></tr>
+<tr><td>5. tool 호출 trace와 감사 로그</td><td>tool 단위 trace와 감사 로그가 지금 없다. trace는 fastmcp 계측을 켜는 안이 있다.</td><td>SDK와 exporter 설정, 수집기 구성, 감사 middleware 작성, 이미지 재배포</td><td>06편 4장, 7장</td><td>추천 유지. 이미지에 OpenTelemetry SDK가 없다(10장).</td></tr>
+<tr><td>4. 위임 설계에 목록 필터링</td><td>쓸 수 없는 tool을 LLM이 고르지 않게 한다.</td><td>위임 설계 구현과 함께 한다.</td><td>05편 10장</td><td>구현됨. 위임 설계가 들어간 MCP 서버 이미지부터 fastmcp AuthMiddleware가 목록을 거른다(9장).</td></tr>
+<tr><td>3. token exchange</td><td>REST API 서버가 자기를 대상으로 발급된 access token을 받는다.</td><td>IdP의 RFC 8693 지원, REST API 서버의 <code>aud</code> 검사</td><td>05편 8장</td><td>추천 유지. 이미지는 IdP access token을 그대로 전달한다(8장).</td></tr>
+<tr><td>2. upstream 형식 목록 API</td><td>다른 도구가 우리 목록을 읽는다.</td><td>새 API 경로, 필드 매핑</td><td>04편 2장, 4장</td><td>추천 유지. core에 upstream 형식 API가 없다(6장).</td></tr>
+<tr><td>검토 후보: 나가는 연결 제한</td><td>프로필이 부를 REST API 서버를 이미 안다.</td><td>host 기반 제한은 egress proxy 같은 구성 요소가 필요할 가능성이 있다. ToolHive operator에도 없다.</td><td>03편 4장~6장</td><td>검토 후보 유지. operator 코드에 NetworkPolicy가 없다(5장).</td></tr>
+</table></div>
+
+<h2 id="sQ">13. 자가 점검 문제</h2>
+<p>먼저 답을 생각해 본 다음 펼쳐서 확인한다.</p>
+<details><summary>Q1. ToolHive MCPServer와 우리 McpServer의 가장 큰 차이 하나는?</summary>
+<p>ToolHive MCPServer는 제3자가 만든 이미지를 실행하고 앞에 별도 proxy pod를 둔다. 우리 McpServer는 우리 MCP 서버 이미지 하나를 실행하고, 어떤 tool을 낼지는 프로필 ConfigMap이 정한다.</p></details>
+<details><summary>Q2. ToolHive가 인증과 감사를 MCP 서버 밖의 proxy에 두는 이유는?</summary>
+<p>ToolHive는 MCP 서버의 코드를 고치지 못하기 때문에, 어떤 서버에도 같은 기능을 걸려면 밖에서 걸어야 한다. 우리는 이미지를 직접 만들므로 같은 기능을 프로세스 안에 넣었다.</p></details>
+<details><summary>Q3. 우리 MCP 서버 pod에 읽기 전용 루트 파일 시스템을 켜려면 무엇을 먼저 확인해야 하나?</summary>
+<p>이미지가 디스크에 쓰는 경로를 확인해야 한다. Redis가 없으면 OAuth 상태를 <code>/application/.fastmcp/server/oauth-proxy</code>에 쓰므로 그 경로에 emptyDir을 붙여야 한다. Dockerfile이 만드는 <code>/application/files</code>의 쓰임도 확인해야 한다.</p></details>
+<details><summary>Q4. NetworkPolicy로 나가는 연결을 막을 때 ToolHive egress proxy와 다른 한계는?</summary>
+<p>NetworkPolicy는 IP와 포트로만 거르기 때문에 host 이름으로 허용하려면 egress proxy 같은 구성 요소가 따로 필요하다. REST API 서버가 클러스터 밖에 있고 IP가 자주 바뀌면 NetworkPolicy만으로는 관리하기 어렵다.</p></details>
+<details><summary>Q5. 토큰 전달 설정을 켜면 REST API 서버는 어떤 access token을 받나? 무엇이 위험한가?</summary>
+<p>MCP 서버가 받은 IdP access token을 그대로 받는다. 이 access token은 MCP 서버의 IdP 앱 앞으로 발급된 것이라서 REST API 서버를 대상으로 발급되었다는 보장이 없다. REST API 서버가 <code>aud</code>를 검사하지 않으면 다른 서비스용 access token도 받아들일 가능성이 있다.</p></details>
+<details><summary>Q6. McpRegistry를 upstream 형식으로 낼 때 <code>usage_doc</code> 같은 우리 필드는 어디에 두나?</summary>
+<p><code>_meta</code>의 publisher-provided 영역에 둔다. ToolHive도 자기만의 필드를 그곳에 두고 있다.</p></details>
+<details><summary>Q7. 우리 MCP 서버 이미지는 위임되지 않은 scope의 tool을 어떻게 다루나?</summary>
+<p>fastmcp AuthMiddleware가 tools/list 응답에서 그 tool을 지우고 호출도 거부한다. 호출만 막고 목록에 남기면 LLM이 쓸 수 없는 tool을 고를 가능성이 있고, 그러면 호출이 거부되어 대화가 한 번 더 돈다. 이 동작은 위임 설계와 함께 MCP 서버 이미지에 들어갔다.</p></details>
+<details><summary>Q8. 노출 방식 <code>gateway</code>는 vMCP 같은 집계인가?</summary>
+<p>집계가 아니다. core는 <code>gateway</code>를 "비활성 Ingress에 host만 둔 상태"로 정의하고, 우리 operator는 이때 Ingress를 만들지 않는다. 여러 MCP 서버를 하나로 묶는 기능은 없다.</p></details>
+<details><summary>Q9. ToolHive의 위임 토큰과 우리 위임 설계는 무엇이 다른가?</summary>
+<p>ToolHive의 위임 토큰은 내장 인가 서버가 token exchange로 발급하는 access token이고, <code>sub</code>는 사용자, <code>act</code>는 대신 행동하는 클라이언트다. 우리 위임 설계는 사용자가 동의 화면에서 고른 scope만 클라이언트의 access token에 싣는다. 둘 다 클라이언트의 권한을 좁히지만 수단이 다르다.</p></details>
+
+<h2 id="sR">14. 참고 자료</h2>
+<ul>
+  <li>이 시리즈 01편~09편. ToolHive 쪽 사실은 각 편의 근거를 따른다.</li>
+  <li>ToolHive v0.63.0(태그 커밋 01f96bf, 2026-11-06). 이 문서가 직접 읽은 파일과 관련 PR은 다음과 같다.
+    <ul>
+      <li>인가 서버: <code>pkg/authserver/config.go</code>, <code>pkg/authserver/server/tokenexchange/handler.go</code>, <code>docs/arch/17-token-exchange-delegation.md</code></li>
+      <li>인가: <code>pkg/authz/middleware.go</code>, <code>pkg/authz/response_filter.go</code>, <code>pkg/authz/authorizers/cedar/core.go</code>, <code>docs/authz.md</code></li>
+      <li>operator와 컨테이너: <code>pkg/container/kubernetes/security.go</code>, <code>cmd/thv-operator/api/v1beta1/mcpexternalauthconfig_types.go</code>, <code>cmd/thv-operator/pkg/controllerutil/resources.go</code></li>
+      <li>동의 화면 표시 이름은 PR #6929다. 동의 화면 건너뛰기는 #6882다. DCR 클라이언트 상한은 #6863과 #6867이다.</li>
+      <li>TLS listener는 #6760, #6843, #7024다. authorization_details는 #6921이다. exchange 전용 refresh token은 #7003이다. vMCP backend 단위 인가는 #6487이다.</li>
+    </ul>
+  </li>
+  <li>우리 operator 저장소의 개발 브랜치(머리말의 커밋).
+    <ul>
+      <li>README, McpServer spec 타입 정의, AiAgent 타입 정의</li>
+      <li>McpServer controller의 reconcile 코드, Deployment 생성 코드, 기본값 코드</li>
+    </ul>
+  </li>
+  <li>MCP 서버 이미지 저장소의 개발 브랜치(머리말의 커밋). 위임 설계는 2026-10-27 릴리스에 들어갔다.
+    <ul>
+      <li>서버 본체, 설정, 타입 정의, 컨테이너용 실행 모듈</li>
+      <li>위임 scope 처리 코드, 동의 화면 코드, 위임 scope 흐름 시험 코드</li>
+      <li>의존성 정의와 잠금 파일, Dockerfile</li>
+    </ul>
+  </li>
+  <li>core 저장소의 개발 브랜치(머리말의 커밋).
+    <ul>
+      <li>McpRegistry, 노출 방식, Kubernetes 클러스터 설정의 entity 정의</li>
+      <li>MCP 서버 배포 코드, MCP 서버 인스턴스 서비스, 인증 설정 유틸리티</li>
+    </ul>
+  </li>
+  <li><a href="../oauth/index.html">OAuth 학습 시리즈</a></li>
+</ul>
+<div class="box warn" id="unchecked">
+  <p>우리 쪽 사실은 2026-10-14에 처음 확인했고, 2026-11-07에 머리말의 커밋을 다시 읽어 내용을 맞췄다. ToolHive 쪽 사실은 이 시리즈의 각 편을 따랐고, 이 문서가 직접 인용한 v0.63.0 파일은 소스 트리에서 읽었다. 5장의 Kubernetes 격리 설명은 ToolHive 설계 문서 05의 Kubernetes 절에 대조했고(<code>docs/arch/05-runconfig-and-permissions.md:789</code>), 보안 기본값은 <code>pkg/container/kubernetes/security.go:31~36</code>에서도 확인했다.</p>
+  <p>2026-11-07에 v0.63.0 소스 트리에서 대조한 것은 다음과 같다.</p>
+  <ul>
+    <li>2장과 3장: ToolHive operator가 만드는 객체, RunConfig checksum, Redis 세션 저장소 조건, CRD 수(14종)</li>
+    <li>5장: 보안 기본값과 operator에 NetworkPolicy가 없다는 점</li>
+    <li>7장: 동의 화면, DCR 클라이언트 상한, TLS listener, token exchange grant</li>
+    <li>9장: 목록 필터링, 응답 필터, vMCP backend 단위 인가</li>
+    <li>10장: 사용 제한이 Redis 세션 저장소를 요구하는 CRD 규칙</li>
+    <li>11장: optimizer의 tool 이름</li>
+  </ul>
+  <p>fastmcp 쪽 사실은 MCP 서버 저장소의 로컬 가상 환경에 설치된 fastmcp 4.0.3에서 읽었다. 이 버전은 2026-11-07에도 <code>uv.lock</code>이 고정한 버전과 같다. MCP 클라이언트가 보낸 헤더는 fastmcp가 REST API 서버 요청에 복사하는데(fastmcp <code>server/providers/openapi/components.py:218</code>), <code>authorization</code>과 <code>cookie</code> 같은 헤더는 복사하지 않는다(fastmcp <code>server/dependencies.py:561</code>). 목록 필터링은 fastmcp <code>server/middleware/authorization.py:170~196</code>과 <code>utilities/authorization.py:197</code>에서 읽었다.</p>
+  <p>API 키 값은 프로필 ConfigMap에 들어가지 않는다. core가 프로필을 만들 때 헤더 이름만 넣기 때문이다.</p>
+  <p>확인하지 못한 내용도 있다. 추천 1의 호환성은 실행해서 시험하지 않았고, fastmcp span이 SDK 설정 뒤 실제로 기록되는지도 시험하지 않았다. 위임 설계의 동작은 이미지의 시험 코드로 확인했고, 이 문서를 갱신하면서 배포 환경에서 다시 실행하지는 않았다. ToolHive v0.63.0의 동의 화면 건너뛰기와 token exchange grant는 코드와 설계 문서로만 확인했다. ToolHive의 registry server 경로는 별도 저장소의 내용이라 이번에 다시 확인하지 않았다. 추천의 효과는 모두 추정이다.</p>
+</div>
+<p>이 문서가 ToolHive 학습의 마지막 편이다. 전체 목록은 <a href="index.html">목차</a>에 있다.</p>
+
+<nav class="pager">
+<a class="prev" href="09-skill-plugin.html"><span class="k">이전 글</span><span class="t">skill과 plugin</span></a>
+</nav>
+
+<footer>2026-10-14 작성, 2026-11-07 갱신. 기준: ToolHive v0.63.0, 우리 플랫폼 각 저장소의 개발 브랜치(머리말의 커밋).</footer>
+</div>
+</body>
+</html>

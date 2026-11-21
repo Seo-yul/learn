@@ -1,0 +1,615 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>skill과 plugin</title>
+<link rel="stylesheet" href="../assets/learn.css">
+</head>
+<body>
+<div class="masthead"><div class="bar"><a class="brand" href="../index.html">learn</a><span class="crumb"><a href="index.html">ToolHive</a></span></div></div>
+<div class="wrap">
+
+<header>
+  <h1>skill과 plugin</h1>
+  <p class="kicker">ToolHive 학습 09편 · 2026-10-14 작성</p>
+  <p>이 문서는 ToolHive가 MCP 서버 말고도 관리하는 두 가지 배포물을 다룬다. 하나는 AI 클라이언트가 읽는 지시문인 skill이고, 다른 하나는 여러 구성 요소를 묶은 AI plugin이다. 두 기능의 수명 주기와 project lock file, 서명 기반 신뢰 모델을 차례로 설명한다.</p>
+  <p>기준 버전은 ToolHive v0.63.0(2026-11-06)이다. 이 문서는 2026-10-14에 v0.53.0 기준으로 작성했고, 2026-11-07에 v0.63.0 기준으로 갱신했다. 공식 문서도 2026-11-07에 다시 읽었다. ToolHive는 자주 바뀌므로 실제로 쓰기 전에 공식 문서를 다시 확인해야 한다.</p>
+</header>
+
+<div class="box key">
+  <span class="label">한 문장 요약</span>
+  <p>skill과 plugin은 실행 프로세스가 아니라 AI 클라이언트가 읽는 파일 묶음이다. ToolHive는 이 묶음을 OCI artifact나 git으로 배포해서 클라이언트 디렉터리에 풀어 놓고, project 범위로 설치할 때는 서명을 검증한 뒤 <code>toolhive.lock.yaml</code>에 digest와 서명자를 고정한다.</p>
+</div>
+
+<div class="box key">
+  <span class="label">v0.63.0 갱신 요약</span>
+  <ul>
+    <li>skill 지원 클라이언트에 Pi coding agent가 들어왔다. user 범위 경로는 <code>~/.pi/agent/skills/</code>, project 범위 경로는 <code>.pi/skills/</code>이고, 환경 변수 <code>PI_CODING_AGENT_DIR</code>이 있으면 user 범위 경로와 클라이언트 감지가 그 디렉터리를 따른다(3장).</li>
+    <li>ToolHive는 <code>SKILL.md</code> frontmatter와 lock file을 <code>go.yaml.in/yaml/v3</code>로 읽는다. 이전 라이브러리는 특정 frontmatter에서 panic했다. 라이브러리만 바뀌었고 형식, 크기 제한, lock file 필드는 그대로다(3장, 7장).</li>
+    <li><code>SKILL.md</code> 파서와 plugin manifest 파서에 Go fuzz 테스트가 생겼다(9장).</li>
+    <li>skill과 plugin의 설계 문서, CLI 문서, service 코드는 두 버전 사이에 바뀌지 않았으므로 설치 흐름, 서명, sync, upgrade 설명은 그대로다.</li>
+    <li>공식 문서는 2026-11-02에 갱신됐지만, 기본 대상 클라이언트와 그룹 자동 설치 설명은 여전히 코드와 다르다(3장, 6장, 10장, 13장).</li>
+    <li>줄 번호를 v0.63.0 트리에서 다시 확인하고 3장, 9장, 10장의 인용을 고쳤다.</li>
+  </ul>
+</div>
+
+<nav class="toc">
+  <b>목차</b>
+  <ol>
+    <li><a href="#s0">용어집</a></li>
+    <li><a href="#s1">skill, plugin, MCP 서버</a></li>
+    <li><a href="#s2">ToolHive가 관리하는 이유와 전체 구조</a></li>
+    <li><a href="#s3">SKILL.md와 설치 범위</a></li>
+    <li><a href="#s4">skill 배포 흐름</a></li>
+    <li><a href="#s5">소스 해석: git, OCI, registry</a></li>
+    <li><a href="#s6">저장 위치, 그룹, UI</a></li>
+    <li><a href="#s7">project lock file과 신뢰 모델</a></li>
+    <li><a href="#s8">sync와 upgrade</a></li>
+    <li><a href="#s9">skill의 보안 장치</a></li>
+    <li><a href="#s10">AI plugin의 구성과 수명 주기</a></li>
+    <li><a href="#s11">plugin의 lock, 보안, skill과의 차이</a></li>
+    <li><a href="#sQ">자가 점검 문제</a></li>
+    <li><a href="#sR">참고 자료</a></li>
+  </ol>
+</nav>
+
+<h2 id="s0">0. 용어집</h2>
+<p>이 문서에서는 아래 용어를 표에 적은 뜻으로만 쓰고, 표에 없는 시리즈 공통 용어는 공통 뜻을 따른다.</p>
+<div class="tbl"><table>
+<tr><th>용어</th><th>이 문서에서의 뜻</th></tr>
+<tr><td>skill</td><td><code>SKILL.md</code> 하나와 보조 파일을 담은 지시문 묶음. Agent Skills 규격을 따른다.</td></tr>
+<tr><td>plugin</td><td>AI 코딩 도구용 plugin. <code>.claude-plugin/plugin.json</code>이 기술하는 구성 요소 묶음이다. ToolHive 자체의 확장 기능이 아니다.</td></tr>
+<tr><td>구성 요소</td><td>plugin 안의 단위. commands, agents, skills, hooks, mcpServers, lspServers 여섯 종류다.</td></tr>
+<tr><td>AI 클라이언트</td><td>skill이나 plugin을 읽는 AI 코딩 도구. Claude Code, Cursor, Codex 등이다.</td></tr>
+<tr><td>설치 범위</td><td>파일을 둘 위치의 종류. user 범위와 project 범위가 있다. flag 이름은 <code>--scope</code>다. 인가의 scope와 다른 뜻이다.</td></tr>
+<tr><td>project root</td><td>project 범위 설치의 기준 디렉터리. git 저장소여야 한다.</td></tr>
+<tr><td>git 저장소</td><td>git으로 관리하는 소스 코드 저장소.</td></tr>
+<tr><td>이미지 저장소</td><td>OCI artifact를 올리는 원격 저장소. ghcr.io, Docker Hub 등이다.</td></tr>
+<tr><td>OCI artifact</td><td>OCI 형식으로 묶은 배포 단위. 여기서는 컨테이너 이미지가 아니라 tar.gz 층 하나를 담은 파일 묶음이다.</td></tr>
+<tr><td>로컬 OCI store</td><td>build 결과와 내려받은 artifact를 두는 로컬 저장 공간.</td></tr>
+<tr><td>registry</td><td>ToolHive가 읽는 목록. 이 문서에서는 MCP 서버 항목과 함께 skill과 plugin 항목도 담는다.</td></tr>
+<tr><td>API server</td><td><code>thv serve</code>가 띄우는 로컬 HTTP 서버. <code>thv skill</code>과 <code>thv ai-plugin</code>은 이 서버를 호출한다.</td></tr>
+<tr><td>digest</td><td>내용을 가리키는 고정 값. OCI manifest의 sha256 값이나 git commit hash다.</td></tr>
+<tr><td>contentDigest</td><td>설치된 파일 전체로 계산한 hash. 디스크 위 내용이 바뀌었는지 판단한다.</td></tr>
+<tr><td>lock file</td><td>project root의 <code>toolhive.lock.yaml</code>. project 범위 설치의 소스, digest, 서명자를 기록한다.</td></tr>
+<tr><td>drift</td><td>설치된 상태가 lock file 기록과 다른 상태.</td></tr>
+<tr><td>keyless 서명</td><td>Sigstore 방식 서명. 짧게 쓰는 OIDC identity token으로 인증서를 받고 투명성 로그에 기록한다.</td></tr>
+<tr><td>key-pair 서명</td><td>cosign 개인 키로 하는 서명. 인증서와 투명성 로그 기록이 없다.</td></tr>
+<tr><td>identity token</td><td>keyless 서명에 쓰는 OIDC 자격 증명. access token과 다른 용도다.</td></tr>
+<tr><td>서명 검증</td><td>artifact의 서명이 lock file에 기록된 기준과 맞는지 암호학적으로 따지는 것.</td></tr>
+<tr><td>신뢰 기준</td><td>lock entry에 기록한 서명자 정보. keyless는 인증서 identity, key-pair는 public key다.</td></tr>
+<tr><td>TOFU</td><td>trust on first use. 첫 설치 때 본 서명자를 신뢰 기준으로 기록하는 방식.</td></tr>
+<tr><td>materialize</td><td>plugin tree를 AI 클라이언트 경로에 풀고 클라이언트 등록 파일을 고치는 작업.</td></tr>
+<tr><td>marketplace</td><td>AI 클라이언트가 plugin 목록을 찾는 JSON 파일. <code>marketplace.json</code>이다.</td></tr>
+</table></div>
+
+<h2 id="s1">1. skill, plugin, MCP 서버</h2>
+<p>MCP 서버는 tool과 resource를 제공하는 실행 프로세스인 반면, skill은 실행 프로세스가 아니라 AI 클라이언트가 읽는 Markdown 지시문이다(source <code>docs/arch/12-skills-system.md</code>). 공식 문서는 둘의 관계를 MCP 서버가 tool을 주고 skill이 그 tool을 언제, 어떻게 쓸지 알려 주는 것으로 정리한다(docs <code>concepts/skills</code>).</p>
+<p>plugin은 더 큰 묶음이라서 plugin 하나에 여러 구성 요소가 함께 들어간다. commands, agents, skills, hooks와 MCP 서버, LSP 서버 선언이 그 구성 요소다(source <code>docs/arch/14-plugins-system.md</code>). plugin 안의 skill은 plugin 전체가 한 단위로 설치되기 때문에 독립 skill과 다른 수명 주기를 따른다.</p>
+<div class="tbl"><table>
+<tr><th>항목</th><th>skill</th><th>plugin</th><th>MCP 서버</th></tr>
+<tr><td>정체</td><td>지시문과 지식</td><td>여러 구성 요소 묶음</td><td>tool과 resource</td></tr>
+<tr><td>형식</td><td><code>SKILL.md</code> (YAML frontmatter + Markdown)</td><td><code>.claude-plugin/plugin.json</code> + 디렉터리 tree</td><td>컨테이너 이미지나 원격 endpoint</td></tr>
+<tr><td>실행</td><td>AI 클라이언트가 prompt 시점에 읽는다</td><td>AI 클라이언트가 읽고 해석한다</td><td>프로세스로 실행한다</td></tr>
+<tr><td>배포</td><td>OCI artifact, git</td><td>OCI artifact, git</td><td>컨테이너 이미지</td></tr>
+<tr><td>지원 클라이언트</td><td>skill을 지원하는 여러 클라이언트</td><td>Claude Code, Codex 두 개</td><td>MCP 클라이언트</td></tr>
+<tr><td>CLI</td><td><code>thv skill</code></td><td><code>thv ai-plugin</code></td><td><code>thv run</code> 등</td></tr>
+</table></div>
+<p>plugin이 MCP 서버를 선언해도 ToolHive는 그 서버를 workload로 실행하지 않고, 선언된 서버를 쓸지는 AI 클라이언트가 정한다(source <code>docs/arch/14-plugins-system.md</code>, Component Inventory).</p>
+
+<h2 id="s2">2. ToolHive가 관리하는 이유와 전체 구조</h2>
+<p>ToolHive가 없으면 팀은 <code>SKILL.md</code>를 손으로 복사하고 버전도 손으로 맞춰야 하며, 찾아볼 중앙 목록도 없다. ToolHive는 MCP 서버에 쓰던 기반을 skill에도 써서 다음과 같은 기능을 준다(source <code>docs/arch/12-skills-system.md</code>).</p>
+<ul>
+  <li>registry에서 이름으로 찾는다.</li>
+  <li>OCI artifact로 배포하고 버전을 붙인다.</li>
+  <li>설치 범위를 user와 project로 나눈다.</li>
+  <li>여러 AI 클라이언트에 한 번에 설치한다.</li>
+</ul>
+<p>skill과 MCP 서버는 registry, 그룹, OCI 배포를 공유하지만, 목적과 형식, 수명 주기가 다른 별개 시스템이다.</p>
+<h3>CLI와 API server</h3>
+<p><code>thv skill</code>과 <code>thv ai-plugin</code>은 로컬에서도 HTTP로 API server를 호출하기 때문에, 사용자는 먼저 <code>thv serve</code>를 띄워 두어야 한다. ToolHive 데스크톱 앱이 실행 중이면 앱이 API server를 제공한다(docs <code>guides-cli/skills-management</code>).</p>
+<ol>
+  <li>CLI는 <code>TOOLHIVE_API_URL</code>이나 로컬 discovery 파일로 API server를 찾는다(source <code>docs/arch/12-skills-system.md</code>).</li>
+  <li>API server는 skill 요청을 <code>/api/v1beta/skills</code>, plugin 요청을 <code>/api/v1beta/plugins</code>로 받는다.</li>
+  <li>service 계층이 소스 해석, 서명 검증, 추출, 저장, lock file 기록을 맡는다. skill은 <code>pkg/skills/skillsvc</code>, plugin은 <code>pkg/plugins/pluginsvc</code>다.</li>
+</ol>
+<p>CLI의 기본 API 대기 시간은 10분이라서 큰 OCI artifact는 이 시간 안에 다 받지 못할 가능성이 있다. 그때는 <code>TOOLHIVE_API_TIMEOUT</code>으로 늘려야 한다(docs <code>guides-cli/skills-management</code>, Troubleshooting).</p>
+
+<h2 id="s3">3. SKILL.md와 설치 범위</h2>
+<h3>SKILL.md 형식</h3>
+<p>skill은 <code>SKILL.md</code>가 있는 디렉터리이고, 이 디렉터리에는 <code>scripts/</code>, <code>references/</code>, <code>assets/</code> 같은 보조 파일도 들어간다(docs <code>concepts/skills</code>).</p>
+<pre><code>---
+name: code-review
+description: Reviews code for best practices and security patterns
+version: 1.0.0
+allowed-tools: Read Glob Grep
+toolhive.requires: ghcr.io/org/base-skill:v1
+license: Apache-2.0
+---
+
+# Code Review Skill
+
+Instructions for how the AI assistant should perform code reviews...</code></pre>
+<div class="tbl"><table>
+<tr><th>필드</th><th>필수</th><th>규칙</th></tr>
+<tr><td><code>name</code></td><td>예</td><td>2~64자. 소문자, 숫자, 하이픈. 처음과 끝은 영숫자다. 디렉터리 이름과 같아야 한다.</td></tr>
+<tr><td><code>description</code></td><td>예</td><td>최대 1024자</td></tr>
+<tr><td><code>version</code></td><td>아니요</td><td>semantic version. 기본 규격이 아니라 ToolHive 확장 필드다</td></tr>
+<tr><td><code>allowed-tools</code></td><td>아니요</td><td>미리 허용할 tool 이름 목록</td></tr>
+<tr><td><code>toolhive.requires</code></td><td>아니요</td><td>의존하는 다른 skill의 OCI 참조</td></tr>
+<tr><td><code>license</code>, <code>compatibility</code>, <code>metadata</code></td><td>아니요</td><td>SPDX 라이선스, 호환 클라이언트 문자열, 임의 key-value</td></tr>
+</table></div>
+<p>ToolHive는 이름 규칙을 정규식으로 확인한다(source <code>pkg/skills/validator.go:18</code>). frontmatter는 64KB를 넘을 수 없고 의존 skill은 100개까지다(source <code>pkg/skills/parser.go:17-23</code>). v0.57.0부터는 frontmatter를 <code>go.yaml.in/yaml/v3</code>로 읽는데, 이 라이브러리는 <code>gopkg.in/yaml.v3</code>를 이어받아 유지 관리하는 fork다(source <code>pkg/skills/parser.go:11</code>, <code>go.mod:92</code>). 이전 라이브러리는 merge key 옆에 mapping key가 오는 frontmatter에서 panic했지만, 새 파서는 같은 입력을 frontmatter 오류로 거부한다(source <code>pkg/skills/parser_test.go:193-197</code>). frontmatter 형식과 제한은 바뀌지 않았다.</p>
+
+<h3>설치 범위</h3>
+<div class="tbl"><table>
+<tr><th>설치 범위</th><th>Claude Code 경로 예</th><th>특징</th></tr>
+<tr><td>user (기본값)</td><td><code>~/.claude/skills/&lt;이름&gt;/</code></td><td>모든 project에서 보인다. 서명 검증과 lock file이 없다.</td></tr>
+<tr><td>project</td><td><code>&lt;project root&gt;/.claude/skills/&lt;이름&gt;/</code></td><td>그 project에서만 보인다. project root는 git 저장소여야 한다. 서명 검증과 lock file 기록을 한다.</td></tr>
+</table></div>
+<p>클라이언트마다 skill 디렉터리가 달라서, 예를 들어 Cursor는 <code>~/.cursor/skills/</code>를 쓴다(docs <code>guides-cli/skills-management</code>). ToolHive는 이런 클라이언트별 경로 규칙을 <code>pkg/client</code> 설정에 둔다(source <code>pkg/client/config.go:248-249</code>).</p>
+<p>v0.54.0부터 Pi coding agent도 skill 지원 클라이언트다. user 범위 경로는 <code>~/.pi/agent/skills/&lt;이름&gt;/</code>이고 project 범위 경로는 <code>&lt;project root&gt;/.pi/skills/&lt;이름&gt;/</code>다(source <code>pkg/client/config.go:1055-1076</code>, docs <code>reference/client-compatibility</code>). Pi에는 설정 디렉터리를 환경 변수 <code>PI_CODING_AGENT_DIR</code>로 옮기는 기능이 있는데, 이 변수가 있으면 ToolHive는 user 범위 skill을 그 디렉터리의 <code>skills/</code> 아래에 둔다(source <code>pkg/client/skills.go:129-131</code>). 클라이언트 감지도 그 디렉터리가 있는지를 본다(source <code>pkg/client/discovery.go:116-124</code>). 값 앞의 <code>~</code>는 home 디렉터리로 바꾸고, 상대 경로는 작업 디렉터리 기준으로 푼다(source <code>pkg/client/config.go:1484-1503</code>). project 범위 경로는 이 변수와 무관하다.</p>
+
+<h3>대상 클라이언트</h3>
+<p><code>--clients</code>를 주지 않으면 ToolHive는 설치된 모든 skill 지원 클라이언트에 설치하고, <code>--clients all</code>도 같은 뜻이다(source <code>pkg/skills/skillsvc/clients.go:40-49</code>). API server는 이 목록에서 시스템에 없는 클라이언트를 뺀다(source <code>pkg/api/server.go:1000-1011</code>). 한 클라이언트라도 설치에 실패하면 그 설치 작업 전체를 되돌린다(docs <code>guides-cli/skills-management</code>).</p>
+<div class="box warn">
+<p>CLI 안내 문서는 "처음 찾은 클라이언트 하나에 설치한다"고 적고, 2026-11-02에 갱신된 문서도 같다. 그러나 v0.63.0 코드는 감지된 클라이언트 전부에 설치한다(source <code>pkg/skills/skillsvc/clients.go:40-49</code>). 이 문서는 코드를 따른다. 특정 클라이언트에만 설치하려면 <code>--clients</code>를 명시해야 한다.</p>
+</div>
+
+<h2 id="s4">4. skill 배포 흐름</h2>
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 340" width="760" height="340" role="img" aria-label="skill 배포 흐름. 작성자는 build와 push를 하고 사용자는 install을 한다.">
+    <defs><marker id="m09a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+    <marker id="m09b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head-w" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <text x="16" y="22" font-size="12" class="d-m">작성자</text>
+    <rect class="d-box" x="16" y="34" width="140" height="56" rx="10"/>
+    <text x="86" y="58" font-size="13.5" font-weight="600" text-anchor="middle">skill 디렉터리</text>
+    <text x="86" y="77" font-size="11.5" class="d-m" text-anchor="middle">SKILL.md + 파일</text>
+    <rect class="d-box" x="196" y="34" width="150" height="56" rx="10"/>
+    <text x="271" y="58" font-size="13.5" font-weight="600" text-anchor="middle">로컬 OCI store</text>
+    <text x="271" y="77" font-size="11.5" class="d-m" text-anchor="middle">thv skill build</text>
+    <rect class="d-acc" x="386" y="34" width="160" height="56" rx="10"/>
+    <text x="466" y="58" font-size="13.5" font-weight="600" text-anchor="middle">이미지 저장소</text>
+    <text x="466" y="77" font-size="11.5" class="d-m" text-anchor="middle">thv skill push, 서명</text>
+    <rect class="d-box" x="586" y="34" width="158" height="56" rx="10"/>
+    <text x="665" y="58" font-size="13.5" font-weight="600" text-anchor="middle">registry server</text>
+    <text x="665" y="77" font-size="11.5" class="d-m" text-anchor="middle">카탈로그 항목 게시</text>
+    <line class="d-line" x1="156" y1="62" x2="194" y2="62" marker-end="url(#m09a)"/>
+    <line class="d-line" x1="346" y1="62" x2="384" y2="62" marker-end="url(#m09a)"/>
+    <line class="d-dash" x1="586" y1="62" x2="548" y2="62" marker-end="url(#m09b)"/>
+    <text x="567" y="54" font-size="10.5" class="d-w" text-anchor="middle">참조</text>
+    <rect class="d-box" x="16" y="130" width="140" height="40" rx="8"/>
+    <text x="86" y="155" font-size="13" text-anchor="middle">git 저장소</text>
+    <text x="16" y="200" font-size="12" class="d-m">사용자</text>
+    <rect class="d-box" x="16" y="212" width="140" height="56" rx="10"/>
+    <text x="86" y="236" font-size="13.5" font-weight="600" text-anchor="middle">thv skill install</text>
+    <text x="86" y="255" font-size="11.5" class="d-m" text-anchor="middle">이름, OCI, git://</text>
+    <rect class="d-acc" x="196" y="212" width="150" height="56" rx="10"/>
+    <text x="271" y="236" font-size="13.5" font-weight="600" text-anchor="middle">소스 해석</text>
+    <text x="271" y="255" font-size="11.5" class="d-m" text-anchor="middle">git, OCI, 이름 순서</text>
+    <rect class="d-warn" x="386" y="212" width="160" height="56" rx="10"/>
+    <text x="466" y="236" font-size="13.5" font-weight="600" text-anchor="middle">추출과 안전 검사</text>
+    <text x="466" y="255" font-size="11.5" class="d-m" text-anchor="middle">project면 서명 검증</text>
+    <rect class="d-ok" x="586" y="212" width="158" height="56" rx="10"/>
+    <text x="665" y="236" font-size="13.5" font-weight="600" text-anchor="middle">AI 클라이언트</text>
+    <text x="665" y="255" font-size="11.5" class="d-m" text-anchor="middle">~/.claude/skills/이름/</text>
+    <rect class="d-box" x="386" y="292" width="160" height="34" rx="8"/>
+    <text x="466" y="314" font-size="12.5" text-anchor="middle">SQLite 설치 기록</text>
+    <rect class="d-box" x="586" y="292" width="158" height="34" rx="8"/>
+    <text x="665" y="314" font-size="12.5" text-anchor="middle">toolhive.lock.yaml</text>
+    <line class="d-line" x1="156" y1="240" x2="194" y2="240" marker-end="url(#m09a)"/>
+    <line class="d-line" x1="346" y1="240" x2="384" y2="240" marker-end="url(#m09a)"/>
+    <line class="d-line" x1="546" y1="240" x2="584" y2="240" marker-end="url(#m09a)"/>
+    <line class="d-line" x1="240" y1="212" x2="140" y2="172" marker-end="url(#m09a)"/>
+    <line class="d-line" x1="290" y1="212" x2="440" y2="92" marker-end="url(#m09a)"/>
+    <text x="392" y="140" font-size="11" class="d-m">pull</text>
+    <line class="d-line" x1="320" y1="212" x2="630" y2="92" marker-end="url(#m09a)"/>
+    <text x="560" y="140" font-size="11" class="d-m">이름 조회</text>
+    <line class="d-line" x1="466" y1="268" x2="466" y2="290" marker-end="url(#m09a)"/>
+    <line class="d-line" x1="530" y1="268" x2="600" y2="290" marker-end="url(#m09a)"/>
+    <text x="16" y="330" font-size="11" class="d-m">lock file은 project 범위 설치만 기록한다.</text>
+  </svg>
+  </div>
+  <figcaption>그림 1. skill 배포 흐름. 작성자는 build와 push를 하고, 사용자의 install은 소스를 해석해서 파일을 클라이언트 디렉터리에 푼다. 출처는 <code>docs/arch/12-skills-system.md</code>의 Skill Lifecycle이다.</figcaption>
+</figure>
+
+<h3>validate와 build</h3>
+<p>작성자는 다음 순서로 skill을 artifact로 만든다(source <code>docs/arch/12-skills-system.md</code>, Building).</p>
+<ol>
+  <li><code>thv skill validate ./my-skill</code>로 frontmatter, 이름, symlink, 경로 문제를 확인한다.</li>
+  <li><code>thv skill build ./my-skill --tag ghcr.io/my-org/skills/my-skill:v1.0.0</code>을 실행한다.</li>
+  <li>ToolHive는 디렉터리 전체를 tar.gz 층 하나로 묶어 로컬 OCI store에 저장한다.</li>
+  <li><code>thv skill builds</code>로 로컬 build 목록을 보고, <code>thv skill builds remove &lt;tag&gt;</code>로 지운다.</li>
+</ol>
+
+<h3>push와 서명</h3>
+<p><code>thv skill push</code>는 기본으로 서명하고, 서명 없는 push는 명시해야만 가능하다. 사용자는 아래 셋 중 하나를 고른다(source <code>docs/arch/12-skills-system.md</code>, Publishing).</p>
+<div class="tbl"><table>
+<tr><th>방식</th><th>flag</th><th>동작</th></tr>
+<tr><td>keyless (기본)</td><td>없음 또는 <code>--identity-token</code></td><td>OIDC identity token으로 Fulcio 인증서를 받고 Rekor 투명성 로그에 기록한다</td></tr>
+<tr><td>key-pair</td><td><code>--key cosign.key</code></td><td>cosign 개인 키로 서명한다. 서명은 API server가 한다</td></tr>
+<tr><td>서명 없음</td><td><code>--no-sign</code></td><td>서명하지 않는다</td></tr>
+</table></div>
+<p>flag를 하나도 주지 않으면 CLI가 다음 순서로 identity token을 구한다(source <code>pkg/skills/identitytoken</code>, <code>docs/arch/12-skills-system.md</code>).</p>
+<ol>
+  <li>GitHub Actions에서 <code>id-token: write</code> 권한이 있으면 ambient OIDC token을 쓴다.</li>
+  <li>대화형 terminal이면 y/N을 묻고 브라우저로 Sigstore 로그인을 한다.</li>
+  <li>둘 다 안 되면 push 전에 오류로 끝나며, 서명 없이 조용히 올리지는 않는다.</li>
+</ol>
+<p><code>--key</code>는 자동 탐색한 로컬 API server에서만 받고, 원격 API server나 수동으로 정한 URL로 key 서명을 요청하면 403이다(docs <code>guides-cli/skills-management</code>). 개인 키 서명 기능이 원격에 노출되지 않게 하는 제한이다.</p>
+<div class="box warn">
+<p>skill push는 artifact를 먼저 올리고 그다음 서명하기 때문에(source <code>pkg/skills/skillsvc/build.go:139-154</code>), 서명 단계가 실패하면 서명 없는 artifact가 이미지 저장소에 남는다. project 범위 설치는 서명을 요구하므로 이 artifact는 <code>--allow-unsigned</code> 없이는 project 범위로 설치되지 않는다. plugin push는 순서가 다른데, 이 차이는 <a href="#s11">11장</a>에서 비교한다.</p>
+</div>
+
+<h3>install</h3>
+<pre><code>thv skill install code-review                                   # registry 이름
+thv skill install ghcr.io/org/skill:v1.0.0                      # OCI 참조
+thv skill install git://github.com/org/repo@v1#skills/my-skill  # git
+thv skill install code-review --scope project --project-root .  # project 범위</code></pre>
+<p>ToolHive는 install 요청을 다음 순서로 처리한다(source <code>docs/arch/12-skills-system.md</code>, Installation).</p>
+<ol>
+  <li>참조 형식으로 소스 종류를 정한다. 다음 장에서 자세히 다룬다.</li>
+  <li>artifact를 받거나 git 저장소를 clone한다.</li>
+  <li>압축을 풀고 symlink, 경로 탈출, 크기를 확인한다.</li>
+  <li>파일 권한을 정리하고 각 클라이언트의 skill 디렉터리에 쓴다.</li>
+  <li>SQLite에 설치 기록을 만들고 그룹에 등록한다.</li>
+  <li>project 범위이면 lock file에 항목을 쓴다.</li>
+</ol>
+<p>OCI 설치에서는 artifact 안의 skill 이름이 이미지 저장소 경로의 마지막 부분과 같아야 한다. plugin 아키텍처 문서는 같은 확인을 이름 덮어쓰기 방지로 설명하는데, 이 확인이 게시자의 신원을 증명하는 것은 아니다.</p>
+<p>uninstall은 클라이언트의 파일, DB 기록, 모든 그룹에 등록된 이름 세 가지를 지운다(source <code>pkg/skills/skillsvc/uninstall.go</code>, <code>pkg/groups/skills.go</code>).</p>
+
+<h2 id="s5">5. 소스 해석: git, OCI, registry</h2>
+<h3>해석 순서</h3>
+<p>skill service는 함수 하나로 소스 문자열을 분류한다(source <code>pkg/skills/skillsvc/source_dispatch.go:48-90</code>). install과 upgrade가 같은 함수를 쓰며, 분류 순서는 다음과 같다.</p>
+<ol>
+  <li><code>git://</code>로 시작하면 git resolver로 보낸다.</li>
+  <li>OCI 참조 모양이면 이미지 저장소에서 받는다. <code>org/name</code>처럼 애매한 이름이 실패하면 registry 이름으로 다시 찾는다.</li>
+  <li>나머지는 skill 이름 규칙을 확인한 뒤 registry 이름으로 찾는다. install은 로컬 OCI store를 먼저 본다.</li>
+</ol>
+
+<h3>git 참조</h3>
+<pre><code>git://github.com/org/repo                       # 기본 branch의 root
+git://github.com/org/repo@v1.0.0                # tag
+git://github.com/org/repo#skills/my-skill       # 하위 디렉터리
+git://github.com/org/repo@main#skills/my-skill  # branch + 하위 디렉터리</code></pre>
+<ul>
+  <li>clone 제한 시간은 2분이다(source <code>pkg/skills/gitresolver/resolver.go:26</code>).</li>
+  <li>인증 정보는 host별로 보낸다. <code>GITHUB_TOKEN</code>은 github.com에만, <code>GITLAB_TOKEN</code>은 gitlab.com에만 보내고, <code>GIT_TOKEN</code>은 모든 host에 보내는 대체 값이다(source <code>pkg/skills/gitresolver/auth.go:22-24</code>).</li>
+  <li>host가 localhost나 사설 IP이면 SSRF를 막으려고 거부한다.</li>
+</ul>
+<div class="box warn">
+<p>SSRF 검사는 IP 문자열과 알려진 localhost 이름만 보기 때문에 DNS가 사설 IP로 풀리는 hostname은 막지 못한다. 이 한계는 소스 주석에도 적혀 있다(source <code>pkg/skills/gitresolver/reference.go:122-128</code>).</p>
+</div>
+
+<h3>registry와 registry server</h3>
+<p>이름으로 설치하면 ToolHive는 설정된 registry에서 skill을 찾는데, registry server는 skill을 MCP 서버와 다른 확장 경로로 제공한다(docs <code>guides-registry/skills</code>).</p>
+<div class="tbl"><table>
+<tr><th>용도</th><th>경로</th></tr>
+<tr><td>목록, 조회, 검색</td><td><code>GET /registry/{registryName}/v0.1/x/dev.toolhive/skills</code></td></tr>
+<tr><td>특정 버전 조회</td><td><code>GET .../skills/{namespace}/{name}/versions/{version}</code></td></tr>
+<tr><td>게시</td><td><code>POST /v1/entries</code> (본문에 <code>skill</code> 객체)</td></tr>
+<tr><td>버전 삭제</td><td><code>DELETE /v1/entries/skill/{namespace%2Fname}/versions/{version}</code></td></tr>
+</table></div>
+<p>registry 항목은 namespace, name, version이 필수이고, <code>packages</code>에는 OCI나 git 위치를 적는다. registry server는 더 높은 버전이 오면 latest를 옮기지만, 낮은 버전을 나중에 올려도 latest는 그대로다. registry 항목에 기대하는 서명자(<code>provenance</code>)가 있으면 첫 project 설치가 그 값으로 서명을 확인한다(<a href="#s7">7장</a>). registry 자체는 <a href="04-registry-group-client.html">04편</a>이 다룬다.</p>
+
+<h2 id="s6">6. 저장 위치, 그룹, UI</h2>
+<h3>SQLite 설치 기록</h3>
+<p>ToolHive는 설치 기록을 SQLite에 두는데, 파일은 XDG state 디렉터리의 <code>toolhive/toolhive.db</code>다(source <code>pkg/storage/sqlite/db.go:75</code>). 주요 table은 아래와 같다(source <code>docs/arch/12-skills-system.md</code>, Storage).</p>
+<div class="tbl"><table>
+<tr><th>table</th><th>내용</th></tr>
+<tr><td><code>entries</code></td><td>skill, plugin 등 모든 항목의 공통 부모. <code>(entry_type, name)</code>이 고유하다</td></tr>
+<tr><td><code>installed_skills</code></td><td>설치 범위, project root, 참조, digest, 대상 클라이언트, 상태, lock 관리 여부</td></tr>
+<tr><td><code>skill_dependencies</code></td><td><code>toolhive.requires</code> 의존 관계</td></tr>
+<tr><td><code>installed_plugins</code>, <code>plugin_dependencies</code></td><td>plugin 설치 기록과 의존 정보</td></tr>
+</table></div>
+<p>migration 파일은 <code>pkg/storage/sqlite/migrations/</code>의 001부터 006까지이고, 그중 004와 006이 서명 bundle 열을 추가한다.</p>
+
+<h3>그룹</h3>
+<p>skill은 MCP 서버처럼 그룹에 속하고, <code>--group</code>을 주지 않으면 ToolHive가 <code>default</code> 그룹에 넣는다(source <code>pkg/skills/skillsvc/install.go:271-290</code>). 그룹은 이름 목록만 가지며, <code>thv skill list --group dev-tools</code>는 이 목록으로 설치 기록을 거른다(source <code>pkg/skills/skillsvc/list.go:48-59</code>).</p>
+<div class="box warn">
+<p>CLI 안내 문서는 "그룹의 skill이 그 그룹에 등록된 클라이언트에 자동 설치된다"고 적는다. 그러나 v0.63.0 코드에서도 그룹의 skill 목록을 읽는 곳은 목록 거르기와 삭제뿐이고(source <code>pkg/skills/skillsvc/list.go:48-59</code>, <code>pkg/groups/skills.go</code>), 자동 설치 경로는 찾지 못했다. 그룹 개념은 <a href="04-registry-group-client.html">04편</a>을 보면 된다.</p>
+</div>
+
+<h3>데스크톱 UI</h3>
+<p>ToolHive UI에는 Skills 화면이 있고, 탭은 Registry, Installed, Local Builds 세 개다(docs <code>guides-ui/skills</code>). 사용자는 UI에서 찾기, 설치, 삭제, 로컬 build를 할 수 있지만, 이미지 저장소로 push하는 기능은 CLI에만 있다(docs <code>guides-ui/skills-build</code>). UI에는 <code>--force</code> 동작이 없어서 덮어쓰려면 지우고 다시 설치해야 한다. toolhive-studio v0.40.1에는 plugin 화면이 없다(source <code>renderer/src/routes/</code>).</p>
+
+<h2 id="s7">7. project lock file과 신뢰 모델</h2>
+<h3>lock file이 하는 일</h3>
+<p>project 범위로 설치하면 ToolHive는 project root의 <code>toolhive.lock.yaml</code>에 항목을 쓴다(source <code>pkg/skills/lockfile/lockfile.go:37-39</code>). 이 파일은 <code>package-lock.json</code>이나 <code>go.sum</code>과 같은 일을 해서, 팀원과 CI는 같은 git 저장소를 받아 <code>thv skill sync</code>로 같은 내용을 복원한다. 이때 sync가 복원하는 것은 소스의 최신 내용이 아니라 lock file에 기록된 내용이다.</p>
+<p>아래는 스키마 필드로 만든 예이고, 값은 설명용이다(source <code>pkg/skills/lockfile/lockfile.go:54-166</code>). ToolHive는 이 파일을 <code>go.yaml.in/yaml/v3</code>로 읽고 쓴다(source <code>pkg/skills/lockfile/lockfile.go:31</code>). v0.57.0에 YAML 라이브러리만 바뀌었고 필드는 그대로다.</p>
+<pre><code>version: 1
+skills:
+  - name: code-review
+    version: "1.0.0"
+    source: code-review                       # 사용자가 요청한 그대로. sync는 고치지 않는다
+    resolvedReference: ghcr.io/org/code-review:1.0.0
+    digest: sha256:9f2b1e...                  # 고정 값: OCI manifest digest 또는 git commit
+    contentDigest: sha256:a1b2c3...           # 설치된 파일 전체의 hash
+    explicit: true                            # 이름으로 직접 설치했는지
+    provenance:                               # keyless 서명의 신뢰 기준
+      signerIdentity: https://github.com/org/skills/.github/workflows/release.yml@refs/tags/v1.0.0
+      certIssuer: https://token.actions.githubusercontent.com
+      repositoryRef: refs/tags/v1.0.0
+      runnerEnvironment: github-hosted
+plugins:
+  - name: release-toolkit
+    source: ghcr.io/org/plugins/release-toolkit:1.0.0
+    digest: sha256:4c1d...
+    publicKey: MFkwEwYHKoZIzj0CAQY...          # key-pair 서명의 신뢰 기준</code></pre>
+<p>ToolHive는 항목을 이름순으로 정렬하기 때문에 diff가 안정적이다. 설치 중 lock file 쓰기가 실패하면 설치 전체를 실패로 끝내는데, 설계 문서가 고정되지 않은 설치를 설치 실패보다 나쁜 상태로 보기 때문이다(source <code>docs/arch/12-skills-system.md</code>).</p>
+
+<h3>TOFU와 catalog provenance</h3>
+<p>신뢰 모델의 중심은 TOFU이고, project 범위 설치는 다음 규칙을 따른다(source <code>docs/arch/12-skills-system.md</code>, Project Lock File).</p>
+<ol>
+  <li>첫 설치 때 ToolHive는 서명을 검증하고, 그때 본 서명자를 <code>provenance</code>에 기록한 뒤 사용자에게 보여 준다.</li>
+  <li>그 뒤의 install, sync, upgrade는 기록한 서명자를 Sigstore 정책 안에서 강제한다.</li>
+  <li>서명 workflow의 git ref와 runner 종류도 기록하고, 이 값이 달라지면 서명자 변경과 똑같이 막는다.</li>
+  <li>다른 서명자로 바꾸려면 upgrade에 <code>--allow-signer-change</code>를 명시해야 한다.</li>
+</ol>
+<p>registry 이름으로 설치할 때는 첫 설치도 맹목적이지 않다. registry 항목이 기대 서명자를 선언하면 첫 project 설치가 그 조건으로 서명 검증을 하기 때문이다. 이미 lock 항목이 있으면 lock 항목이 registry보다 우선한다. user 범위 설치는 lock file 검증을 하지 않으므로 registry의 provenance도 적용하지 않는다.</p>
+
+<h3>keyless와 key-pair</h3>
+<div class="tbl"><table>
+<tr><th>항목</th><th>keyless</th><th>key-pair</th></tr>
+<tr><td>증거</td><td>Fulcio 인증서와 Rekor 기록</td><td>분리된 서명만 있음</td></tr>
+<tr><td>알 수 있는 것</td><td>누가, 언제 서명했는지</td><td>고정한 public key로 확인되는지만</td></tr>
+<tr><td>첫 project 설치</td><td>추가 입력 없음</td><td><code>--public-key cosign.pub</code> 필요</td></tr>
+<tr><td>lock 기록</td><td><code>signerIdentity</code>, <code>certIssuer</code> 등</td><td><code>publicKey</code> (DER SPKI)</td></tr>
+<tr><td>registry provenance</td><td>적용 가능</td><td>적용 불가</td></tr>
+</table></div>
+<p>아키텍처 문서는 key-pair 서명을 더 낮은 보증 단계로 본다. key-pair 서명으로는 서명자와 서명 시각을 알 수 없고, 개인 키가 유출되면 project마다 새 key로 신뢰 기준을 다시 잡아야 한다(source <code>docs/arch/12-skills-system.md</code>). public key는 artifact에서 얻을 수 없어서 게시자가 별도 경로로 배포해야 한다.</p>
+
+<h3>서명 없는 skill과 lock file 검토</h3>
+<ul>
+  <li>서명 없는 skill을 project 범위로 설치하려면 <code>--allow-unsigned</code>가 필요하다. ToolHive는 이 예외를 <code>unsigned: true</code>로 lock file에 기록하고 이후 sync에서는 다시 묻지 않는다.</li>
+  <li><code>--allow-unsigned</code>는 서명이 아예 없는 경우에만 통하고, 서명이 깨졌거나 key가 틀린 경우는 통과하지 않는다.</li>
+  <li>lock file은 git 저장소에 커밋하는 정책 문서라서 git 저장소에 쓰기 권한이 있는 누구에게나 열려 있다. <code>provenance</code>를 <code>unsigned: true</code>로 바꾸는 diff는 신뢰 수준을 낮추는데, sync는 그 값을 그대로 따른다.</li>
+</ul>
+<p>리뷰어가 특히 볼 필드는 <code>provenance</code>, <code>publicKey</code>, <code>unsigned</code>, <code>digest</code>, <code>resolvedReference</code>이고, 이 필드의 변경은 skill 본문 변경만큼 신중하게 봐야 한다(source <code>docs/arch/12-skills-system.md</code>).</p>
+
+<h2 id="s8">8. sync와 upgrade</h2>
+<h3>sync: 기록대로 복원</h3>
+<p><code>thv skill sync</code>는 설치 상태를 lock file에 맞추는 명령으로, 소스를 다시 해석하지 않고 고정한 digest로 설치한다(source <code>docs/arch/12-skills-system.md</code>, Sync).</p>
+<div class="tbl"><table>
+<tr><th>lock file과 설치 상태</th><th>결과</th></tr>
+<tr><td>digest와 contentDigest가 모두 같음</td><td>최신으로 보고</td></tr>
+<tr><td>DB 기록은 있으나 digest나 contentDigest가 다름</td><td>drift. 고정 참조로 다시 설치 (<code>--check</code>는 보고만)</td></tr>
+<tr><td>lock 항목은 있으나 DB 기록이 없음</td><td>missing. 고정 참조로 새로 설치</td></tr>
+<tr><td>설치돼 있고 lock 관리 대상이나 lock 항목이 없음</td><td>보고 (<code>--prune</code>이면 삭제)</td></tr>
+<tr><td>설치돼 있고 lock 관리 대상이 아님</td><td>보고 (<code>--adopt</code>이면 lock 항목 생성)</td></tr>
+</table></div>
+<p>sync는 저장해 둔 서명 bundle을 내장 trust root로 오프라인 재검증한다. 기본 대상이 설치된 모든 skill 지원 클라이언트라서 CI에서는 <code>--clients</code>로 대상을 좁히는 편이 안전하다. 새 버전의 thv가 클라이언트를 더 지원하면 그 클라이언트가 drift로 잡힐 가능성이 있기 때문이다(docs <code>guides-cli/skills-management</code>).</p>
+<pre><code># CI 검사: drift가 있으면 종료 코드 2
+thv skill sync --project-root . --clients claude-code --check
+
+# 새 장비에서 복원
+thv skill sync --project-root . --yes</code></pre>
+
+<h3>upgrade: 새 내용으로 다시 고정</h3>
+<p><code>thv skill upgrade</code>는 각 항목의 <code>source</code>를 install과 같은 순서로 다시 해석하고, digest가 바뀌었으면 새 내용을 설치한 뒤 lock을 갱신한다(source <code>pkg/skills/skillsvc/upgrade.go</code>).</p>
+<div class="tbl"><table>
+<tr><th>flag</th><th>뜻</th></tr>
+<tr><td><code>--preview</code></td><td>바뀔 내용을 보고만 한다. OCI는 비교하려고 artifact를 받는다</td></tr>
+<tr><td><code>--fail-on-changes</code></td><td>바뀔 내용이 있으면 실패한다. CI 최신성 검사용이다</td></tr>
+<tr><td><code>--allow-ref-change</code></td><td>artifact가 다른 경로, 조직, 이미지 저장소로 옮겨 가도 진행한다</td></tr>
+<tr><td><code>--allow-signer-change</code></td><td>서명자가 바뀌어도 진행하고 새 서명자를 기록한다</td></tr>
+<tr><td><code>--public-key</code></td><td><code>--allow-signer-change</code>와 함께 새 key로 신뢰 기준을 바꾼다</td></tr>
+</table></div>
+<p>같은 이미지 저장소 경로 안의 tag 변경은 <code>--allow-ref-change</code> 없이 진행하고, 더 오래된 tag로 가는 경우도 같다. 전체 git commit hash로 고정한 항목은 upgrade 대상이 아니다. OCI digest로 고정한 항목은 내용이 그대로여도 서명이 따로 바뀔 가능성이 있는데, 이 경우 upgrade는 내용 대신 신뢰 기준만 바꾼다. 게시자가 key를 바꿨을 때 쓰는 기능이다(docs <code>guides-cli/skills-management</code>).</p>
+<p>upgrade는 서명 없는 후보를 서명자 변경이 아니라 실패(<code>unsigned-rejected</code>)로 처리하며, 서명 없는 후보를 허용하는 flag도 upgrade에는 없다.</p>
+
+<h3>확인 질문과 종료 코드</h3>
+<p>skill 내용은 AI가 따르는 지시문이라서 sync와 upgrade는 실제로 설치하기 전에 확인을 묻고, 비대화형 환경에서 <code>--yes</code>가 없으면 CLI가 실행을 거부한다. ToolHive는 확인 문구에 넣는 이름에서 제어 문자도 지우는데, 악성 이름이 terminal 화면을 바꾸지 못하게 하는 장치다(source <code>docs/arch/12-skills-system.md</code>, CLI Confirmation).</p>
+<div class="tbl"><table>
+<tr><th>종료 코드</th><th>뜻</th></tr>
+<tr><td>0</td><td>성공</td></tr>
+<tr><td>1</td><td>분류되지 않은 오류</td></tr>
+<tr><td>2</td><td>검사 실패. <code>sync --check</code>가 drift를 찾았거나 <code>upgrade --fail-on-changes</code>가 변경을 찾음</td></tr>
+<tr><td>3</td><td>일부 실패</td></tr>
+<tr><td>4</td><td>정책 거부. 비대화형 확인 거부나 <code>--allow-ref-change</code> 없는 경로 변경</td></tr>
+</table></div>
+<p>출처는 <code>cmd/thv/app/exitcode.go:15-25</code>다.</p>
+
+<h2 id="s9">9. skill의 보안 장치</h2>
+<p>skill 시스템은 여러 층에서 방어한다. 출처는 <code>docs/arch/12-skills-system.md</code>의 Security Model과 <code>pkg/skills/installer.go:16-33</code>다.</p>
+<div class="tbl"><table>
+<tr><th>층</th><th>장치</th></tr>
+<tr><td>압축 해제</td><td>전체 500MB, 파일당 100MB, 파일 1000개 제한. symlink와 hardlink가 있으면 거부한다. <code>..</code>와 절대 경로를 거부한다</td></tr>
+<tr><td>파일 권한</td><td>setuid, setgid, sticky bit를 지우고 최대 0644로 맞춘다. 디렉터리는 0750이다</td></tr>
+<tr><td>쓰기 전 검사</td><td>대상 경로의 상위 디렉터리에 symlink가 있는지 확인한다</td></tr>
+<tr><td>삭제 보호</td><td>파일 시스템 root, home 디렉터리, 깊이 4 미만 경로는 지우지 않는다</td></tr>
+<tr><td>공급망</td><td>OCI artifact의 skill 이름이 이미지 저장소 경로 끝과 같아야 한다. git 인증 정보는 host별로만 보낸다</td></tr>
+<tr><td>입력 확인</td><td>이름 규칙, frontmatter 64KB, 의존 100개, git ref의 shell 특수 문자 거부</td></tr>
+<tr><td>서명</td><td>push는 기본으로 서명한다. project 범위 설치는 서명을 검증한다</td></tr>
+</table></div>
+<p>v0.56.0부터 <code>SKILL.md</code> 파서와 plugin manifest 파서에는 Go fuzz 테스트가 있어서, 임의 입력에 파서가 panic하지 않는지 확인한다(source <code>pkg/skills/parser_fuzz_test.go:8-9</code>, <code>pkg/plugins/parser_fuzz_test.go:8-10</code>). 입력 확인 층의 제한값은 바뀌지 않았다.</p>
+<div class="box warn">
+<p>user 범위 설치는 서명을 검증하지 않는다(docs <code>guides-cli/skills-management</code>). skill은 AI가 따르는 지시문이고 <code>scripts/</code>에 실행 코드가 들어 있을 가능성도 있으므로, 조직에서 배포 통제가 필요하면 project 범위와 lock file을 써야 한다.</p>
+</div>
+
+<h2 id="s10">10. AI plugin의 구성과 수명 주기</h2>
+<h3>manifest와 구성 요소</h3>
+<p>plugin은 <code>.claude-plugin/plugin.json</code>이 있는 디렉터리다. manifest에는 이름, 버전, 설명, 작성자, 라이선스, keyword를 적고, 이름은 kebab-case로 쓴다(docs <code>guides-cli/ai-plugins</code>).</p>
+<pre><code>{
+  "name": "my-plugin",
+  "version": "1.0.0",
+  "description": "What this plugin does and when to use it.",
+  "license": "Apache-2.0",
+  "keywords": ["review", "python"],
+  "commands": ["./commands/review.md"],
+  "agents": ["./agents/reviewer.md"],
+  "skills": ["./skills/code-review"],
+  "hooks": ["./hooks/post-tool-use.js"]
+}</code></pre>
+<ul>
+  <li>구성 요소 경로는 <code>./</code>로 시작해야 하고, <code>..</code>는 거부한다.</li>
+  <li>구성 요소는 종류마다 100개까지이고 manifest는 64KB까지다(source <code>pkg/plugins/parser.go:21-30</code>).</li>
+  <li>plugin 안의 skill에도 skill 검증 규칙을 다시 적용한다(source <code>pkg/plugins/validator.go:76-79</code>).</li>
+</ul>
+<p>build는 구성 요소 수를 OCI config에 기록한다. 종류는 <code>commands</code>, <code>agents</code>, <code>skills</code>, <code>hooks</code>, <code>mcpServers</code>, <code>lspServers</code>다(source <code>pkg/plugins/adapter.go:15-26</code>).</p>
+
+<h3>클라이언트별 materialize</h3>
+<p>plugin을 받는 클라이언트는 Claude Code와 Codex 두 개이고, 클라이언트마다 adapter가 경로와 등록 방법을 맡는다(source <code>docs/arch/14-plugins-system.md</code>).</p>
+<div class="tbl"><table>
+<tr><th>클라이언트</th><th>user 범위 경로</th><th>등록</th><th>adapter가 지원한다고 보고하는 구성 요소</th></tr>
+<tr><td>Claude Code</td><td><code>~/.claude/plugins/&lt;이름&gt;/</code></td><td>공유 <code>marketplace.json</code>과 <code>settings.json</code>의 <code>enabledPlugins</code>, <code>extraKnownMarketplaces.toolhive</code>를 ToolHive가 고친다</td><td>commands, agents, skills, hooks</td></tr>
+<tr><td>Codex</td><td><code>~/.agents/plugins/toolhive/&lt;이름&gt;/</code></td><td><code>.agents/plugins/marketplace.json</code>만 고친다. 사용자가 <code>codex plugin install &lt;이름&gt;@toolhive</code>를 직접 실행해야 한다</td><td>skills, mcpServers, hooks</td></tr>
+</table></div>
+<p>지원 구성 요소 목록의 출처는 <code>pkg/plugins/adapters/claudecode.go:53-58</code>와 <code>codex.go:52-56</code>다. 이 목록은 파일 필터가 아니라서 adapter는 plugin tree 전체를 풀고, <code>thv ai-plugin info</code>는 목록 밖의 구성 요소를 "materialize되지 않은 구성 요소"로 보고만 한다.</p>
+<p>Codex adapter는 <code>codex</code> 실행 파일을 호출하지 않고 <code>~/.codex/config.toml</code>도 고치지 않는다. 소스 주석은 사용자의 공유 설정을 건드리는 위험이 이득보다 크다고 적는다(source <code>pkg/plugins/adapters/codex.go:21-35</code>).</p>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 320" width="760" height="320" role="img" aria-label="plugin 수명 주기. build, push, install, materialize와 lock file.">
+    <defs><marker id="m09c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="d-box" x="16" y="30" width="150" height="60" rx="10"/>
+    <text x="91" y="55" font-size="13.5" font-weight="600" text-anchor="middle">plugin 디렉터리</text>
+    <text x="91" y="75" font-size="11" class="d-m" text-anchor="middle">.claude-plugin/plugin.json</text>
+    <rect class="d-box" x="200" y="30" width="150" height="60" rx="10"/>
+    <text x="275" y="55" font-size="13.5" font-weight="600" text-anchor="middle">build</text>
+    <text x="275" y="75" font-size="11" class="d-m" text-anchor="middle">tree 전체를 tar.gz 1층</text>
+    <rect class="d-acc" x="384" y="30" width="170" height="60" rx="10"/>
+    <text x="469" y="55" font-size="13.5" font-weight="600" text-anchor="middle">push</text>
+    <text x="469" y="75" font-size="11" class="d-m" text-anchor="middle">digest로 올림, 서명, tag</text>
+    <rect class="d-box" x="588" y="30" width="156" height="60" rx="10"/>
+    <text x="666" y="55" font-size="13.5" font-weight="600" text-anchor="middle">install</text>
+    <text x="666" y="75" font-size="11" class="d-m" text-anchor="middle">git, OCI, 이름 순서</text>
+    <line class="d-line" x1="166" y1="60" x2="198" y2="60" marker-end="url(#m09c)"/>
+    <line class="d-line" x1="350" y1="60" x2="382" y2="60" marker-end="url(#m09c)"/>
+    <line class="d-line" x1="554" y1="60" x2="586" y2="60" marker-end="url(#m09c)"/>
+    <rect class="d-warn" x="16" y="140" width="250" height="60" rx="10"/>
+    <text x="141" y="164" font-size="13.5" font-weight="600" text-anchor="middle">toolhive.lock.yaml의 plugins:</text>
+    <text x="141" y="184" font-size="11" class="d-m" text-anchor="middle">digest, contentDigest, 신뢰 기준 고정</text>
+    <rect class="d-acc" x="500" y="140" width="244" height="60" rx="10"/>
+    <text x="622" y="164" font-size="13.5" font-weight="600" text-anchor="middle">materialize adapter</text>
+    <text x="622" y="184" font-size="11" class="d-m" text-anchor="middle">클라이언트별 경로와 등록 파일</text>
+    <line class="d-line" x1="666" y1="90" x2="666" y2="138" marker-end="url(#m09c)"/>
+    <line class="d-line" x1="600" y1="90" x2="230" y2="138" marker-end="url(#m09c)"/>
+    <text x="290" y="112" font-size="11" class="d-m">project 범위만</text>
+    <line class="d-line" x1="266" y1="170" x2="498" y2="170" marker-end="url(#m09c)"/>
+    <text x="382" y="162" font-size="11" class="d-m" text-anchor="middle">sync, upgrade</text>
+    <rect class="d-box" x="290" y="240" width="215" height="64" rx="10"/>
+    <text x="397" y="262" font-size="13.5" font-weight="600" text-anchor="middle">Claude Code</text>
+    <text x="397" y="280" font-size="11" class="d-m" text-anchor="middle">~/.claude/plugins/이름/</text>
+    <text x="397" y="296" font-size="11" class="d-m" text-anchor="middle">settings.json에 자동 등록</text>
+    <rect class="d-box" x="530" y="240" width="214" height="64" rx="10"/>
+    <text x="637" y="262" font-size="13.5" font-weight="600" text-anchor="middle">Codex</text>
+    <text x="637" y="280" font-size="11" class="d-m" text-anchor="middle">~/.agents/plugins/toolhive/이름/</text>
+    <text x="637" y="296" font-size="11" class="d-m" text-anchor="middle">codex plugin install은 사용자가</text>
+    <line class="d-line" x1="560" y1="200" x2="440" y2="238" marker-end="url(#m09c)"/>
+    <line class="d-line" x1="637" y1="200" x2="637" y2="238" marker-end="url(#m09c)"/>
+    <text x="16" y="236" font-size="11" class="d-m">MCP, LSP 서버 선언은</text>
+    <text x="16" y="252" font-size="11" class="d-m">ToolHive가 실행하지 않는다.</text>
+  </svg>
+  </div>
+  <figcaption>그림 2. plugin 수명 주기. install은 project 범위일 때 lock file에 기록하고, sync와 upgrade는 lock file을 기준으로 다시 materialize한다. 출처는 <code>docs/arch/14-plugins-system.md</code>다.</figcaption>
+</figure>
+
+<h3>수명 주기</h3>
+<p>사용자는 아래 명령으로 plugin을 다룬다(source <code>docs/cli/thv_ai-plugin.md</code>).</p>
+<div class="tbl"><table>
+<tr><th>단계</th><th>명령</th><th>동작</th></tr>
+<tr><td>확인</td><td><code>thv ai-plugin validate ./my-plugin</code></td><td>manifest와 디렉터리 구조를 확인한다</td></tr>
+<tr><td>build</td><td><code>thv ai-plugin build ./my-plugin --tag ...</code></td><td>tree 전체를 tar.gz 층 하나로 묶어 로컬 OCI store에 둔다</td></tr>
+<tr><td>push</td><td><code>thv ai-plugin push ghcr.io/org/plugins/my-plugin:v1.0.0</code></td><td>기본으로 keyless 서명한다</td></tr>
+<tr><td>install</td><td><code>thv ai-plugin install my-plugin --clients claude-code</code></td><td>소스를 해석하고 각 클라이언트에 materialize한다</td></tr>
+<tr><td>조회</td><td><code>thv ai-plugin list</code>, <code>info</code></td><td>설치 기록, 그룹, 신뢰 상태를 보여 준다</td></tr>
+<tr><td>삭제</td><td><code>thv ai-plugin uninstall my-plugin</code></td><td>클라이언트 등록을 되돌리고 기록을 지운다</td></tr>
+<tr><td>복원, 갱신</td><td><code>thv ai-plugin sync</code>, <code>upgrade</code></td><td>lock file 기준으로 복원하거나 다시 고정한다</td></tr>
+</table></div>
+<p>이름으로 설치하면 ToolHive는 로컬 OCI store를 먼저 보고 그다음 registry를 검색한다. 검색 결과에서는 대소문자를 무시한 정확한 이름 일치만 남기는데, 일치가 0개이면 not found이고 2개 이상이면 거부한다. 첫 번째 검색 결과를 골라 설치하지는 않는다(source <code>docs/arch/14-plugins-system.md</code>, Discovery).</p>
+<p><code>--clients</code>를 주지 않으면 감지된 plugin 지원 클라이언트 전부가 대상이다(source <code>pkg/plugins/pluginsvc/install_extraction.go:585-609</code>). CLI 안내 문서의 "처음 찾은 클라이언트"라는 표현은 코드와 다르고, 2026-11-02에 갱신된 문서도 같다.</p>
+<p>설치 중 뒤 단계가 실패하면 ToolHive는 이전 파일, 클라이언트 등록, DB, 그룹 상태를 되돌린다. 같은 digest로 다시 설치하면 새로 요청한 클라이언트만 추가한다.</p>
+
+<h2 id="s11">11. plugin의 lock, 보안, skill과의 차이</h2>
+<h3>skill과 공유하는 lock file과 신뢰 모델</h3>
+<p>plugin은 skill과 같은 <code>toolhive.lock.yaml</code>을 쓰고 <code>plugins:</code> key 아래에 기록한다(source <code>pkg/skills/lockfile/lockfile.go:157-166</code>). 신뢰 규칙도 같아서 project 범위 설치는 서명을 검증하고 TOFU로 신뢰 기준을 기록한다. key-pair 서명은 첫 설치에 <code>--public-key</code>가 필요하고, 서명 없는 plugin은 <code>--allow-unsigned</code>가 필요하다.</p>
+<p>project 범위의 skill과 plugin 작업은 같은 transaction lock을 쓰며, lock 디렉터리 이름은 옛 ToolHive와 맞추려고 <code>skills-project-locks</code>를 그대로 쓴다(source <code>pkg/projecttxn/transaction.go:25</code>).</p>
+
+<h3>skill과 다른 점</h3>
+<div class="tbl"><table>
+<tr><th>항목</th><th>skill</th><th>plugin</th></tr>
+<tr><td>push 순서</td><td>tag로 먼저 올린 뒤 서명한다. 서명이 실패하면 서명 없는 artifact가 남는다</td><td>digest로 먼저 올리고 서명한 뒤 tag를 옮긴다. 요청한 tag가 서명 없는 내용을 가리키는 순간이 없다</td></tr>
+<tr><td>의존성</td><td>project 범위 설치에서 <code>toolhive.requires</code>를 재귀로 설치한다</td><td>의존 정보를 기록만 하고 설치하지 않는다. lock 항목은 모두 직접 설치다</td></tr>
+<tr><td>클라이언트</td><td>skill을 지원하는 여러 클라이언트</td><td>Claude Code, Codex</td></tr>
+<tr><td>클라이언트 등록</td><td>디렉터리에 쓰기만 한다</td><td>marketplace와 설정 파일을 고친다</td></tr>
+<tr><td>파일 권한 상한</td><td>0644</td><td>0755. hook script의 실행 권한을 남긴다</td></tr>
+<tr><td>UI</td><td>Skills 화면이 있다</td><td>v0.40.1 UI에는 화면이 없다</td></tr>
+</table></div>
+<p>push 순서의 출처는 skill이 <code>pkg/skills/skillsvc/build.go:139-154</code>, plugin이 <code>pkg/plugins/pluginsvc/build.go:166-212</code>다. 권한 상한의 출처는 <code>pkg/skills/installer.go:26-32</code>, <code>:121-161</code>이고, 의존성의 출처는 <code>docs/arch/14-plugins-system.md</code>의 Storage다.</p>
+
+<h3>plugin 쪽 보안 장치</h3>
+<ul>
+  <li>identity token과 key 서명 권한은 loopback이 아닌 HTTP로 보내지 않고, 자격 증명을 담은 요청은 redirect를 따라가지 않는다.</li>
+  <li>git clone 저장 공간은 100MB와 파일 10,000개로 제한한다(source <code>docs/arch/14-plugins-system.md</code>).</li>
+  <li>git 항목의 서명은 commit에 있어서 sync는 바뀌지 않은 git 항목을 오프라인으로 다시 검증하지 않는다. 서명자 기록은 git 내용을 다시 해석할 때 확인한다.</li>
+  <li>plugin 이름은 경로를 만들기 전에 확인하므로 이름으로 user 범위나 project 범위 밖으로 나갈 수 없다.</li>
+  <li>Claude Code adapter는 uninstall 때 자기가 넣은 항목만 지우고, 공유 marketplace 등록은 마지막 ToolHive plugin이 빠질 때만 지운다.</li>
+</ul>
+<p>plugin이 선언한 MCP 서버는 ToolHive의 workload 관리, 격리, 인증 밖에 있어서, ToolHive가 관리하는 MCP 서버로 쓰려면 <code>thv run</code>이나 operator로 따로 띄워야 한다(<a href="02-run-model-proxy.html">02편</a>, <a href="07-kubernetes-operator.html">07편</a>).</p>
+
+<h2 id="sQ">12. 자가 점검 문제</h2>
+<p>먼저 답을 생각해 본 다음 펼쳐서 확인한다.</p>
+<details><summary>Q1. skill과 MCP 서버의 가장 큰 차이는 무엇인가?</summary>
+<p>MCP 서버는 프로세스로 실행되고 tool과 resource를 제공한다. skill은 실행되지 않는 Markdown 지시문이고, AI 클라이언트가 prompt 시점에 읽는다. 두 시스템은 registry, 그룹, OCI 배포를 공유하지만 수명 주기는 따로다.</p></details>
+<details><summary>Q2. <code>thv skill install code-review</code>를 실행했더니 연결 오류가 났다. 가장 먼저 무엇을 확인해야 하는가?</summary>
+<p><code>thv serve</code>로 API server가 떠 있는지 확인해야 한다. <code>thv skill</code>은 로컬에서도 API server를 HTTP로 호출하기 때문이다. 데스크톱 앱이 실행 중이면 앱이 API server를 제공한다.</p></details>
+<details><summary>Q3. <code>--clients</code> 없이 skill을 설치했다. 어떤 클라이언트에 설치되는가?</summary>
+<p>v0.63.0 코드 기준으로 시스템에서 감지된 모든 skill 지원 클라이언트에 설치되고, 감지된 클라이언트가 하나도 없으면 오류가 난다. 한 클라이언트라도 실패하면 그 설치 작업 전체를 되돌린다.</p></details>
+<details><summary>Q4. 같은 skill을 user 범위로 설치했을 때와 project 범위로 설치했을 때, 서명 처리는 어떻게 다른가?</summary>
+<p>user 범위 설치는 서명을 검증하지 않고 lock file에도 기록하지 않는다. project 범위 설치는 서명을 검증하고 서명자를 lock file에 신뢰 기준으로 기록한다. 서명이 없으면 <code>--allow-unsigned</code>가 있어야 설치한다.</p></details>
+<details><summary>Q5. 팀원이 PR에서 lock 항목의 <code>provenance</code> 블록을 지우고 <code>unsigned: true</code>를 넣었다. sync는 어떻게 동작하는가? 리뷰어는 무엇을 해야 하는가?</summary>
+<p>sync는 lock file을 정책으로 따르기 때문에 그 항목을 서명 없는 예외로 다룬다. 이 변경은 신뢰 수준을 낮추므로 리뷰어는 이 diff를 skill 본문 변경만큼 신중하게 검토하고 이유를 확인해야 한다.</p></details>
+<details><summary>Q6. key-pair로 서명한 skill을 처음 project 범위로 설치한다. 무엇이 더 필요하고, 왜 필요한가?</summary>
+<p><code>--public-key cosign.pub</code>가 필요하다. key-pair 서명에는 인증서가 없고 public key도 artifact나 서명 bundle에서 얻을 수 없어서, 사용자가 key를 직접 주어야 한다. ToolHive는 그 key로 서명을 검증하고 lock 항목에 <code>publicKey</code>로 고정하며, 이후 sync와 upgrade는 고정한 key를 다시 쓴다.</p></details>
+<details><summary>Q7. CI에서 <code>thv skill sync --check</code>가 종료 코드 2로 끝났다. 무슨 뜻인가?</summary>
+<p>설치 상태가 lock file과 다르다는 뜻으로, drift이거나 missing 항목이 있다. <code>--check</code>는 아무것도 쓰지 않고 보고만 한다. 기본 대상은 설치된 모든 클라이언트라서 새로 지원된 클라이언트가 원인일 가능성도 있다. CI에서는 <code>--clients</code>로 대상을 고정하는 편이 낫다.</p></details>
+<details><summary>Q8. push 중 서명 단계가 실패했다. skill과 plugin 중 어느 쪽에서 서명 없는 내용이 tag로 노출될 가능성이 있는가?</summary>
+<p>skill push다. skill은 tag로 먼저 올리고 그다음 서명하지만, plugin은 digest로 먼저 올리고 서명한 뒤에 tag를 옮긴다. 그래서 plugin의 요청 tag는 서명 없는 내용을 가리키지 않는다.</p></details>
+<details><summary>Q9. Codex에 plugin을 설치했는데 Codex에서 보이지 않는다. ToolHive가 하지 않는 단계는 무엇인가?</summary>
+<p>ToolHive는 plugin 파일을 <code>~/.agents/plugins/toolhive/&lt;이름&gt;/</code>에 풀고 <code>marketplace.json</code>을 고치는 데까지만 하고 Codex 쪽 설치는 하지 않는다. 사용자가 <code>codex plugin install &lt;이름&gt;@toolhive</code>를 직접 실행해야 한다.</p></details>
+<details><summary>Q10. plugin이 <code>mcpServers</code>에 MCP 서버를 선언했다. ToolHive가 그 서버를 격리된 컨테이너로 실행하는가?</summary>
+<p>실행하지 않는다. ToolHive는 plugin이 선언한 MCP 서버와 LSP 서버를 workload로 관리하지 않고, 그 선언을 쓸지는 AI 클라이언트가 정한다. ToolHive의 격리와 인증을 적용하려면 MCP 서버를 따로 workload로 띄워야 한다.</p></details>
+
+<h2 id="sR">13. 참고 자료</h2>
+<ul>
+  <li>공식 문서 concepts/skills, guides-cli/skills-management, guides-cli/ai-plugins, reference/client-compatibility (2026-11-02 갱신본, 2026-11-07에 다시 읽음)</li>
+  <li>공식 문서 guides-ui/skills, guides-ui/skills-browse-install, guides-ui/skills-build, guides-ui/skills-manage, guides-registry/skills, guides-registry/plugins (2026-10-13에 읽음, 이번 갱신에서는 다시 읽지 않음)</li>
+  <li>toolhive v0.63.0 <code>docs/arch/12-skills-system.md</code>, <code>docs/arch/14-plugins-system.md</code>, <code>docs/cli/thv_skill*.md</code>, <code>docs/cli/thv_ai-plugin*.md</code>. v0.53.0과 내용이 같다.</li>
+  <li>toolhive v0.63.0 <code>pkg/skills/</code>, <code>pkg/skills/skillsvc/</code>, <code>pkg/skills/gitresolver/</code>, <code>pkg/skills/lockfile/</code></li>
+  <li>toolhive v0.63.0 <code>pkg/plugins/</code>, <code>pkg/plugins/pluginsvc/</code>, <code>pkg/plugins/adapters/</code></li>
+  <li>toolhive v0.63.0 <code>pkg/api/server.go</code>, <code>pkg/client/config.go</code>, <code>pkg/client/skills.go</code>, <code>pkg/client/discovery.go</code>, <code>pkg/groups/skills.go</code>, <code>pkg/storage/sqlite/</code>, <code>pkg/projecttxn/transaction.go</code>, <code>cmd/thv/app/exitcode.go</code>, <code>go.mod</code></li>
+  <li>toolhive 릴리스 노트 v0.54.0부터 v0.63.0까지. 이 문서와 관련된 항목은 다음 넷이다.
+    <ul>
+      <li>Pi 클라이언트 추가 (#6819, v0.54.0)</li>
+      <li><code>PI_CODING_AGENT_DIR</code> 처리 (#6839, v0.55.0)</li>
+      <li>파서 fuzz 테스트 추가 (#6877, v0.56.0)</li>
+      <li>YAML 라이브러리 교체 (#6919, #6920, v0.57.0)</li>
+    </ul>
+  </li>
+  <li>toolhive-studio v0.40.1 <code>renderer/src/routes/</code>. 2026-10-13에 확인했고 이번 갱신에서는 다시 보지 않았다.</li>
+</ul>
+<div class="box warn" id="unchecked">
+  <p><b>대조한 내용은 다음과 같다.</b> 기본 대상 클라이언트, 소스 해석 순서, 그룹 기본값은 skillsvc와 pluginsvc 코드와 대조했고, 추출 제한, 이름 규칙, git 인증, SSRF 검사는 해당 Go 파일과 대조했다. push 순서, lock file 필드, 종료 코드, adapter 지원 목록도 대조했다. 모든 줄 번호는 2026-11-07에 v0.63.0 트리에서 다시 확인했다. 두 버전 사이에 <code>pkg/skills</code>와 <code>pkg/plugins</code>의 변경은 YAML import 세 줄, 테스트 파일, 새 fuzz 테스트 두 파일 세 가지다. skill과 plugin의 설계 문서와 CLI 문서는 바뀌지 않았다. 공식 문서 네 페이지는 2026-11-07에 다시 읽었고, Pi의 경로와 <code>PI_CODING_AGENT_DIR</code> 처리는 <code>pkg/client</code> 코드와 공식 문서 reference/client-compatibility로 대조했다.</p>
+  <p><b>문서와 코드가 다른 곳은 아래와 같다.</b> 이 문서는 코드를 따랐고, 세 항목 모두 2026-11-02 갱신본에서도 그대로다.</p>
+  <ul>
+    <li>CLI 안내 문서 두 곳(skill, plugin)은 <code>--clients</code>가 없으면 처음 찾은 클라이언트 하나에 설치한다고 적지만, 코드는 감지된 지원 클라이언트 전부에 설치한다.</li>
+    <li>CLI 안내 문서는 그룹의 skill이 그룹에 등록된 클라이언트에 자동 설치된다고 적는데, 그 경로는 v0.63.0 코드에서도 찾지 못했다.</li>
+    <li>공식 문서 concepts/skills의 페이지 설명문은 skill을 "MCP 서버 설정 묶음"이라고 적지만, 같은 페이지 본문과 코드는 skill을 지시문 묶음으로 다룬다.</li>
+  </ul>
+  <p><b>대조하지 못한 내용은 다음과 같다.</b> OCI 패키징, 로컬 OCI store 경로, Sigstore 서명 검증의 세부는 이 코드가 toolhive-core 패키지 안에 있어서 확인하지 못했고, 이 부분은 아키텍처 문서를 따랐다. TOFU, catalog provenance, git 서명의 provisional 처리도 아키텍처 문서만 따랐으며, plugin push의 자격 증명 전송 제한과 plugin git clone 제한도 같다. 7장 lock file 예의 값은 설명용으로 만든 값이다. toolhive-studio의 plugin 화면 유무와 guides-ui 문서는 이번 갱신에서 다시 확인하지 않았으므로, 6장과 11장의 UI 설명은 2026-10-13 확인 결과다.</p>
+  <p><code>thv llm config</code>는 OIDC로 보호된 LLM gateway의 연결 설정이다. <code>pkg/llm</code>과 <code>cmd/thv/app/llm.go</code>에서 skill이나 plugin을 참조하는 코드를 찾지 못해서 이 문서에서는 다루지 않았다.</p>
+</div>
+<p>다음 학습은 <a href="10-platform-comparison.html">10편 "우리 MCP 플랫폼과 비교"</a>다.</p>
+
+<nav class="pager">
+<a class="prev" href="08-vmcp.html"><span class="k">이전 글</span><span class="t">vMCP와 optimizer</span></a>
+<a class="next" href="10-platform-comparison.html"><span class="k">다음 글</span><span class="t">우리 MCP 플랫폼과 비교</span></a>
+</nav>
+
+<footer>2026-10-14 작성, 2026-11-07 갱신. 기준: ToolHive v0.63.0.</footer>
+</div>
+</body>
+</html>

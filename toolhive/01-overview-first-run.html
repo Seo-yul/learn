@@ -1,0 +1,741 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ToolHive 개요와 첫 실행</title>
+<link rel="stylesheet" href="../assets/learn.css">
+</head>
+<body>
+<div class="masthead"><div class="bar"><a class="brand" href="../index.html">learn</a><span class="crumb"><a href="index.html">ToolHive</a></span></div></div>
+<div class="wrap">
+
+<header>
+  <h1>ToolHive 개요와 첫 실행</h1>
+  <p class="kicker">ToolHive 학습 01편 · 2026-10-14 작성 · 2026-11-07 갱신</p>
+  <p>이 문서는 ToolHive가 무엇이고 어떤 문제를 푸는지 설명하고, 구성 요소와 배포 모드를 지도로 보여 준다. 마지막에는 MCP 서버 하나를 실제 명령으로 실행하고 지우는 과정을 따라간다.</p>
+  <p>기준 버전은 ToolHive v0.63.0(2026-11-06)이다. 처음에는 v0.53.0 기준으로 썼고, 2026-11-07에 v0.63.0 기준으로 갱신했다. 공식 문서는 2026-10-13 사본을 읽었고, 설치 문서와 CLI quickstart는 2026-11-07에 사이트에서 다시 읽었다. ToolHive는 자주 바뀌므로 실제로 쓰기 전에 공식 문서를 다시 확인해야 한다.</p>
+</header>
+
+<div class="box key">
+  <span class="label">한 문장 요약</span>
+  <p>ToolHive는 MCP 서버를 컨테이너 안에서 실행하고, 서버마다 proxy를 앞에 두는 플랫폼이다. 로컬에서는 thv CLI나 ToolHive UI로 쓰고, 클러스터에서는 Kubernetes operator로 쓴다. 8장에서는 서버 하나를 thv 명령으로 실행하고 지우는 일곱 단계를 따라간다.</p>
+</div>
+
+<div class="box key">
+  <span class="label">v0.63.0 갱신 요약</span>
+  <ul>
+    <li>Homebrew tap이 thv를 cask로 배포하게 됐지만 설치 명령은 그대로다. 7장에 적었다.</li>
+    <li>ToolHive가 설정을 고치는 MCP 클라이언트 목록에 Pi coding agent가 들어가서 2장의 표에 넣었다.</li>
+    <li><code>thv client connector</code> 명령이 생겼는데, Claude Desktop에 원격 MCP 서버를 proxy 없이 적는 명령이다. 용어집과 2장에 적었다.</li>
+    <li><code>thv llm setup</code>이 Pi와 Codex도 설정하고, <code>--scopes</code> 플래그가 생겼다. 3장에 적었다.</li>
+    <li>proxy가 RunConfig를 다시 저장할 때 상태 파일을 다시 읽고 secret 값을 지운다. 2장에 적었다.</li>
+    <li>Go 버전, 내장 registry 버전, UI와 registry server 버전을 갱신해서 7장과 10장에 적었다.</li>
+    <li>인용한 행 번호를 v0.63.0에 맞췄다. 인용한 줄의 동작은 바뀌지 않았고, 아키텍처 문서 네 편도 그대로다.</li>
+  </ul>
+</div>
+
+<nav class="toc">
+  <b>목차</b>
+  <ol>
+    <li><a href="#s0">용어집</a></li>
+    <li><a href="#s1">MCP 한눈에 보기</a></li>
+    <li><a href="#s2">ToolHive가 푸는 문제</a></li>
+    <li><a href="#s3">구성 요소 지도</a></li>
+    <li><a href="#s4">배포 모드</a></li>
+    <li><a href="#s5">핵심 명사와 동사</a></li>
+    <li><a href="#s6">MCP 서버를 실행하는 다섯 가지 방법</a></li>
+    <li><a href="#s7">설치</a></li>
+    <li><a href="#s8">첫 실행: CLI</a></li>
+    <li><a href="#s9">첫 실행: UI</a></li>
+    <li><a href="#s10">프로젝트 정보</a></li>
+    <li><a href="#s11">학습 지도</a></li>
+    <li><a href="#sQ">자가 점검 문제</a></li>
+    <li><a href="#sR">참고 자료</a></li>
+  </ol>
+</nav>
+
+<h2 id="s0">0. 용어집</h2>
+<p>이 문서에서는 아래 용어를 표에 적은 뜻으로만 쓴다.</p>
+<div class="tbl"><table>
+<tr><th>용어</th><th>이 문서에서의 뜻</th></tr>
+<tr><td>MCP</td><td>Model Context Protocol. AI 앱이 외부 데이터와 tool에 연결할 때 쓰는 공개 표준이다.</td></tr>
+<tr><td>MCP 서버</td><td>tool, resource, prompt를 MCP로 제공하는 프로그램이다.</td></tr>
+<tr><td>MCP 클라이언트</td><td>MCP 서버에 연결하는 앱이다. 예: Claude Code, Cursor, VS Code. MCP 명세의 host와 client를 합친 말이다.</td></tr>
+<tr><td>tool</td><td>MCP 서버가 제공하는 함수 하나다. 모델이 이름으로 호출한다.</td></tr>
+<tr><td>transport</td><td>MCP 메시지를 나르는 방식이다. stdio, SSE, streamable HTTP가 있다.</td></tr>
+<tr><td>session</td><td>MCP 클라이언트와 MCP 서버 사이의 연결 하나와 그 상태다.</td></tr>
+<tr><td>workload</td><td>ToolHive가 관리하는 MCP 서버 하나다. ToolHive가 실행하는 컨테이너이거나, ToolHive가 proxy를 앞에 두는 원격 서버다.</td></tr>
+<tr><td>proxy</td><td>ToolHive가 MCP 서버마다 앞에 두는 프로세스다. Kubernetes에서는 thv-proxyrunner가 이 일을 한다.</td></tr>
+<tr><td>egress proxy</td><td>네트워크 격리에서 컨테이너가 나가는 연결을 거르는 별도 구성 요소다. 위의 proxy와 다르다. 03편에서 다룬다.</td></tr>
+<tr><td>middleware</td><td>proxy가 요청마다 차례로 적용하는 처리 단계다. 인증, 인가, 감사 기록이 예다.</td></tr>
+<tr><td>컨테이너 런타임</td><td>Docker, Podman, Colima처럼 컨테이너를 실행하는 프로그램이다.</td></tr>
+<tr><td><code>Runtime</code> 인터페이스</td><td>ToolHive 코드 안의 추상화다. 컨테이너 런타임과 Kubernetes를 같은 함수로 다룬다.</td></tr>
+<tr><td>이미지, 이미지 저장소</td><td>컨테이너 이미지와 ghcr.io 같은 컨테이너 이미지 저장소다.</td></tr>
+<tr><td>registry</td><td>ToolHive가 읽는 MCP 서버 목록이다. skill 항목과 plugin 항목도 담는다. 이미지 저장소와 다르다.</td></tr>
+<tr><td>내장 registry</td><td>ToolHive 바이너리에 들어 있는 기본 registry다. Stacklok이 관리한다.</td></tr>
+<tr><td>registry server</td><td>registry를 API로 제공하는 별도 서버다. 제품 이름은 ToolHive Registry Server다.</td></tr>
+<tr><td>그룹</td><td>workload를 묶는 ToolHive 단위다. 지정하지 않으면 default 그룹에 들어간다.</td></tr>
+<tr><td>secret provider</td><td>secret 값을 보관하는 곳이다. encrypted, 1password, environment가 있다.</td></tr>
+<tr><td>secret</td><td>ToolHive가 관리하는 비밀 값이다. API 키가 대표적이다. Kubernetes 리소스는 "Kubernetes Secret"으로 쓴다.</td></tr>
+<tr><td>클라이언트 설정</td><td>ToolHive가 고쳐 쓰는 MCP 클라이언트의 설정 파일이다.</td></tr>
+<tr><td>connector</td><td>Claude Desktop이 proxy 없이 직접 연결하는 원격 MCP 서버 항목이다. <code>thv client connector</code>로 적는다.</td></tr>
+<tr><td>RunConfig</td><td>workload 하나를 실행하는 데 필요한 값을 모은 JSON 형식이다.</td></tr>
+<tr><td>API 서버</td><td><code>thv serve</code>가 여는 서버다. workload, registry, 클라이언트, 그룹을 REST API로 제공한다. ToolHive UI가 이 서버를 쓴다.</td></tr>
+<tr><td>operator</td><td>Kubernetes operator인 thv-operator다. CRD를 읽고 Kubernetes 리소스를 만든다.</td></tr>
+<tr><td>CRD</td><td>Kubernetes에 새 리소스 종류를 추가하는 정의다. 예: MCPServer.</td></tr>
+<tr><td>reconcile</td><td>operator가 리소스의 원하는 상태와 실제 상태를 맞추는 동작이다.</td></tr>
+<tr><td>Deployment, StatefulSet, Service</td><td>Kubernetes 리소스 종류다. 영어 이름 그대로 쓴다.</td></tr>
+<tr><td>vMCP</td><td>Virtual MCP Server. 여러 MCP 서버를 endpoint 하나로 묶는 ToolHive의 MCP gateway다.</td></tr>
+<tr><td>backend</td><td>vMCP가 묶는 MCP 서버 하나다.</td></tr>
+<tr><td>endpoint</td><td>MCP 클라이언트가 접속하는 URL 하나다.</td></tr>
+<tr><td>skill</td><td>SKILL.md 하나로 된 지시 묶음이다. MCP 클라이언트에 설치한다. MCP 서버가 아니다.</td></tr>
+<tr><td>plugin</td><td>명령, agent, skill 등을 하나로 묶어 MCP 클라이언트에 설치하는 단위다. ToolHive 자체의 확장 기능이 아니다.</td></tr>
+<tr><td>배포 모드</td><td>ToolHive를 쓰는 세 방식이다. 로컬 CLI, 로컬 UI, Kubernetes가 있다.</td></tr>
+<tr><td>네트워크 격리</td><td>컨테이너가 나가는 연결을 허용 목록으로 거르는 기능이다.</td></tr>
+<tr><td>permission profile</td><td>컨테이너에 줄 파일 시스템 권한과 네트워크 권한을 적은 정책이다.</td></tr>
+<tr><td>LLM 토큰</td><td>LLM이 처리하는 텍스트 단위다.</td></tr>
+</table></div>
+
+<h2 id="s1">1. MCP 한눈에 보기</h2>
+<p>MCP는 AI 앱을 외부 데이터, tool, 작업 흐름에 연결하는 공개 표준이다(docs <code>concepts/mcp-primer</code>). AI 앱은 서비스마다 통합 코드를 따로 만드는 대신 MCP 하나로 파일, 데이터베이스, API에 접근한다.</p>
+<p>MCP 메시지는 JSON-RPC 2.0 형식이고, 상태가 있는 session 안에서 오간다. session이 시작되면 양쪽이 지원하는 기능을 서로 알린다.</p>
+<p>MCP 명세는 참여자를 셋으로 나눈다.</p>
+<ul>
+  <li><b>host</b>: AI 앱 자체다. Claude Desktop, Cursor, 직접 만든 agent가 여기에 든다.</li>
+  <li><b>client</b>: host 안의 커넥터로, 서버 하나와 1:1로 연결한다.</li>
+  <li><b>server</b>: 기능을 MCP로 제공하는 프로세스다. 로컬 프로세스일 수도 있고 원격 서비스일 수도 있다.</li>
+</ul>
+<p>이 문서에서는 host와 client를 합쳐 "MCP 클라이언트"라고 부르는데, ToolHive 문서도 Claude Code 같은 앱을 client라고 부른다(source <code>docs/arch/02-core-concepts.md</code> "Client").</p>
+<p>MCP 서버는 세 가지 기능을 제공한다.</p>
+<div class="tbl"><table>
+<tr><th>기능</th><th>뜻</th><th>예</th></tr>
+<tr><td>tool</td><td>모델이 호출하는 함수다. 입력과 출력의 형식은 JSON schema로 정한다.</td><td>코드베이스 검색, Jira 이슈 만들기</td></tr>
+<tr><td>resource</td><td>host나 모델이 읽는 데이터다.</td><td>파일, 데이터베이스 행, API 응답</td></tr>
+<tr><td>prompt</td><td>사용자가 골라서 쓰는 정형 작업이다.</td><td>"이 PR을 요약해 줘"</td></tr>
+</table></div>
+<p>transport는 메시지를 나르는 방식이고, 명세의 현행판은 표준 transport를 두 개 정한다.</p>
+<div class="tbl"><table>
+<tr><th>transport</th><th>동작</th><th>상태</th></tr>
+<tr><td>stdio</td><td>host가 서버를 하위 프로세스로 띄운다. 표준 입력과 표준 출력으로 줄 단위 JSON-RPC를 주고받는다.</td><td>현행 표준이다. 로컬 서버에 권장한다.</td></tr>
+<tr><td>streamable HTTP</td><td>서버가 독립된 HTTP 서비스로 돈다. endpoint 하나가 POST와 GET을 받는다.</td><td>현행 표준이다. 원격 서버에 쓴다.</td></tr>
+<tr><td>SSE</td><td>POST endpoint와 SSE endpoint를 따로 둔다. 2024-11-05판의 방식이다.</td><td>2025-03-26판에서 streamable HTTP로 바뀌었다. 지금은 deprecated다.</td></tr>
+</table></div>
+<p>ToolHive는 세 transport를 모두 지원하고(source <code>pkg/transport/types/transport.go:146</code>), 디버깅용 inspector transport도 따로 있다. stdio 서버 앞의 proxy가 HTTP 요청을 stdio로 바꾸는 방법은 02편에서 다룬다.</p>
+<p>HTTP transport에서는 MCP가 OAuth 2.1 기반의 인가 흐름을 정한다. stdio transport는 OAuth를 쓰지 않고, stdio 서버가 자격 증명을 환경 변수에서 읽는다(docs <code>concepts/mcp-primer</code>). 인증과 인가는 05편에서 다룬다.</p>
+
+<h2 id="s2">2. ToolHive가 푸는 문제</h2>
+<p>ToolHive는 MCP 서버를 실행하고 관리하는 오픈소스 플랫폼으로(docs <code>index</code>), Stacklok이 만들고 Apache 2.0 라이선스로 배포한다. 공식 문서는 MCP 서버를 쓸 때의 걸림돌이 주로 운영 쪽에 있다고 본다(docs <code>index</code> "Why ToolHive?").</p>
+<p>남이 만든 MCP 서버를 그대로 실행하면 아래 세 문제를 만나는데, ToolHive는 문제마다 답을 하나씩 둔다.</p>
+
+<h3>문제 1. 내 컴퓨터에서 도는 남의 코드</h3>
+<p>stdio 서버는 host가 하위 프로세스로 띄운다(docs <code>concepts/mcp-primer</code>). 하위 프로세스는 보통 사용자와 같은 권한으로 돌기 때문에, 서버 코드가 사용자 파일과 네트워크에 제한 없이 접근할 가능성이 있다.</p>
+<p>ToolHive는 서버마다 격리된 컨테이너를 쓴다. 공식 FAQ는 기본 권한이 최소라고 설명한다(docs <code>faq</code> "Is it safe to run MCP servers?"). 컨테이너의 mount와 네트워크 연결은 permission profile이 정하는데(source <code>docs/arch/02-core-concepts.md</code>), profile에는 읽기 mount, 쓰기 mount, 허용할 host와 port가 들어간다. <code>thv run</code>은 네트워크 격리를 기본으로 켜지만(source <code>cmd/thv/app/run_flags.go:302</code>), 격리가 켜져도 어떤 연결을 허용할지는 permission profile이 정한다. registry에 없는 이미지가 받는 기본 profile은 5장에 적었고, 자세한 내용은 03편에서 다룬다.</p>
+
+<h3>문제 2. 평문으로 남는 secret</h3>
+<p>MCP 서버는 API 키 같은 secret을 자주 요구한다(docs <code>guides-cli/secrets-management</code>). stdio 서버는 이 값을 환경 변수로 받는데, 값을 설정 파일에 그대로 적으면 평문이 파일에 남는다.</p>
+<p>ToolHive는 secret을 secret provider에 둔다. encrypted provider는 OS keyring에 둔 비밀번호로 secret 파일을 암호화하고, 1Password provider와 environment provider도 있다(docs <code>guides-cli/secrets-management</code>). 실행할 때는 secret을 환경 변수로 넘기기 때문에 설정 파일에는 평문 값이 남지 않는다(docs <code>faq</code>).</p>
+<p><code>thv run</code>은 secret을 처리하기 전에 RunConfig를 저장하는데, 상태 파일에 secret 값이 남지 않게 하려는 순서다(source <code>cmd/thv/app/run.go:254</code>). proxy가 나중에 RunConfig를 다시 저장할 때도 secret 값을 걸러 내며, 원격 서버 인증의 토큰 참조를 적을 때가 그 예다. 이때 proxy는 메모리의 실행 값을 그대로 쓰지 않고, 상태 파일을 다시 읽어 secret 값을 지운 뒤 저장한다(source <code>pkg/runner/runner.go:952</code>).</p>
+
+<h3>문제 3. 클라이언트마다 다른 설정 파일</h3>
+<p>MCP 클라이언트는 각자 자기 설정 파일에서 서버 목록을 읽는데, 파일 위치와 키 이름이 클라이언트마다 다르다. ToolHive 코드에 적힌 네 예는 아래와 같다.</p>
+<div class="tbl"><table>
+<tr><th>MCP 클라이언트</th><th>macOS의 설정 파일</th><th>서버 목록 키</th><th>근거</th></tr>
+<tr><td>VS Code</td><td><code>~/Library/Application Support/Code/User/mcp.json</code></td><td><code>servers</code></td><td><code>pkg/client/config.go:455</code></td></tr>
+<tr><td>Cursor</td><td><code>~/.cursor/mcp.json</code></td><td><code>mcpServers</code></td><td><code>pkg/client/config.go:493</code></td></tr>
+<tr><td>Claude Code</td><td><code>~/.claude.json</code></td><td><code>mcpServers</code></td><td><code>pkg/client/config.go:530</code></td></tr>
+<tr><td>Pi coding agent</td><td><code>~/.pi/agent/mcp.json</code></td><td><code>mcpServers</code></td><td><code>pkg/client/config.go:1055</code></td></tr>
+</table></div>
+<p>Pi는 v0.54.0에서 목록에 들어왔다. <code>PI_CODING_AGENT_DIR</code> 환경 변수가 있으면 ToolHive는 그 디렉터리의 <code>mcp.json</code>을 쓴다(source <code>pkg/client/config.go:1073</code>).</p>
+<p>사람이 직접 관리하면 서버를 바꿀 때마다 파일을 하나씩 고쳐야 한다. ToolHive는 사용자가 등록한 클라이언트의 클라이언트 설정을 대신 고쳐 주고, workload가 시작되면 proxy URL을 넣는다(source <code>pkg/runner/runner.go:694</code>). 이 부분은 04편에서 자세히 다룬다.</p>
+<p>다만 Claude Desktop의 클라이언트 설정에는 ToolHive가 workload를 넣지 않는다. 대신 v0.55.0부터 <code>thv client connector add</code>가 Claude Desktop에 원격 MCP 서버를 connector로 적는다. 이때는 ToolHive가 proxy를 두지 않고 Claude Desktop이 그 서버에 직접 로그인한다. 이 명령은 <code>thv llm setup --client claude-desktop</code>을 먼저 실행한 상태를 전제로 한다(source <code>cmd/thv/app/client_connector.go:22</code>).</p>
+
+<h3>ToolHive가 밝히는 제공 항목</h3>
+<p>ToolHive 아키텍처 문서는 ToolHive가 단순한 컨테이너 실행기가 아니라 다섯 가지를 제공하는 플랫폼이라고 설명한다(source <code>docs/arch/02-core-concepts.md</code> "Platform Philosophy").</p>
+<div class="tbl"><table>
+<tr><th>제공하는 것</th><th>이 시리즈에서 다루는 편</th></tr>
+<tr><td>middleware를 갖춘 proxy 기반</td><td>02편, 05편, 06편</td></tr>
+<tr><td>보안과 격리</td><td>03편</td></tr>
+<tr><td>설정 관리 (RunConfig)</td><td>02편</td></tr>
+<tr><td>registry로 서버 목록 공유</td><td>04편</td></tr>
+<tr><td>여러 서버의 집계와 조합</td><td>08편</td></tr>
+</table></div>
+
+<h2 id="s3">3. 구성 요소 지도</h2>
+<p>그림 1은 ToolHive의 구성 요소를 세 줄로 나눠 보여 준다. 맨 아래 줄은 MCP 클라이언트의 요청이 지나가는 경로이고, 가운데 줄은 그 경로를 만드는 실행 관리 도구다. 맨 위 줄은 무엇을 실행하고 설치할지 알려 주는 목록이다.</p>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 380" width="760" height="380" role="img" aria-label="ToolHive 구성 요소 지도. 목록, 실행 관리, 요청 경로의 세 줄로 나뉜다.">
+    <defs><marker id="m01a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+        <rect class="d-outer" x="10" y="10" width="650" height="82" rx="10"/>
+    <text class="d-m" x="24" y="28" font-size="12">목록과 설치 대상 (04편, 09편)</text>
+    <rect class="d-box" x="20" y="38" width="140" height="44" rx="8"/>
+    <text x="90" y="57" font-size="14" font-weight="600" text-anchor="middle">skill · plugin</text>
+    <text class="d-m" x="90" y="74" font-size="12" text-anchor="middle">09편</text>
+    <rect class="d-box" x="210" y="38" width="190" height="44" rx="8"/>
+    <text x="305" y="57" font-size="14" font-weight="600" text-anchor="middle">내장 registry</text>
+    <text class="d-m" x="305" y="74" font-size="12" text-anchor="middle">바이너리에 포함 · 04편</text>
+    <rect class="d-box" x="430" y="38" width="190" height="44" rx="8"/>
+    <text x="525" y="57" font-size="14" font-weight="600" text-anchor="middle">registry server</text>
+    <text class="d-m" x="525" y="74" font-size="12" text-anchor="middle">별도 서버 · 04편</text>
+        <line class="d-line" x1="305" y1="82" x2="305" y2="116" marker-end="url(#m01a)"/>
+    <text class="d-m" x="313" y="107" font-size="12">읽는다</text>
+        <rect class="d-outer" x="170" y="118" width="580" height="92" rx="10"/>
+    <text class="d-m" x="184" y="137" font-size="12">실행 관리: workload를 만들고 지운다</text>
+    <rect class="d-acc" x="184" y="146" width="120" height="50" rx="8"/>
+    <text x="244" y="168" font-size="14" font-weight="600" text-anchor="middle">thv CLI</text>
+    <text class="d-m" x="244" y="186" font-size="12" text-anchor="middle">01편</text>
+    <rect class="d-acc" x="322" y="146" width="120" height="50" rx="8"/>
+    <text x="382" y="168" font-size="14" font-weight="600" text-anchor="middle">ToolHive UI</text>
+    <text class="d-m" x="382" y="186" font-size="12" text-anchor="middle">데스크톱 앱</text>
+    <line class="d-line" x1="442" y1="171" x2="468" y2="171" marker-end="url(#m01a)"/>
+    <rect class="d-acc" x="470" y="146" width="120" height="50" rx="8"/>
+    <text x="530" y="168" font-size="14" font-weight="600" text-anchor="middle">API 서버</text>
+    <text class="d-m" x="530" y="186" font-size="12" text-anchor="middle">thv serve</text>
+    <rect class="d-acc" x="608" y="146" width="130" height="50" rx="8"/>
+    <text x="673" y="168" font-size="14" font-weight="600" text-anchor="middle">operator</text>
+    <text class="d-m" x="673" y="186" font-size="12" text-anchor="middle">Kubernetes · 07편</text>
+        <line class="d-line" x1="465" y1="210" x2="465" y2="260" marker-end="url(#m01a)"/>
+    <text class="d-m" x="473" y="240" font-size="12">proxy를 띄운다</text>
+        <line class="d-line" x1="90" y1="82" x2="90" y2="260" marker-end="url(#m01a)"/>
+    <text class="d-m" x="98" y="180" font-size="12">설치한다</text>
+        <rect class="d-box" x="20" y="262" width="140" height="56" rx="8"/>
+    <text x="90" y="286" font-size="14" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <text class="d-m" x="90" y="305" font-size="12" text-anchor="middle">Claude Code 등</text>
+    <line class="d-line" x1="160" y1="290" x2="198" y2="290" marker-end="url(#m01a)"/>
+    <rect class="d-box" x="200" y="262" width="140" height="56" rx="8"/>
+    <text x="270" y="286" font-size="14" font-weight="600" text-anchor="middle">vMCP</text>
+    <text class="d-m" x="270" y="305" font-size="12" text-anchor="middle">서버 묶음 · 08편</text>
+    <line class="d-line" x1="340" y1="290" x2="388" y2="290" marker-end="url(#m01a)"/>
+    <rect class="d-acc" x="390" y="262" width="150" height="56" rx="8"/>
+    <text x="465" y="286" font-size="14" font-weight="600" text-anchor="middle">proxy</text>
+    <text class="d-m" x="465" y="305" font-size="12" text-anchor="middle">서버마다 하나 · 02편</text>
+    <line class="d-line" x1="540" y1="290" x2="588" y2="290" marker-end="url(#m01a)"/>
+    <rect class="d-box" x="590" y="262" width="150" height="56" rx="8"/>
+    <text x="665" y="286" font-size="14" font-weight="600" text-anchor="middle">MCP 서버</text>
+    <text class="d-m" x="665" y="305" font-size="12" text-anchor="middle">컨테이너 · 03편</text>
+        <path class="d-line" d="M90,318 V345 H465 V321" marker-end="url(#m01a)"/>
+    <text class="d-m" x="277" y="364" font-size="12" text-anchor="middle">vMCP 없이 바로 연결하는 경로</text>
+  </svg>
+  </div>
+  <figcaption>그림 1. ToolHive 구성 요소 지도. 맨 아래 줄이 요청 경로이고, 위 두 줄은 그 경로를 만들고 채운다. 상자 안의 "NN편"은 그 구성 요소를 깊게 다루는 문서다.</figcaption>
+</figure>
+
+<div class="tbl"><table>
+<tr><th>구성 요소</th><th>하는 일</th><th>위치</th><th>다루는 편</th></tr>
+<tr><td>thv CLI</td><td>MCP 서버 실행, 그룹, secret, 클라이언트 설정을 관리한다.</td><td>toolhive <code>cmd/thv</code></td><td>01편, 02~06편</td></tr>
+<tr><td>ToolHive UI</td><td>데스크톱 앱이다. API 서버를 띄우고 그 위에 화면을 올린다.</td><td>toolhive-studio 저장소</td><td>01편</td></tr>
+<tr><td>API 서버</td><td><code>thv serve</code>로 연다. workload, registry, 클라이언트, 그룹을 REST API로 제공한다.</td><td><code>pkg/api</code></td><td>01편</td></tr>
+<tr><td>proxy</td><td>MCP 서버 앞에서 요청을 받는다. middleware를 적용한 뒤 서버에 전달한다.</td><td><code>pkg/transport</code>, <code>cmd/thv-proxyrunner</code></td><td>02편</td></tr>
+<tr><td>Kubernetes operator</td><td>CRD를 읽고 proxy Deployment와 Service를 만든다.</td><td><code>cmd/thv-operator</code></td><td>07편</td></tr>
+<tr><td>registry</td><td>ToolHive가 실행할 MCP 서버의 목록이다. 내장 registry는 바이너리에 들어 있다.</td><td><code>pkg/registry</code></td><td>04편</td></tr>
+<tr><td>registry server</td><td>registry를 MCP Registry API로 제공한다. PostgreSQL에 목록을 저장한다.</td><td>toolhive-registry-server 저장소</td><td>04편</td></tr>
+<tr><td>vMCP</td><td>여러 MCP 서버를 endpoint 하나로 묶는다. ToolHive의 MCP gateway다.</td><td><code>cmd/vmcp</code>, <code>thv vmcp</code></td><td>08편</td></tr>
+<tr><td>skill, plugin</td><td>MCP 클라이언트에 설치하는 묶음이다. MCP 서버처럼 실행하지 않는다.</td><td><code>thv skill</code>, <code>thv ai-plugin</code></td><td>09편</td></tr>
+</table></div>
+<p>근거는 <code>docs/arch/00-overview.md</code> "Key Components"와 <code>cmd/thv/app/commands.go:59</code>다. registry server의 저장소 설명은 같은 문서의 "Registry Server" 항목을 따랐다.</p>
+<p>CLI에는 <code>thv llm</code> 명령도 있는데, Claude Code 같은 코딩 도구를 OIDC로 보호된 LLM gateway에 연결하는 기능이다(source <code>cmd/thv/app/llm.go:32</code>). v0.63.0의 <code>thv llm setup</code>은 코딩 도구 여덟 가지를 찾아 설정하고, Pi, Claude Desktop, Codex도 그 안에 있다(source <code>cmd/thv/app/llm.go:300</code>). <code>--scopes</code> 플래그는 요청할 OIDC scope를 정한다(source <code>cmd/thv/app/llm.go:87</code>). <code>--bedrock-compat</code> 플래그는 AWS Bedrock으로 가는 gateway에 쓰는데, 이때 setup은 Claude Code와 Codex의 모델을 Bedrock 모델로 고정한다(source <code>cmd/thv/app/llm.go:431</code>). 이 문서에서는 이 기능을 다루지 않는다.</p>
+
+<h2 id="s4">4. 배포 모드</h2>
+<p>ToolHive는 세 배포 모드를 지원한다(source <code>docs/arch/01-deployment-modes.md</code>). 두 모드는 로컬 컴퓨터에서 돌고, 나머지 하나는 Kubernetes 클러스터에서 돈다.</p>
+<div class="tbl"><table>
+<tr><th>항목</th><th>로컬 CLI</th><th>로컬 UI</th><th>Kubernetes</th></tr>
+<tr><td>바이너리</td><td><code>thv</code></td><td>ToolHive UI와 <code>thv</code> (API 서버)</td><td><code>thv-operator</code>와 <code>thv-proxyrunner</code></td></tr>
+<tr><td>컨테이너를 만드는 곳</td><td>컨테이너 런타임</td><td>컨테이너 런타임</td><td>Kubernetes</td></tr>
+<tr><td>proxy 프로세스 관리</td><td>분리된 자식 프로세스</td><td>API 서버가 띄운 분리된 자식 프로세스</td><td>operator가 만든 Deployment</td></tr>
+<tr><td>상태 저장</td><td>로컬 파일</td><td>로컬 파일</td><td>etcd (Kubernetes API)</td></tr>
+<tr><td>규모</td><td>컴퓨터 한 대</td><td>컴퓨터 한 대</td><td>클러스터 전체</td></tr>
+<tr><td>맞는 사용자</td><td>개발자, CLI 사용자</td><td>UI 사용자, 입문자</td><td>운영 환경, 여러 사용자</td></tr>
+</table></div>
+<p>로컬 UI 열의 프로세스 관리 칸은 코드를 기준으로 적었다. API 서버도 CLI와 같은 함수로 proxy를 띄우기 때문이다(source <code>pkg/api/v1/workload_service.go:101</code>).</p>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 380" width="760" height="380" role="img" aria-label="세 배포 모드의 프로세스 구조. 로컬 CLI, 로컬 UI, Kubernetes를 나란히 보여 준다.">
+    <defs><marker id="m01b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <text class="d-a" x="130" y="22" font-size="15" font-weight="700" text-anchor="middle">로컬 CLI</text>
+    <text class="d-a" x="380" y="22" font-size="15" font-weight="700" text-anchor="middle">로컬 UI</text>
+    <text class="d-a" x="630" y="22" font-size="15" font-weight="700" text-anchor="middle">Kubernetes</text>
+    <rect class="d-outer" x="15" y="34" width="230" height="336" rx="10"/>
+    <rect class="d-outer" x="265" y="34" width="230" height="336" rx="10"/>
+    <rect class="d-outer" x="515" y="34" width="230" height="336" rx="10"/>
+        <rect class="d-box" x="35" y="48" width="190" height="48" rx="8"/>
+    <text x="130" y="68" font-size="14" font-weight="600" text-anchor="middle">터미널</text>
+    <text class="d-m" x="130" y="86" font-size="12" text-anchor="middle">thv run 이름</text>
+    <line class="d-line" x1="130" y1="96" x2="130" y2="124" marker-end="url(#m01b)"/>
+    <rect class="d-box" x="35" y="126" width="190" height="48" rx="8"/>
+    <text x="130" y="146" font-size="14" font-weight="600" text-anchor="middle">thv (부모)</text>
+    <text class="d-m" x="130" y="164" font-size="12" text-anchor="middle">이미지 받기, RunConfig 저장</text>
+    <line class="d-line" x1="130" y1="174" x2="130" y2="202" marker-end="url(#m01b)"/>
+    <text class="d-m" x="138" y="193" font-size="12">자식 프로세스</text>
+    <rect class="d-acc" x="35" y="204" width="190" height="48" rx="8"/>
+    <text x="130" y="224" font-size="14" font-weight="600" text-anchor="middle">proxy 프로세스</text>
+    <text class="d-m" x="130" y="242" font-size="12" text-anchor="middle">thv start --foreground</text>
+    <line class="d-line" x1="130" y1="252" x2="130" y2="280" marker-end="url(#m01b)"/>
+    <text class="d-m" x="138" y="271" font-size="12">만들고 연결</text>
+    <rect class="d-box" x="35" y="282" width="190" height="48" rx="8"/>
+    <text x="130" y="302" font-size="14" font-weight="600" text-anchor="middle">MCP 서버 컨테이너</text>
+    <text class="d-m" x="130" y="320" font-size="12" text-anchor="middle">Docker API로 생성</text>
+    <text class="d-m" x="130" y="356" font-size="12" text-anchor="middle">상태: 로컬 파일</text>
+        <rect class="d-box" x="285" y="48" width="190" height="48" rx="8"/>
+    <text x="380" y="68" font-size="14" font-weight="600" text-anchor="middle">ToolHive UI</text>
+    <text class="d-m" x="380" y="86" font-size="12" text-anchor="middle">Electron 앱</text>
+    <line class="d-line" x1="380" y1="96" x2="380" y2="124" marker-end="url(#m01b)"/>
+    <text class="d-m" x="388" y="115" font-size="12">REST API, 소켓</text>
+    <rect class="d-box" x="285" y="126" width="190" height="48" rx="8"/>
+    <text x="380" y="146" font-size="14" font-weight="600" text-anchor="middle">API 서버</text>
+    <text class="d-m" x="380" y="164" font-size="12" text-anchor="middle">thv serve --socket</text>
+    <line class="d-line" x1="380" y1="174" x2="380" y2="202" marker-end="url(#m01b)"/>
+    <text class="d-m" x="388" y="193" font-size="12">자식 프로세스</text>
+    <rect class="d-acc" x="285" y="204" width="190" height="48" rx="8"/>
+    <text x="380" y="224" font-size="14" font-weight="600" text-anchor="middle">proxy 프로세스</text>
+    <text class="d-m" x="380" y="242" font-size="12" text-anchor="middle">workload마다 하나</text>
+    <line class="d-line" x1="380" y1="252" x2="380" y2="280" marker-end="url(#m01b)"/>
+    <text class="d-m" x="388" y="271" font-size="12">만들고 연결</text>
+    <rect class="d-box" x="285" y="282" width="190" height="48" rx="8"/>
+    <text x="380" y="302" font-size="14" font-weight="600" text-anchor="middle">MCP 서버 컨테이너</text>
+    <text class="d-m" x="380" y="320" font-size="12" text-anchor="middle">CLI와 같은 컨테이너 런타임</text>
+    <text class="d-m" x="380" y="356" font-size="12" text-anchor="middle">상태: 로컬 파일</text>
+        <rect class="d-box" x="535" y="48" width="190" height="48" rx="8"/>
+    <text x="630" y="68" font-size="14" font-weight="600" text-anchor="middle">kubectl apply</text>
+    <text class="d-m" x="630" y="86" font-size="12" text-anchor="middle">MCPServer 리소스</text>
+    <line class="d-line" x1="630" y1="96" x2="630" y2="124" marker-end="url(#m01b)"/>
+    <text class="d-m" x="638" y="115" font-size="12">watch</text>
+    <rect class="d-box" x="535" y="126" width="190" height="48" rx="8"/>
+    <text x="630" y="146" font-size="14" font-weight="600" text-anchor="middle">operator</text>
+    <text class="d-m" x="630" y="164" font-size="12" text-anchor="middle">thv-operator</text>
+    <line class="d-line" x1="630" y1="174" x2="630" y2="202" marker-end="url(#m01b)"/>
+    <text class="d-m" x="638" y="193" font-size="12">만든다</text>
+    <rect class="d-acc" x="535" y="204" width="190" height="48" rx="8"/>
+    <text x="630" y="224" font-size="14" font-weight="600" text-anchor="middle">proxy Deployment</text>
+    <text class="d-m" x="630" y="242" font-size="12" text-anchor="middle">thv-proxyrunner</text>
+    <line class="d-line" x1="630" y1="252" x2="630" y2="280" marker-end="url(#m01b)"/>
+    <text class="d-m" x="638" y="271" font-size="12">만들고 연결</text>
+    <rect class="d-box" x="535" y="282" width="190" height="48" rx="8"/>
+    <text x="630" y="302" font-size="14" font-weight="600" text-anchor="middle">MCP 서버 StatefulSet</text>
+    <text class="d-m" x="630" y="320" font-size="12" text-anchor="middle">pod로 실행</text>
+    <text class="d-m" x="630" y="356" font-size="12" text-anchor="middle">상태: etcd</text>
+  </svg>
+  </div>
+  <figcaption>그림 2. 세 배포 모드의 프로세스 구조. 파란 상자가 proxy이고, 세 모드 모두 MCP 서버 앞에 proxy가 하나씩 선다.</figcaption>
+</figure>
+
+<h3>로컬 CLI</h3>
+<p>사용자가 <code>thv run</code>을 실행하면 ToolHive는 다음 순서로 움직인다(source <code>docs/arch/01-deployment-modes.md</code> "How It Works").</p>
+<ol>
+  <li>thv가 인자를 읽고 RunConfig를 만든다.</li>
+  <li>thv가 컨테이너 런타임을 찾는데, Podman, Docker, Colima 순서로 소켓을 확인한다(source <code>pkg/container/docker/sdk/factory.go:57</code>).</li>
+  <li>thv가 이미지를 받고 RunConfig를 저장한다(source <code>cmd/thv/app/run_flags.go:452</code>, <code>cmd/thv/app/run.go:255</code>).</li>
+  <li>thv가 자식 프로세스를 띄우는데, 이때 쓰는 명령은 <code>thv start &lt;이름&gt; --foreground</code>다(source <code>pkg/workloads/manager.go:747</code>).</li>
+  <li>자식 프로세스가 컨테이너를 만들고 proxy를 연다(source <code>pkg/runner/runner.go:492</code>). proxy는 MCP 클라이언트가 접속할 로컬 HTTP endpoint다.</li>
+  <li>부모 thv는 곧바로 끝나고, 자식 프로세스는 부모와 분리된 채 계속 돈다.</li>
+</ol>
+<p>아키텍처 문서의 "How It Works" 목록은 부모 쪽이 컨테이너를 만든다고 적지만, 같은 문서의 그림과 v0.63.0 코드에서는 자식 프로세스가 만든다. 이 문서는 코드를 따랐다.</p>
+<p>로컬 모드는 상태를 파일로 남기는데, 위치는 운영체제마다 다르다(source <code>docs/arch/01-deployment-modes.md</code> "File Locations").</p>
+<div class="tbl"><table>
+<tr><th>용도</th><th>Linux</th><th>macOS</th></tr>
+<tr><td>RunConfig 상태 파일</td><td><code>~/.local/state/toolhive/</code></td><td><code>~/Library/Application Support/toolhive/</code></td></tr>
+<tr><td>로그, PID, secret, 상태 값</td><td><code>~/.local/share/toolhive/</code></td><td><code>~/Library/Application Support/toolhive/</code></td></tr>
+<tr><td>설정 파일</td><td><code>~/.config/toolhive/</code></td><td><code>~/Library/Application Support/toolhive/</code></td></tr>
+<tr><td>캐시</td><td><code>~/.cache/toolhive/</code></td><td><code>~/Library/Caches/toolhive/</code></td></tr>
+</table></div>
+
+<h3>로컬 UI</h3>
+<p>ToolHive UI는 Electron으로 만든 데스크톱 앱이다(source toolhive-studio <code>package.json</code>). UI는 시작할 때 함께 들어 있는 thv로 API 서버를 띄우는데, 실행 인자는 <code>thv serve --openapi --socket=&lt;경로&gt;</code>다(source toolhive-studio <code>main/src/toolhive-manager.ts:142</code>).</p>
+<p>이때 API 서버는 TCP 포트 대신 UNIX socket으로 요청을 받고, Windows에서는 named pipe를 쓴다. 그래서 같은 컴퓨터의 프로세스만 API에 접근한다(source <code>docs/arch/01-deployment-modes.md</code> "Local Mode: UI").</p>
+<p>REST API 경로는 대부분 <code>/api/v1beta/</code>로 시작하고, 그 아래에 <code>workloads</code>, <code>registry</code>, <code>clients</code>, <code>groups</code>, <code>secrets</code>, <code>skills</code> 등이 있다(source <code>pkg/api/server.go:451</code>). <code>--socket</code>을 주지 않으면 API 서버는 <code>127.0.0.1:8080</code>에서 연결을 받는다(source <code>cmd/thv/app/server.go:157</code>).</p>
+<p>2026-11-07 기준 UI의 최신 릴리스는 v0.40.2(2026-10-14)이고, 여기에 들어 있는 thv는 v0.53.0이다(source toolhive-studio <code>utils/constants.ts:6</code>). 따라서 UI로 쓸 때의 동작은 이 문서의 기준 버전 v0.63.0과 다를 가능성이 있다.</p>
+
+<h3>Kubernetes</h3>
+<p>사용자가 MCPServer를 적용하면 다음 일이 차례로 일어난다(source <code>docs/arch/01-deployment-modes.md</code>).</p>
+<ol>
+  <li>operator가 MCPServer를 watch하고 reconcile한다.</li>
+  <li>operator가 thv-proxyrunner를 실행하는 Deployment와 Service를 만들고, RunConfig는 ConfigMap으로 넣는다.</li>
+  <li>proxy runner가 Kubernetes API로 MCP 서버 StatefulSet을 만든다(source <code>pkg/container/kubernetes/client.go:518</code>).</li>
+  <li>MCP 클라이언트의 요청은 Service, proxy runner, MCP 서버 pod 순서로 흐른다.</li>
+</ol>
+<p>operator는 proxy를 직접 실행하지 않고 MCP 서버 컨테이너도 직접 만들지 않는다. 두 일은 proxy runner가 맡는다(source <code>docs/arch/01-deployment-modes.md</code> "Why Two Binaries?"). 다만 StatefulSet의 수명 주기는 operator가 관리하고, 그 StatefulSet에 owner reference도 operator가 붙인다. StatefulSet이 지워지면 operator가 proxy Deployment를 다시 시작하고, 그러면 proxy runner가 StatefulSet을 다시 만든다(source <code>cmd/thv-operator/controllers/mcpserver_statefulset.go:29</code>). 07편에서 자세히 다룬다.</p>
+
+<h3>모드 선택 기준</h3>
+<div class="tbl"><table>
+<tr><th>모드</th><th>아키텍처 문서가 권하는 상황</th></tr>
+<tr><td>로컬 CLI</td><td>MCP 서버를 로컬에서 개발한다. 빠르게 시험하고 고친다. 사용자가 한 명이다.</td></tr>
+<tr><td>로컬 UI</td><td>개발자가 아닌 사용자도 써야 한다. 화면으로 관리하고 싶다.</td></tr>
+<tr><td>Kubernetes</td><td>운영 환경이다. 여러 tenant, 수평 확장, 고가용성이 필요하다. MCP 서버가 많다.</td></tr>
+</table></div>
+
+<h3>모드 사이 옮기기</h3>
+<p>로컬 workload를 Kubernetes로 옮기려면 다음 순서로 작업해야 한다.</p>
+<ol>
+  <li>로컬 workload를 MCPServer YAML로 내보낸다: <code>thv export my-server ./my-server.yaml --format k8s</code></li>
+  <li>출력에 빠진 설정을 따로 만든다. secret, OIDC, telemetry, tool 필터 설정은 별도 리소스가 필요하다.</li>
+  <li>클러스터에 적용한다: <code>kubectl apply -f my-server.yaml</code></li>
+</ol>
+<p><code>--format k8s</code>는 v0.63.0 코드에 있다(source <code>cmd/thv/app/export.go:46</code>). 아키텍처 문서는 이 변환을 "계획 중"이라고 적는데, 이 부분은 문서가 코드보다 늦다. 원격 서버는 이 방식으로 내보내지 못하고(source <code>pkg/export/k8s.go:42</code>), permission profile도 내보내지 않는다. 코드 주석은 operator가 <code>spec.permissionProfile</code>을 무시하기 때문이라고 적는다(source <code>pkg/export/k8s.go:63</code>).</p>
+<p>반대 방향은 아키텍처 문서가 손으로 옮기는 순서만 적고 있어서, 다음 순서로 직접 옮겨야 한다.</p>
+<ol>
+  <li>MCPServer 정의를 읽는다: <code>kubectl get mcpserver my-server -o yaml</code></li>
+  <li>필요한 필드를 RunConfig 형식으로 옮겨 적는다.</li>
+  <li>로컬에서 실행한다: <code>thv run --from-config runconfig.json</code></li>
+</ol>
+<p>로컬끼리는 <code>thv export</code>의 기본 JSON 형식과 <code>thv run --from-config</code>를 쓴다(source <code>docs/arch/01-deployment-modes.md</code> "Migration Paths").</p>
+
+<h2 id="s5">5. 핵심 명사와 동사</h2>
+<p>ToolHive 아키텍처 문서는 개념을 명사와 동사로 나눠 정의한다(source <code>docs/arch/02-core-concepts.md</code>). 아래 표는 그 정의를 옮기고 구현 위치를 붙인 것이다.</p>
+<h3>명사</h3>
+<div class="tbl"><table>
+<tr><th>용어</th><th>한 줄 정의</th><th>구현 위치</th></tr>
+<tr><td>workload</td><td>배포 단위 하나다. MCP 서버, proxy, 네트워크 설정, 권한, middleware 설정을 함께 묶는다. 컨테이너 workload와 원격 workload가 있다.</td><td><code>pkg/core/workload.go</code></td></tr>
+<tr><td>transport</td><td>MCP 클라이언트와 서버가 통신하는 방식이다. stdio, sse, streamable-http, inspector가 있다.</td><td><code>pkg/transport/types/transport.go</code></td></tr>
+<tr><td>proxy</td><td>트래픽을 전달하면서 middleware를 적용한다. transparent proxy와 프로토콜 전용 proxy가 있다.</td><td><code>pkg/transport/proxy/</code></td></tr>
+<tr><td>middleware</td><td>요청 처리 사슬의 한 단계다. 각 단계는 요청을 검사하거나 바꾸고, 필요하면 거절한다.</td><td><code>pkg/runner/middleware.go</code></td></tr>
+<tr><td>RunConfig</td><td>workload 실행 값을 모은 JSON 형식이다. 스키마 버전은 v0.1.0이다.</td><td><code>pkg/runner/config.go:43</code></td></tr>
+<tr><td>permission profile</td><td>파일 시스템, 네트워크, privileged 권한을 정한다. 내장 profile로 none과 network가 있다.</td><td>toolhive-core <code>permissions</code></td></tr>
+<tr><td>그룹</td><td>목적이 같은 MCP 서버의 논리 묶음이다.</td><td><code>pkg/groups/</code></td></tr>
+<tr><td>vMCP</td><td>그룹 하나의 MCP 서버를 endpoint 하나로 묶는다.</td><td><code>cmd/vmcp</code>, <code>pkg/vmcp</code></td></tr>
+<tr><td>registry</td><td>MCP 서버, skill, plugin의 정의를 담은 목록이다.</td><td><code>pkg/registry/</code></td></tr>
+<tr><td>session</td><td>MCP 연결 하나의 상태를 추적한다.</td><td><code>pkg/transport/session/</code></td></tr>
+<tr><td><code>Runtime</code> 인터페이스</td><td>컨테이너 시스템을 감싼 추상화다. Docker 계열 구현과 Kubernetes 구현이 있다.</td><td><code>pkg/container/runtime/types.go</code></td></tr>
+<tr><td>MCP 클라이언트</td><td>MCP 서버를 쓰는 앱이다.</td><td><code>pkg/client/</code></td></tr>
+<tr><td>skill</td><td>SKILL.md 하나로 된 Agent Skill이다.</td><td><code>pkg/skills/</code></td></tr>
+<tr><td>plugin</td><td><code>.claude-plugin/plugin.json</code>으로 정의하는 묶음이다. Claude Code 같은 MCP 클라이언트에 설치한다.</td><td><code>pkg/plugins/</code></td></tr>
+</table></div>
+<p><code>--permission-profile</code>을 주지 않으면 ToolHive는 registry 항목의 profile을 쓰고, registry에 없는 서버에는 network profile을 쓴다(source <code>cmd/thv/app/run_flags.go:207</code>). 코드도 플래그 설명대로 동작한다(source <code>pkg/runner/config_builder.go:1408</code>). network profile은 나가는 연결을 모두 허용한다(source <code>docs/arch/02-core-concepts.md</code> "Built-in profiles"). 아키텍처 문서는 none을 기본값으로 적지만 이 문서는 코드를 따랐다.</p>
+<h3>동사</h3>
+<div class="tbl"><table>
+<tr><th>동사</th><th>뜻</th><th>관련 명령이나 플래그</th></tr>
+<tr><td>Deploy</td><td>workload를 만들고 시작한다.</td><td><code>thv run</code></td></tr>
+<tr><td>Proxy</td><td>middleware를 적용하면서 트래픽을 전달한다.</td><td>자동</td></tr>
+<tr><td>Attach</td><td>컨테이너의 stdin과 stdout에 붙는다. stdio transport에서만 쓴다.</td><td>자동</td></tr>
+<tr><td>Parse</td><td>JSON-RPC 메시지에서 method, 요청 ID, 인자를 뽑는다.</td><td>자동</td></tr>
+<tr><td>Filter and Override</td><td>MCP 클라이언트에 보일 tool과 그 이름, 설명을 정한다.</td><td><code>--tools</code>, <code>--tools-override</code></td></tr>
+<tr><td>Authorize</td><td>Cedar 정책으로 요청을 허용할지 정한다.</td><td><code>--authz-config</code></td></tr>
+<tr><td>Audit</td><td>MCP 동작을 감사 기록으로 남긴다.</td><td><code>--enable-audit</code>, <code>--audit-config</code></td></tr>
+<tr><td>Export</td><td>RunConfig를 JSON 파일로 쓴다.</td><td><code>thv export</code></td></tr>
+<tr><td>Import</td><td>내보낸 파일로 workload를 만든다.</td><td><code>thv run --from-config</code></td></tr>
+<tr><td>Monitor</td><td>컨테이너 종료와 상태를 감시한다. MCP ping으로 health check를 한다.</td><td>자동</td></tr>
+</table></div>
+<p>플래그 이름은 <code>cmd/thv/app/run_flags.go</code>에서 확인했다. 아키텍처 문서의 <code>--tool</code>은 실제로는 <code>--tools</code>다(source <code>cmd/thv/app/run_flags.go:337</code>).</p>
+<p>workload의 상태 값은 11개다(source <code>pkg/container/runtime/types.go:27</code>). 수명 주기는 02편에서 다룬다.</p>
+<pre><code>running  stopped  starting  stopping  removing  error
+unhealthy  unknown  unauthenticated  auth_retrying  policy_stopped</code></pre>
+
+<h2 id="s6">6. MCP 서버를 실행하는 다섯 가지 방법</h2>
+<p><code>thv run</code>은 MCP 서버를 다섯 가지 방법으로 실행한다(source <code>cmd/thv/app/run.go:36</code>).</p>
+<div class="tbl"><table>
+<tr><th>방법</th><th>명령</th><th>ToolHive가 하는 일</th></tr>
+<tr><td>1. registry에서</td><td><code>thv run server-name</code></td><td>registry 항목의 이미지, transport, 권한, 환경 변수를 그대로 쓴다.</td></tr>
+<tr><td>2. 컨테이너 이미지로</td><td><code>thv run ghcr.io/example/mcp-server:latest</code></td><td>지정한 이미지를 바로 실행한다.</td></tr>
+<tr><td>3. 프로토콜 scheme으로</td><td><code>thv run uvx://package-name</code><br><code>npx://</code>, <code>go://</code>도 받는다.</td><td>패키지를 실행하는 이미지를 실행 시점에 만든다. <code>go://</code>는 <code>./</code>나 <code>../</code>로 시작하는 로컬 경로도 받는다.</td></tr>
+<tr><td>4. 내보낸 설정으로</td><td><code>thv run --from-config &lt;path&gt;</code></td><td>예전에 내보낸 RunConfig로 같은 workload를 다시 만든다.</td></tr>
+<tr><td>5. 원격 서버로</td><td><code>thv run &lt;URL&gt; [--name &lt;name&gt;]</code></td><td>컨테이너를 만들지 않는다. 원격 URL 앞에 proxy만 둔다.</td></tr>
+</table></div>
+<p>registry에 없는 이미지는 transport 정보가 없어서, <code>--transport</code>가 없으면 <code>thv run</code>은 streamable-http를 쓴다(source <code>cmd/thv/app/run_flags.go:595</code>). 공식 문서는 stdio를 기본으로 적는데, 이 차이는 02편 6장에서 다룬다.</p>
+<p>다섯 방법의 결과는 모두 workload 하나다. ToolHive는 원격 서버도 로컬 workload처럼 관리해서 클라이언트 설정, tool 필터, 내보내기를 똑같이 쓴다(source <code>cmd/thv/app/run.go:74</code>).</p>
+<p>방법 3의 scheme은 셋이다(source <code>docs/arch/00-overview.md</code> "Protocol Builds"). <code>uvx://</code>는 Python 패키지에, <code>npx://</code>는 Node.js 패키지에, <code>go://</code>는 Go 패키지에 쓴다.</p>
+
+<h2 id="s7">7. 설치</h2>
+<h3>준비물</h3>
+<p>ToolHive는 macOS, Linux, Windows에서 돌고, 로컬 모드에는 컨테이너 런타임이 하나 필요하다(docs <code>guides-cli/install</code>).</p>
+<ul>
+  <li>Docker 또는 Docker Desktop</li>
+  <li>Podman 또는 Podman Desktop</li>
+  <li>Colima (Docker 모드)</li>
+  <li>Rancher Desktop (dockerd/moby 모드, 실험 단계)</li>
+</ul>
+<p>공식 문서는 ToolHive가 CPU, 메모리, 디스크를 조금만 쓴다고 설명하는데, 실제 양은 실행하는 서버 수에 달려 있다.</p>
+
+<h3>CLI 설치</h3>
+<p>공식 문서는 macOS와 Linux에 Homebrew를 권하고, Windows에 WinGet을 권한다(docs <code>guides-cli/install</code>).</p>
+<pre><code># macOS, Linux
+brew tap stacklok/tap
+brew install thv
+
+# Windows
+winget install stacklok.thv
+
+# 소스에서 빌드
+git clone https://github.com/stacklok/toolhive.git
+cd toolhive
+go install ./cmd/thv</code></pre>
+<p>v0.55.1부터 Homebrew tap은 thv를 cask로 배포한다(source <code>.goreleaser.yaml:103</code>). 설치 명령은 그대로이고, 공식 설치 문서도 cask를 따로 말하지 않는다. macOS에서는 cask가 설치 뒤 바이너리의 quarantine 속성을 지우는데, 바이너리가 서명은 됐지만 notarize는 되지 않았기 때문이다(source <code>.goreleaser.yaml:115</code>).</p>
+<p>릴리스 페이지에는 운영체제별 바이너리 압축 파일도 있다. 공식 문서는 소스 빌드에 Go 1.24 이상이 필요하다고 적지만, v0.63.0의 <code>go.mod</code>는 <code>go 1.27</code>을 적는다(source <code>go.mod:3</code>). 그래서 소스로 빌드하려면 Go 1.27 이상을 준비해야 한다.</p>
+<p>설치 뒤에는 두 명령으로 확인해야 한다.</p>
+<pre><code>thv version          # 버전, commit, 빌드 날짜를 보여 준다
+thv runtime check    # 컨테이너 런타임이 응답하는지 확인한다</code></pre>
+<p><code>thv runtime check</code>는 컨테이너 런타임에 ping을 보낸다(source <code>cmd/thv/app/runtime.go:26</code>).</p>
+
+<h3>UI 설치</h3>
+<p>UI는 운영체제별 설치 파일로 설치한다(docs <code>guides-ui/install</code>).</p>
+<div class="tbl"><table>
+<tr><th>운영체제</th><th>설치 파일</th></tr>
+<tr><td>macOS</td><td>Apple silicon용 <code>ToolHive-arm64.dmg</code>, Intel용 <code>ToolHive-x64.dmg</code></td></tr>
+<tr><td>Windows</td><td><code>ToolHive.Setup.exe</code></td></tr>
+<tr><td>Linux</td><td>RPM 패키지, DEB 패키지, tarball</td></tr>
+</table></div>
+<p>UI는 CLI를 함께 설치하고 관리한다. 함께 들어 있는 CLI를 가리키는 symlink를 만들고 셸의 PATH를 바꾸기 때문에, 터미널의 <code>thv</code>는 UI가 관리하는 CLI가 된다(docs <code>guides-ui/cli-access</code>).</p>
+<p>UI가 설치된 상태에서 따로 설치한 CLI를 실행하면 충돌 오류가 나는데, Homebrew, WinGet, 직접 설치가 모두 해당한다. 공식 문서는 새 터미널을 열어 UI가 관리하는 CLI를 쓰는 방법을 먼저 권하고, 따로 설치한 CLI를 지우는 방법도 있다(docs <code>guides-cli/install</code> "CLI conflict resolution").</p>
+<div class="box warn">
+<p>ToolHive는 익명 사용 지표를 기본으로 모은다. 공식 문서는 tool 호출 횟수만 모은다고 밝히고 있으며, 끄려면 <code>thv config usage-metrics disable</code>을 실행해야 한다(docs <code>faq</code>).</p>
+</div>
+
+<h2 id="s8">8. 첫 실행: CLI</h2>
+<p>이 장은 공식 CLI quickstart를 따른다(docs <code>guides-cli/quickstart</code>). 예로 쓰는 서버는 <code>toolhive-doc-mcp</code>인데, ToolHive 문서를 검색하는 tool을 제공하는 서버다. 출력 예는 공식 문서에서 가져왔다.</p>
+<p>다음 순서로 따라 하면 된다.</p>
+<ol>
+  <li>
+    <p>registry에서 서버를 찾는다.</p>
+<pre><code>thv registry list</code></pre>
+<pre><code>NAME                                          TYPE        DESCRIPTION                                          TIER        STARS
+io.github.stacklok/fetch                      container   A Model Context Protocol server that provides ...    Community   56714
+io.github.stacklok/toolhive-doc-mcp           container   Search ToolHive docs for help with using and c...    Official    3
+io.github.stacklok/toolhive-doc-mcp-remote    remote      Search ToolHive docs for help with using and c...    Official    3
+...</code></pre>
+    <p>TYPE 열은 실행 방식을 보여 준다. container는 로컬 컨테이너이고, remote는 ToolHive가 proxy로 연결하는 원격 endpoint다. 열 이름은 <code>cmd/thv/app/registry.go:161</code>에서 확인했다.</p>
+<pre><code>thv registry info toolhive-doc-mcp</code></pre>
+    <p>이 명령은 서버의 tool 목록과 설정 항목을 보여 준다.</p>
+  </li>
+  <li>
+    <p>서버를 실행한다.</p>
+<pre><code>thv run toolhive-doc-mcp</code></pre>
+<pre><code>{"time":"2026-05-18T09:49:14-04:00","level":"INFO","msg":"logging to","path":"~/Library/Application Support/toolhive/logs/toolhive-doc-mcp.log"}</code></pre>
+    <p>ToolHive는 이미지를 받고 서버를 백그라운드에서 시작한다. 출력에 나온 파일에는 proxy 프로세스의 출력이 쌓이는데(source <code>pkg/workloads/manager.go:742</code>), 공식 quickstart는 이 파일을 서버 로그라고 부른다. 컨테이너 로그는 <code>thv logs &lt;이름&gt;</code>으로 보고, 이 파일은 <code>--proxy</code>를 붙여 본다(source <code>cmd/thv/app/logs.go:64</code>).</p>
+  </li>
+  <li>
+    <p>실행 상태를 확인한다.</p>
+<pre><code>thv list</code></pre>
+<pre><code>NAME               PACKAGE                                                  STATUS    URL                          PORT    GROUP     CREATED
+toolhive-doc-mcp   ghcr.io/stackloklabs/toolhive-doc-mcp:v0.0.14-20260518   running   http://127.0.0.1:19767/mcp   19767   default   2026-05-18 09:49:14 -0400 EDT</code></pre>
+    <p>URL 열이 proxy의 endpoint다. ToolHive가 10000 이상의 빈 포트를 임의로 고르기 때문에 포트는 실행할 때마다 다르다(source <code>pkg/networking/port.go:74</code>). 포트를 고정하려면 <code>--proxy-port</code>를 줘야 한다.</p>
+  </li>
+  <li>
+    <p>(선택) MCP 클라이언트 없이 tool 목록을 본다.</p>
+<pre><code>thv mcp list tools --server toolhive-doc-mcp</code></pre>
+    <p>이 명령은 MCP 클라이언트 대신 workload의 URL에 접속해 tool 목록을 받는다. <code>--server</code>에는 URL이나 실행 중인 workload 이름을 준다(source <code>cmd/thv/app/mcp.go:239</code>). 공식 quickstart는 이 서버의 tool로 <code>query_docs</code>와 <code>get_chunk</code>를 든다.</p>
+  </li>
+  <li>
+    <p>MCP 클라이언트를 연결한다.</p>
+<pre><code>thv client setup
+thv client status</code></pre>
+<pre><code>┌────────────────┬───────────┬────────────┐
+│ CLIENT TYPE    │ INSTALLED │ REGISTERED │
+├────────────────┼───────────┼────────────┤
+│ vscode         │ ✅ Yes    │ ✅ Yes     │
+└────────────────┴───────────┴────────────┘</code></pre>
+    <p><code>setup</code>은 설치됐지만 등록하지 않은 클라이언트를 보여 주는데, 여기서 스페이스바로 고르고 Enter로 확정한다. 등록하면 ToolHive가 실행 중인 workload를 그 클라이언트의 클라이언트 설정에 넣는다(source <code>pkg/client/manager.go:147</code>).</p>
+  </li>
+  <li>
+    <p>MCP 클라이언트에서 질문한다.</p>
+    <p>클라이언트를 다시 시작해야 설정이 반영될 수도 있다. 공식 quickstart는 아래 질문을 예로 든다.</p>
+    <blockquote>What is a Virtual MCP Server and how do I use it with ToolHive?</blockquote>
+    <p>모델은 <code>query_docs</code> tool로 문서를 검색하고 답한다.</p>
+  </li>
+  <li>
+    <p>서버를 멈추고 지운다.</p>
+<pre><code>thv stop toolhive-doc-mcp
+thv rm toolhive-doc-mcp</code></pre>
+    <p><code>stop</code>은 proxy 프로세스를 끝내고 컨테이너를 멈춘다. 컨테이너를 지우지는 않으므로 <code>thv start</code>를 실행하면 서버가 빨리 다시 시작되고, 등록한 클라이언트의 클라이언트 설정에서는 이 서버를 뺀다(source <code>pkg/workloads/manager.go:1659</code>). <code>rm</code>은 컨테이너까지 지운다.</p>
+  </li>
+</ol>
+<p>컨테이너를 쓰고 싶지 않으면 <code>thv run toolhive-doc-mcp-remote</code>를 대신 실행하면 된다. 이 항목은 원격 endpoint <code>https://toolhive-doc-mcp.stacklok.com/mcp</code>에 proxy만 붙인다(docs <code>guides-cli/quickstart</code>).</p>
+
+<h3>뒤에서 일어난 일</h3>
+<p>그림 3은 <code>thv run toolhive-doc-mcp</code> 한 번으로 일어나는 일을 순서대로 보여 준다.</p>
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 240" width="760" height="240" role="img" aria-label="thv run 한 번이 일으키는 일곱 단계">
+    <defs><marker id="m01c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="d-outer" x="8" y="8" width="744" height="92" rx="10"/>
+    <text class="d-m" x="20" y="24" font-size="12">사용자가 실행한 thv</text>
+    <rect class="d-box" x="20" y="32" width="160" height="58" rx="8"/>
+    <text x="100" y="56" font-size="14" font-weight="600" text-anchor="middle">1. registry 조회</text>
+    <text class="d-m" x="100" y="76" font-size="12" text-anchor="middle">이미지, transport, 권한</text>
+    <line class="d-line" x1="180" y1="61" x2="208" y2="61" marker-end="url(#m01c)"/>
+    <rect class="d-box" x="210" y="32" width="160" height="58" rx="8"/>
+    <text x="290" y="56" font-size="14" font-weight="600" text-anchor="middle">2. 이미지 받기</text>
+    <text class="d-m" x="290" y="76" font-size="12" text-anchor="middle">이미지 저장소에서</text>
+    <line class="d-line" x1="370" y1="61" x2="398" y2="61" marker-end="url(#m01c)"/>
+    <rect class="d-box" x="400" y="32" width="160" height="58" rx="8"/>
+    <text x="480" y="56" font-size="14" font-weight="600" text-anchor="middle">3. RunConfig 저장</text>
+    <text class="d-m" x="480" y="76" font-size="12" text-anchor="middle">상태 파일</text>
+    <line class="d-line" x1="560" y1="61" x2="588" y2="61" marker-end="url(#m01c)"/>
+    <rect class="d-box" x="590" y="32" width="150" height="58" rx="8"/>
+    <text x="665" y="56" font-size="14" font-weight="600" text-anchor="middle">4. 자식 실행</text>
+    <text class="d-m" x="665" y="76" font-size="12" text-anchor="middle">thv start --foreground</text>
+    <line class="d-line" x1="665" y1="90" x2="665" y2="138" marker-end="url(#m01c)"/>
+    <rect class="d-outer" x="8" y="122" width="744" height="108" rx="10"/>
+    <text class="d-m" x="20" y="222" font-size="12">자식 프로세스</text>
+    <rect class="d-box" x="590" y="140" width="150" height="58" rx="8"/>
+    <text x="665" y="164" font-size="14" font-weight="600" text-anchor="middle">5. 컨테이너 시작</text>
+    <text class="d-m" x="665" y="184" font-size="12" text-anchor="middle">네트워크 격리 켬</text>
+    <line class="d-line" x1="590" y1="169" x2="562" y2="169" marker-end="url(#m01c)"/>
+    <rect class="d-acc" x="400" y="140" width="160" height="58" rx="8"/>
+    <text x="480" y="164" font-size="14" font-weight="600" text-anchor="middle">6. proxy 시작</text>
+    <text class="d-m" x="480" y="184" font-size="12" text-anchor="middle">127.0.0.1:임의 포트</text>
+    <line class="d-line" x1="400" y1="169" x2="372" y2="169" marker-end="url(#m01c)"/>
+    <rect class="d-box" x="210" y="140" width="160" height="58" rx="8"/>
+    <text x="290" y="164" font-size="14" font-weight="600" text-anchor="middle">7. 클라이언트 설정</text>
+    <text class="d-m" x="290" y="184" font-size="12" text-anchor="middle">등록된 곳에 URL 기록</text>
+    <line class="d-line" x1="210" y1="169" x2="182" y2="169" marker-end="url(#m01c)"/>
+    <rect class="d-box" x="20" y="140" width="160" height="58" rx="8"/>
+    <text x="100" y="164" font-size="14" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <text class="d-m" x="100" y="184" font-size="12" text-anchor="middle">proxy URL로 접속</text>
+  </svg>
+  </div>
+  <figcaption>그림 3. <code>thv run toolhive-doc-mcp</code> 뒤에서 일어나는 일. 위 줄은 사용자가 실행한 thv가 하고, 아래 줄은 자식 프로세스가 한다. 7단계는 클라이언트를 등록했을 때만 일어난다.</figcaption>
+</figure>
+<p>그림의 단계는 다음 코드에서 확인했다.</p>
+<div class="tbl"><table>
+<tr><th>단계</th><th>근거</th></tr>
+<tr><td>1. registry 조회</td><td><code>cmd/thv/app/run_flags.go:420</code>. 이미지를 받지 않고 registry만 본다.</td></tr>
+<tr><td>2. 이미지 받기</td><td><code>cmd/thv/app/run_flags.go:452</code>. 정책 검사를 먼저 하고 이미지를 받는다.</td></tr>
+<tr><td>3. RunConfig 저장</td><td><code>cmd/thv/app/run.go:255</code></td></tr>
+<tr><td>4. 자식 실행</td><td><code>pkg/workloads/manager.go:747</code></td></tr>
+<tr><td>5. 컨테이너 시작</td><td><code>pkg/runner/runner.go:492</code>, <code>cmd/thv/app/run_flags.go:302</code>. 네트워크 격리의 기본값은 true다.</td></tr>
+<tr><td>6. proxy 시작</td><td><code>cmd/thv/app/run_flags.go:190</code>, <code>pkg/networking/port.go:103</code>. 기본 host는 127.0.0.1이다.</td></tr>
+<tr><td>7. 클라이언트 설정</td><td><code>pkg/runner/runner.go:694</code></td></tr>
+</table></div>
+
+<h2 id="s9">9. 첫 실행: UI</h2>
+<p>UI quickstart는 같은 서버를 화면에서 실행한다(docs <code>guides-ui/quickstart</code>). 버튼 이름은 앱의 영어 표기를 그대로 적었다.</p>
+<p>다음 순서로 따라 하면 된다.</p>
+<ol>
+  <li>설치 파일로 앱을 설치하고 연다.</li>
+  <li>위쪽 메뉴에서 <b>Registry</b> 화면을 연다. 내장 registry의 서버 목록이 나온다.</li>
+  <li><b>ToolHive Docs</b> 항목을 누른다. registry 이름은 <code>toolhive-doc-mcp</code>다.</li>
+  <li><b>Install server</b> 버튼을 누른다. 서버가 <b>MCP Servers</b> 화면에 나타난다.</li>
+  <li><b>Clients</b> 화면에서 쓰려는 클라이언트의 스위치를 켠다.</li>
+  <li>클라이언트에서 ToolHive에 관해 질문한다. 설정이 반영되지 않았으면 클라이언트를 다시 시작한다.</li>
+</ol>
+<p>화면 뒤에서는 CLI와 같은 일이 일어난다. UI가 API 서버에 요청을 보내면 API 서버가 proxy 자식 프로세스를 띄운다. 서버가 시작되지 않으면 컨테이너 런타임이 돌고 있는지 먼저 확인해야 한다.</p>
+
+<h2 id="s10">10. 프로젝트 정보</h2>
+<p>아래 값은 로컬 소스에서 직접 확인했다.</p>
+<div class="tbl"><table>
+<tr><th>항목</th><th>값</th><th>근거</th></tr>
+<tr><td>라이선스</td><td>Apache License 2.0</td><td><code>LICENSE</code></td></tr>
+<tr><td>구현 언어</td><td>Go. 모듈 이름은 <code>github.com/stacklok/toolhive</code>다.</td><td><code>go.mod:1</code></td></tr>
+<tr><td>Go 버전</td><td><code>go 1.27</code></td><td><code>go.mod:3</code></td></tr>
+<tr><td>기준 버전</td><td>v0.63.0 태그, 2026-11-06 commit</td><td><code>VERSION</code>, git 태그</td></tr>
+<tr><td>내장 registry</td><td>toolhive-catalog 모듈 v0.20261026.0을 바이너리에 넣는다.</td><td><code>go.mod:71</code>, <code>pkg/registry/provider_local.go:54</code></td></tr>
+<tr><td>ToolHive UI</td><td>toolhive-studio v0.40.2(2026-10-14). Electron 앱이다. 라이선스는 Apache 2.0이다.</td><td>toolhive-studio git 태그, <code>package.json</code></td></tr>
+<tr><td>registry server</td><td>toolhive-registry-server v1.5.3(2026-10-14). Go로 만들었다. 라이선스는 Apache 2.0이다.</td><td>toolhive-registry-server git 태그, <code>go.mod</code>, <code>LICENSE</code></td></tr>
+<tr><td>공식 문서</td><td>docs-website main 브랜치, commit 912bc05 (2026-10-13) 사본. 설치 문서와 CLI quickstart는 2026-11-07에 사이트에서 다시 읽었다.</td><td>로컬 사본, 공식 사이트</td></tr>
+</table></div>
+<p>ToolHive는 아직 1.0 이전 버전이라서 버전이 오를 때 동작이 바뀔 가능성이 있다. Kubernetes CRD의 API 버전은 <code>toolhive.stacklok.dev/v1beta1</code>이고, v1alpha1은 deprecated다(source <code>cmd/thv-operator/api/v1alpha1/types.go:15</code>).</p>
+
+<h3>저장소 최상위 구조</h3>
+<div class="tbl"><table>
+<tr><th>디렉터리</th><th>내용</th></tr>
+<tr><td><code>cmd/</code></td><td>바이너리 진입점이다. 아래 표에 따로 정리했다.</td></tr>
+<tr><td><code>pkg/</code></td><td>Go 패키지 63개가 있다. 아래 표에 묶어서 정리했다.</td></tr>
+<tr><td><code>docs/arch/</code></td><td>아키텍처 문서 00~18편이 있다.</td></tr>
+<tr><td><code>deploy/charts/</code></td><td>operator Helm chart와 operator-crds Helm chart가 있다.</td></tr>
+<tr><td><code>containers/egress-proxy/</code></td><td>네트워크 격리에 쓰는 egress proxy 이미지가 있다.</td></tr>
+<tr><td><code>examples/</code></td><td>operator 예제, OpenTelemetry 예제, 인가 설정 예제가 있다.</td></tr>
+<tr><td><code>test/</code></td><td>e2e, integration, conformance 테스트가 있다.</td></tr>
+<tr><td><code>sdk/go/</code>, <code>skills/</code></td><td>Go SDK와 CLI 사용자용 skill이 있다.</td></tr>
+</table></div>
+
+<h3><code>cmd/</code>의 바이너리</h3>
+<div class="tbl"><table>
+<tr><th>디렉터리</th><th>바이너리가 하는 일</th></tr>
+<tr><td><code>cmd/thv</code></td><td>CLI다. API 서버(<code>thv serve</code>)와 로컬 proxy(<code>thv start</code>)도 이 바이너리가 맡는다.</td></tr>
+<tr><td><code>cmd/thv-operator</code></td><td>Kubernetes operator다. CRD 정의와 controller가 함께 있다.</td></tr>
+<tr><td><code>cmd/thv-proxyrunner</code></td><td>Kubernetes용 proxy다. MCP 서버 StatefulSet을 만들고 트래픽을 전달한다.</td></tr>
+<tr><td><code>cmd/vmcp</code></td><td>vMCP의 독립 실행 바이너리다.</td></tr>
+<tr><td><code>cmd/help</code></td><td>CLI 참조 문서를 만드는 도구다.</td></tr>
+</table></div>
+
+<h3><code>pkg/</code>의 패키지 묶음</h3>
+<p>패키지 63개를 주제별로 묶었다. 묶음은 이 문서가 정한 것이고, 각 패키지의 뜻은 패키지 주석에서 확인했다.</p>
+<div class="tbl"><table>
+<tr><th>주제</th><th>패키지</th><th>다루는 편</th></tr>
+<tr><td>실행과 수명 주기</td><td><code>workloads</code>, <code>runner</code>, <code>container</code>, <code>process</code>, <code>state</code>, <code>core</code>, <code>runtime</code></td><td>02편</td></tr>
+<tr><td>통신과 proxy</td><td><code>transport</code>, <code>mcp</code>, <code>networking</code>, <code>healthcheck</code></td><td>02편</td></tr>
+<tr><td>격리와 secret</td><td><code>secrets</code>, <code>ignore</code>, <code>certs</code>, <code>security</code></td><td>03편</td></tr>
+<tr><td>목록과 클라이언트</td><td><code>registry</code>, <code>groups</code>, <code>client</code>, <code>export</code></td><td>04편</td></tr>
+<tr><td>인증과 인가</td><td><code>auth</code>, <code>authz</code>, <code>authserver</code>, <code>oidc</code>, <code>oauthproto</code>, <code>webhook</code></td><td>05편</td></tr>
+<tr><td>관측과 제한</td><td><code>telemetry</code>, <code>audit</code>, <code>ratelimit</code>, <code>usagemetrics</code>, <code>sentry</code>, <code>diagnostics</code></td><td>06편</td></tr>
+<tr><td>Kubernetes</td><td><code>k8s</code>, <code>operator</code></td><td>07편</td></tr>
+<tr><td>vMCP</td><td><code>vmcp</code></td><td>08편</td></tr>
+<tr><td>skill과 plugin</td><td><code>skills</code>, <code>plugins</code>, <code>git</code>, <code>storage</code></td><td>09편</td></tr>
+<tr><td>화면과 API</td><td><code>api</code>, <code>desktop</code>, <code>tui</code>, <code>cli</code></td><td>01편</td></tr>
+<tr><td>LLM gateway 연결</td><td><code>llm</code>, <code>llmgateway</code></td><td>다루지 않는다</td></tr>
+</table></div>
+<p>나머지 패키지는 <code>config</code>, <code>fileutils</code>, <code>json</code>, <code>labels</code>, <code>lockfile</code>, <code>cache</code>, <code>updates</code>, <code>versions</code> 같은 공용 도구다.</p>
+
+<h2 id="s11">11. 학습 지도</h2>
+<p>이 시리즈는 이 문서 뒤로 아홉 편이 더 있다. 아래 표는 각 편에서 읽을 주제를 정리한 것이다.</p>
+<div class="tbl"><table>
+<tr><th>편</th><th>주제</th></tr>
+<tr><td><a href="02-run-model-proxy.html">02편 실행 모델: workload, transport, proxy</a></td><td>transport별 proxy 동작, middleware 사슬, RunConfig, workload 수명 주기</td></tr>
+<tr><td><a href="03-isolation-secret.html">03편 격리와 secret, 공급망 보안</a></td><td>permission profile, 네트워크 격리와 egress proxy, secret provider, 이미지 출처 확인</td></tr>
+<tr><td><a href="04-registry-group-client.html">04편 registry, 그룹, 클라이언트 설정</a></td><td>registry 형식, registry server, 그룹, 클라이언트 설정 자동화</td></tr>
+<tr><td><a href="05-authn-authz.html">05편 인증과 인가</a></td><td>들어오는 인증, Cedar 인가, 나가는 인증</td></tr>
+<tr><td><a href="06-observability-operations.html">06편 관측, 감사, 사용 제한</a></td><td>OpenTelemetry, 감사 기록, rate limit</td></tr>
+<tr><td><a href="07-kubernetes-operator.html">07편 Kubernetes operator</a></td><td>CRD, reconcile, proxy runner, StatefulSet</td></tr>
+<tr><td><a href="08-vmcp.html">08편 vMCP와 optimizer</a></td><td>backend 집계, 이름 충돌 해결, composite tool, optimizer</td></tr>
+<tr><td><a href="09-skill-plugin.html">09편 skill과 plugin</a></td><td>skill과 plugin의 설치, 배포, 경계</td></tr>
+<tr><td><a href="10-platform-comparison.html">10편 우리 MCP 플랫폼과 비교</a></td><td>operator, MCP 서버 이미지, OAuth proxy를 ToolHive와 견준다</td></tr>
+</table></div>
+<p>처음 읽는 독자는 02편부터 차례로 읽어야 한다. Kubernetes만 궁금한 독자도 02편을 먼저 읽어야 하는데, 07편이 02편의 proxy 개념을 전제로 하기 때문이다.</p>
+
+<h2 id="sQ">12. 자가 점검 문제</h2>
+<p>먼저 답을 생각한 다음 펼쳐서 확인한다.</p>
+<details><summary>Q1. stdio MCP 서버를 MCP 클라이언트가 직접 실행할 때 누가 서버 프로세스를 띄우는가? ToolHive를 쓰면 무엇이 바뀌는가?</summary>
+<p>MCP 명세에서는 host가 서버를 하위 프로세스로 띄우고, 이 프로세스는 보통 사용자와 같은 권한으로 돈다. ToolHive를 쓰면 서버가 격리된 컨테이너에서 돌고, MCP 클라이언트는 하위 프로세스 대신 proxy의 HTTP endpoint에 접속한다.</p></details>
+<details><summary>Q2. ToolHive가 푸는 세 문제와 각각의 답을 말해 보라.</summary>
+<p>첫째는 남의 코드가 내 권한으로 도는 문제이고, ToolHive는 컨테이너, permission profile, 네트워크 격리로 서버의 접근 범위를 줄인다. 둘째는 secret이 평문으로 남는 문제이고, ToolHive는 secret provider에 값을 두고 실행할 때만 넘긴다. 셋째는 클라이언트마다 설정 파일이 다른 문제이고, ToolHive는 등록한 클라이언트의 클라이언트 설정을 대신 고친다.</p></details>
+<details><summary>Q3. 로컬 CLI 모드에서 <code>thv run</code>이 끝난 뒤에도 proxy가 살아 있는 이유는?</summary>
+<p><code>thv run</code>은 자식 프로세스 <code>thv start &lt;이름&gt; --foreground</code>를 띄우고 끝난다. 자식 프로세스는 부모와 분리돼 있어서, 부모가 끝나도 계속 돌면서 proxy를 연다.</p></details>
+<details><summary>Q4. ToolHive UI는 컨테이너를 직접 만드는가?</summary>
+<p>만들지 않는다. UI는 <code>thv serve</code>로 API 서버를 띄우고 UNIX socket으로 요청을 보낸다. API 서버는 CLI와 같은 함수로 proxy 자식 프로세스를 띄우고, 컨테이너는 그 자식 프로세스가 만든다.</p></details>
+<details><summary>Q5. Kubernetes 모드에서 MCP 서버 StatefulSet은 누가 만드는가?</summary>
+<p>proxy runner(thv-proxyrunner)가 만든다. operator는 proxy runner의 Deployment와 Service를 만들고, MCP 서버의 컨테이너는 직접 만들지 않는다.</p></details>
+<details><summary>Q6. registry, 이미지 저장소, registry server는 어떻게 다른가?</summary>
+<p>registry는 ToolHive가 읽는 MCP 서버 목록이고, 이미지 저장소는 ghcr.io처럼 컨테이너 이미지를 보관하는 곳이다. registry 항목이 이미지 저장소의 이미지를 가리킨다. registry server는 registry를 API로 제공하는 별도 서버다. 내장 registry는 바이너리 안에 들어 있어서 별도 서버가 필요 없다.</p></details>
+<details><summary>Q7. <code>thv run</code>에 <code>--proxy-port</code>를 주지 않으면 proxy는 어느 포트에서 연결을 받는가?</summary>
+<p>ToolHive가 10000부터 65535 사이의 빈 포트를 임의로 고르고, host는 기본으로 127.0.0.1이다. 그래서 같은 서버라도 실행할 때마다 URL의 포트가 달라지는데, 등록한 클라이언트의 클라이언트 설정은 ToolHive가 새 URL로 고친다.</p></details>
+<details><summary>Q8. <code>thv stop</code>과 <code>thv rm</code>은 무엇이 다른가?</summary>
+<p><code>thv stop</code>은 proxy 프로세스를 끝내고 컨테이너를 멈춘다. 컨테이너를 지우지는 않으므로 <code>thv start</code>를 실행하면 서버가 빨리 다시 시작된다. <code>thv rm</code>은 컨테이너까지 지운다.</p></details>
+<details><summary>Q9. 로컬 workload를 Kubernetes로 옮길 때 <code>thv export --format k8s</code>만으로 충분한가?</summary>
+<p>서버가 secret, OIDC, telemetry, tool 필터를 쓰면 충분하지 않다. 이 설정은 출력에 빠지기 때문에 Kubernetes Secret, MCPOIDCConfig, MCPTelemetryConfig, MCPToolConfig를 따로 만들어야 한다. permission profile도 출력에 빠지고, 원격 서버는 이 방식으로 내보내지 못한다.</p></details>
+<details><summary>Q10. skill은 MCP 서버와 무엇이 다른가?</summary>
+<p>MCP 서버는 MCP 클라이언트가 호출하는 tool을 제공한다. skill은 SKILL.md로 된 지시 묶음이라서, 호출할 tool이 아니라 지식과 규칙을 준다. ToolHive는 skill을 workload로 실행하지 않고 MCP 클라이언트에 설치한다.</p></details>
+
+<h2 id="sR">13. 참고 자료</h2>
+<ul>
+  <li>공식 문서 <code>concepts/mcp-primer</code>: https://docs.stacklok.com/toolhive/concepts/mcp-primer</li>
+  <li>공식 문서 <code>index</code>, <code>faq</code>: https://docs.stacklok.com/toolhive/ , https://docs.stacklok.com/toolhive/faq</li>
+  <li>공식 문서 <code>guides-cli/install</code>, <code>guides-cli/quickstart</code>, <code>guides-cli/run-mcp-servers</code>, <code>guides-cli/secrets-management</code></li>
+  <li>공식 문서 <code>guides-ui/install</code>, <code>guides-ui/quickstart</code>, <code>guides-ui/cli-access</code></li>
+  <li>toolhive v0.63.0 <code>docs/arch/00-overview.md</code>, <code>01-deployment-modes.md</code>, <code>02-core-concepts.md</code>, <code>06-registry-system.md</code>. 네 문서는 v0.53.0과 같다.</li>
+  <li>toolhive v0.63.0 소스: <code>cmd/thv/app/</code> (<code>commands.go</code>, <code>run.go</code>, <code>run_flags.go</code>, <code>export.go</code>, <code>server.go</code>, <code>mcp.go</code>, <code>client.go</code>, <code>client_connector.go</code>, <code>runtime.go</code>, <code>llm.go</code>, <code>logs.go</code>)</li>
+  <li>toolhive v0.63.0 소스: <code>pkg/workloads/manager.go</code>, <code>pkg/runner/runner.go</code>, <code>pkg/client/config.go</code>, <code>pkg/client/manager.go</code>, <code>pkg/networking/port.go</code>, <code>pkg/container/docker/sdk/factory.go</code>, <code>pkg/container/kubernetes/client.go</code>, <code>pkg/api/server.go</code>, <code>pkg/api/v1/workload_service.go</code>, <code>pkg/export/k8s.go</code>, <code>pkg/registry/provider_local.go</code>, <code>pkg/runner/config_builder.go</code>, <code>cmd/thv-operator/controllers/mcpserver_statefulset.go</code>, <code>README.md</code>, <code>.goreleaser.yaml</code></li>
+  <li>toolhive 릴리스 노트 v0.54.0~v0.63.0. 이 문서에 반영한 항목은 다음과 같다. Pi 클라이언트와 <code>PI_CODING_AGENT_DIR</code>은 PR #6819와 #6839, Claude Desktop connector는 #6840, Homebrew cask는 #6859와 #6870이다. <code>thv llm setup</code>의 Pi 지원, <code>--scopes</code>, Codex Bedrock은 #6818, #6964, #7035다. RunConfig 재저장 때 secret 값을 지우는 변경은 <code>runner.go</code>의 diff에서 찾았고 PR 번호는 확인하지 않았다.</li>
+  <li>toolhive-studio v0.40.2: <code>main/src/toolhive-manager.ts</code>, <code>utils/constants.ts</code>, <code>package.json</code></li>
+  <li>toolhive-registry-server v1.5.3: <code>README.md</code>, <code>go.mod</code>, <code>LICENSE</code></li>
+</ul>
+<div class="box warn" id="unchecked">
+  <span class="label">대조한 것</span>
+  <p>명령 이름, 플래그 이름, 기본값, 출력 열 이름은 v0.63.0 소스의 해당 줄과 대조했다. 2026-11-07 갱신 때는 인용한 파일 25개 가운데 바뀐 7개를 v0.53.0과 diff로 읽었는데, <code>run.go</code>, <code>run_flags.go</code>, <code>logs.go</code>, <code>llm.go</code>, <code>runner.go</code>, <code>kubernetes/client.go</code>, <code>runtime/types.go</code>가 그 7개다. 인용한 줄의 동작은 바뀌지 않았고, 2장 표의 <code>pkg/client/config.go</code> 행 번호도 다시 찾았다. 배포 모드의 프로세스 구조는 아키텍처 문서를 읽고 코드에서 다시 확인했으며, 대상 코드는 <code>manager.go:747</code>, <code>workload_service.go:101</code>, <code>kubernetes/client.go:518</code>, <code>mcpserver_statefulset.go:29</code>, <code>toolhive-manager.ts:142</code>다. Homebrew cask는 <code>.goreleaser.yaml</code>에서 확인했고, stacklok/homebrew-tap의 <code>Casks/thv.rb</code>도 읽었는데 그 파일의 version은 0.63.0이다. toolhive-studio와 toolhive-registry-server의 최신 태그는 GitHub API로 확인했다.</p>
+  <span class="label">문서와 코드가 다른 곳</span>
+  <p>아키텍처 문서는 Kubernetes 변환 도구를 "계획 중"이라고 적지만 코드에는 <code>thv export --format k8s</code>가 있다. 아키텍처 문서의 <code>--tool</code> 플래그는 코드에서 <code>--tools</code>다. 아키텍처 문서는 permission profile의 기본값을 none으로 적는데, 플래그 설명은 registry 항목의 profile을 쓰고 없으면 network를 쓴다고 적는다. 공식 설치 문서는 소스 빌드에 Go 1.24 이상을 적지만 go.mod는 1.27을 적는다. 공식 설치 문서는 Homebrew 명령만 적고 cask를 말하지 않는데, tap은 v0.55.1부터 cask로 배포한다. 아키텍처 문서의 로컬 CLI 단계 목록은 부모가 컨테이너를 만든다고 적지만 코드에서는 자식 프로세스가 만든다. 공식 FAQ는 기본 권한이 최소라고 적는데, 코드에서 registry에 없는 이미지는 나가는 연결을 모두 허용하는 network profile을 받는다. 공식 quickstart는 <code>thv run</code>이 알려 주는 로그 파일을 서버 로그라고 부르지만, 코드에서 그 파일은 proxy 프로세스의 출력을 받는다.</p>
+  <span class="label">대조하지 못한 것</span>
+  <p>이 문서를 쓰면서 명령을 실제로 실행하지는 않았고, 출력 예는 공식 quickstart의 것이다. <code>toolhive-doc-mcp</code>의 transport와 tool 목록은 catalog 모듈 원본과 대조하지 않았다. 공식 문서는 remote 변형이 컨테이너 런타임 없이 돈다고 적지만 코드로 확인하지 않았다. UI 화면의 버튼 이름은 공식 문서에서 가져왔고 앱에서 확인하지 않았다. Windows와 Linux의 UI 파일 위치는 다루지 않았다. 공식 문서 사본은 2026-10-13 것이고, 2026-11-07에는 설치 문서와 CLI quickstart만 사이트에서 다시 읽었다. toolhive-studio v0.40.2는 <code>utils/constants.ts</code>와 <code>main/src/toolhive-manager.ts</code>만 GitHub API로 읽었고, <code>package.json</code>의 내용은 v0.40.1에서 읽은 것이다. Homebrew cask 설치는 실제로 실행하지 않았고, Windows용 Claude Desktop credential helper는 코드로 확인하지 않았다.</p>
+  <span class="label">회사의 주장</span>
+  <p>README는 semantic tool search가 LLM 토큰 사용량을 최대 85% 줄인다고 적는다(<code>README.md:31</code>). 이 수치는 Stacklok의 주장이고, 이 문서에서는 확인하지 않았다. 이 기능은 08편에서 다룬다. 익명 사용 지표가 tool 호출 횟수만 모은다는 내용도 공식 문서의 설명이다.</p>
+</div>
+<p>다음 학습은 <a href="02-run-model-proxy.html">02편 "실행 모델: workload, transport, proxy"</a>다.</p>
+
+<nav class="pager">
+<a class="prev" href="index.html"><span class="k">이전 글</span><span class="t">목차</span></a>
+<a class="next" href="02-run-model-proxy.html"><span class="k">다음 글</span><span class="t">실행 모델: workload, transport, proxy</span></a>
+</nav>
+
+<footer>2026-10-14 작성, 2026-11-07 갱신. 기준: ToolHive v0.63.0.</footer>
+</div>
+</body>
+</html>

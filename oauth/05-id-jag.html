@@ -1,0 +1,823 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ID-JAG</title>
+<link rel="stylesheet" href="../assets/learn.css">
+</head>
+<body>
+<div class="masthead"><div class="bar"><a class="brand" href="../index.html">learn</a><span class="crumb"><a href="index.html">OAuth</a></span></div></div>
+<div class="wrap">
+
+<header>
+  <h1>ID-JAG</h1>
+  <p class="kicker">OAuth 학습 5편 · 2026-11-12 작성 · 2026-11-18 보완</p>
+  <p>IdP가 발급하는 ID-JAG로 여러 MCP 서버의 로그인을 한 번으로 줄이는 방법을 정리했다.</p>
+</header>
+
+<div class="box key">
+  <span class="label">한 문장 요약</span>
+  <p>ID-JAG는 IdP가 서명한 수명이 짧은 JWT다. MCP 클라이언트가 이 JWT를 MCP 인가 서버에 내고 access token을 받는 방식이라서, 브라우저 로그인은 IdP에서 한 번만 하면 된다.</p>
+</div>
+
+<div class="box">
+  <span class="label">2026-11-18 보완 요약</span>
+  <ul>
+    <li>14.3절에 다섯 번째 전제 조건을 더했다. MCP 런타임이 backend API에 보낼 토큰을 따로 얻어야 한다는 조건이다.</li>
+    <li>같은 내용을 용어집, 14.4절 추천 표, 14.5절 PoC 순서, 15장 Q12에도 반영했다.</li>
+    <li>지금 흐름과 ID-JAG의 비교는 <a href="06-platform-auth-flow.html">6편</a>에서 그림으로 다룬다.</li>
+  </ul>
+</div>
+
+<div class="box">
+  <span class="label">읽는 방법</span>
+  <p>장마다 난이도를 표시해 두었다.</p>
+  <ul>
+    <li><span class="lvl l1">초급</span> 1장부터 3장까지로, ID-JAG가 푸는 문제와 전체 흐름을 다룬다.</li>
+    <li><span class="lvl l2">중급</span> 4장부터 9장까지로, 요청과 응답, claim, metadata를 다룬다.</li>
+    <li><span class="lvl l3">고급</span> 10장부터 14장까지로, 보안, 운영, 코드, 우리 플랫폼 적용을 다룬다.</li>
+  </ul>
+</div>
+
+<nav class="toc">
+  <b>목차</b>
+  <ol start="0">
+    <li><a href="#s0">용어집</a></li>
+    <li><a href="#s1">문제: 서버마다 반복되는 로그인</a></li>
+    <li><a href="#s2">ID-JAG 한눈에 보기</a></li>
+    <li><a href="#s3">등장인물과 신뢰 관계</a></li>
+    <li><a href="#s4">1단계: SSO</a></li>
+    <li><a href="#s5">2단계: token exchange</a></li>
+    <li><a href="#s6">ID-JAG의 구조</a></li>
+    <li><a href="#s7">3단계: JWT bearer grant</a></li>
+    <li><a href="#s8">discovery와 metadata</a></li>
+    <li><a href="#s9">다른 방식과 비교</a></li>
+    <li><a href="#s10">보안 설계</a></li>
+    <li><a href="#s11">운영 고려 사항</a></li>
+    <li><a href="#s12">실무 적용: fastmcp 서버</a></li>
+    <li><a href="#s13">실무 적용: MCP SDK 클라이언트</a></li>
+    <li><a href="#s14">실무 적용: 우리 플랫폼</a></li>
+    <li><a href="#s15">자가 점검 문제</a></li>
+    <li><a href="#s16">참고 자료</a></li>
+  </ol>
+</nav>
+
+<h2 id="s0">0. 용어집</h2>
+<p>이 문서에서는 아래 용어를 표에 적은 뜻으로만 쓴다.</p>
+<div class="tbl"><table>
+<tr><th>용어</th><th>이 문서에서의 뜻</th></tr>
+<tr><td>토큰</td><td>OAuth 토큰을 묶어 부르는 말. 종류를 구분할 때는 ID token, access token, refresh token, ID-JAG라고 쓴다.</td></tr>
+<tr><td>IdP</td><td>사용자 계정을 가지고 SSO와 ID-JAG 발급을 맡는 기업 신원 서비스. 예: Okta.</td></tr>
+<tr><td>MCP 클라이언트</td><td>사용자를 대신해 MCP 서버를 부르는 앱. 예: 에이전트, IDE. IETF 초안은 Client, Okta는 requesting app이라고 부른다.</td></tr>
+<tr><td>MCP 인가 서버</td><td>MCP 서버용 access token을 발급하는 서버. IETF 초안은 Resource Authorization Server라고 부른다. fastmcp에서는 OAuthProxy가 이 역할을 맡는다.</td></tr>
+<tr><td>MCP 서버</td><td>tool을 제공하고 access token을 검증하는 서버. IETF 초안은 Resource Server라고 부른다.</td></tr>
+<tr><td>SSO</td><td>사용자가 IdP에 한 번 로그인하고 여러 앱을 쓰는 방식.</td></tr>
+<tr><td>identity assertion</td><td>사용자가 IdP에 로그인했다는 증명. OIDC의 ID token이나 SAML assertion이다.</td></tr>
+<tr><td>ID-JAG</td><td>Identity Assertion JWT Authorization Grant. IdP가 특정 MCP 인가 서버 앞으로 발급하는 서명된 JWT다. access token이 아니다.</td></tr>
+<tr><td>subject token</td><td>token exchange 요청에서 사용자를 대신한다는 근거로 내는 값. 이 문서에서는 ID token이나 IdP refresh token이다.</td></tr>
+<tr><td>token exchange</td><td>RFC 8693. 가진 토큰을 내고 다른 종류의 토큰을 받는 OAuth 요청.</td></tr>
+<tr><td>JWT bearer grant</td><td>RFC 7523. 서명된 JWT를 내고 access token을 받는 OAuth 요청.</td></tr>
+<tr><td>정책</td><td>관리자가 IdP에 정한 접근 규칙. 어떤 사용자가 어떤 MCP 클라이언트로 어떤 MCP 서버를 쓸지 정한다.</td></tr>
+<tr><td>issuer 식별자</td><td>인가 서버가 자기 metadata에 공개하는 issuer 값. 4편의 issuer와 같다.</td></tr>
+<tr><td>resource 식별자</td><td>MCP 서버를 가리키는 URL. RFC 8707과 RFC 9728이 정한다.</td></tr>
+<tr><td>대화형 로그인</td><td>사용자가 브라우저 화면을 보며 하는 로그인.</td></tr>
+<tr><td>백채널 요청</td><td>브라우저 없이 앱이나 서버가 직접 보내는 HTTP 요청.</td></tr>
+<tr><td>동의 화면</td><td>인가 서버가 사용자에게 허용 여부를 묻는 화면. 우리 MCP 서버에서는 위임 scope를 고르는 화면이다.</td></tr>
+<tr><td>upstream 토큰</td><td>OAuthProxy가 authorization code 흐름에서 IdP에게 받아 저장한 토큰. MCP 클라이언트에게는 주지 않는다.</td></tr>
+<tr><td>backend API</td><td>MCP 서버의 tool이 부르는 API. 우리 플랫폼에서는 OpenAPI 스펙으로 등록한다.</td></tr>
+<tr><td>토큰 전달</td><td>MCP 런타임이 backend API 요청의 Authorization 헤더에 upstream 토큰을 넣는 동작. MCP 런타임의 토큰 전달 설정이 이 동작을 켠다.</td></tr>
+<tr><td>confidential client</td><td>비밀 값으로 자기를 인증하는 클라이언트. 비밀 값이 없는 클라이언트는 public client라고 부른다.</td></tr>
+<tr><td>replay</td><td>한 번 쓴 값을 다시 내서 검증을 통과하려는 공격.</td></tr>
+<tr><td>검증</td><td>받는 쪽이 JWT를 받아들일지 판단하는 전체 과정. 서명을 맞춰 보는 단계는 "서명 검증"이라고 부른다. 나머지 단계는 "확인"이라고 쓴다.</td></tr>
+</table></div>
+
+<h2 id="s1">1. 문제: 서버마다 반복되는 로그인<span class="lvl l1">초급</span></h2>
+<p>MCP 클라이언트는 MCP 서버마다 OAuth 흐름을 따로 거치는데, 기본 흐름은 다음과 같다(1편).</p>
+<ol>
+  <li>MCP 서버가 401 응답을 준다.</li>
+  <li>MCP 클라이언트가 Protected Resource Metadata에서 MCP 인가 서버를 찾는다.</li>
+  <li>MCP 클라이언트가 DCR이나 CIMD로 MCP 인가 서버에 자기를 등록한다.</li>
+  <li>MCP 클라이언트가 브라우저를 열어 사용자를 MCP 인가 서버로 보낸다.</li>
+  <li>사용자가 IdP에 로그인하고 동의 화면에서 허용한다.</li>
+  <li>MCP 클라이언트가 authorization code를 access token으로 바꾼다.</li>
+</ol>
+<p>MCP 서버가 세 개면 이 흐름도 세 번 일어나고, 세 서버가 같은 IdP를 써도 마찬가지다. IdP 세션이 남아 있으면 IdP가 비밀번호를 다시 묻지는 않지만, 브라우저 이동과 동의 화면은 서버마다 반복된다.</p>
+
+<h3>서버마다 따로 받는 이유</h3>
+<p>access token은 한 MCP 서버 앞으로 발급되고, 토큰의 <code>aud</code>에 그 서버가 들어 있다(<a href="04-issuer-audience-jwks-uri.html#s4">4편 4장</a>). MCP 권한 스펙은 MCP 서버가 자기 앞으로 발급된 토큰만 받도록 요구하고, 받은 토큰을 다른 서버로 그대로 넘기는 일(token passthrough)도 금지한다.</p>
+<p>그래서 서버 A의 access token을 서버 B에 쓰면 안 된다. 그렇게 쓰면 토큰 하나가 샐 때 그 사용자의 모든 MCP 서버가 열린다.</p>
+<div class="box key">
+  <p>ID-JAG는 이 규칙을 지키면서 반복을 줄인다. 사용자는 로그인을 한 번만 하고, access token은 여전히 서버마다 따로 받는다.</p>
+</div>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 820 330" width="820" role="img" aria-label="기본 흐름은 MCP 서버 세 개에 브라우저 로그인을 세 번 하고, ID-JAG 흐름은 IdP에 한 번 로그인한 뒤 서버마다 백채널 요청만 하는 비교 그림">
+    <defs>
+      <marker id="f1m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+      <marker id="f1w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="d-head-w" d="M0,0 L10,5 L0,10 z"/></marker>
+    </defs>
+
+    <rect class="d-outer" x="10" y="10" width="395" height="310" rx="12"/>
+    <text x="207" y="36" font-size="15" font-weight="600" text-anchor="middle">기본 흐름</text>
+    <text class="d-m" x="207" y="55" font-size="12" text-anchor="middle">서버마다 브라우저 로그인과 동의 화면</text>
+
+    <rect class="d-acc" x="30" y="150" width="120" height="60" rx="10"/>
+    <text x="90" y="185" font-size="13.5" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+
+    <rect class="d-box" x="255" y="74" width="130" height="52" rx="10"/>
+    <text x="320" y="105" font-size="13.5" text-anchor="middle">MCP 서버 A</text>
+    <rect class="d-box" x="255" y="164" width="130" height="52" rx="10"/>
+    <text x="320" y="195" font-size="13.5" text-anchor="middle">MCP 서버 B</text>
+    <rect class="d-box" x="255" y="254" width="130" height="52" rx="10"/>
+    <text x="320" y="285" font-size="13.5" text-anchor="middle">MCP 서버 C</text>
+
+    <path class="d-dash" d="M150,168 L253,102" marker-end="url(#f1w)"/>
+    <path class="d-dash" d="M150,180 L253,190" marker-end="url(#f1w)"/>
+    <path class="d-dash" d="M150,192 L253,278" marker-end="url(#f1w)"/>
+    <text class="d-w" x="196" y="124" font-size="12.5" font-weight="600">①</text>
+    <text class="d-w" x="200" y="178" font-size="12.5" font-weight="600">②</text>
+    <text class="d-w" x="196" y="246" font-size="12.5" font-weight="600">③</text>
+
+    <rect class="d-outer" x="415" y="10" width="395" height="310" rx="12"/>
+    <text x="612" y="36" font-size="15" font-weight="600" text-anchor="middle">ID-JAG</text>
+    <text class="d-m" x="612" y="55" font-size="12" text-anchor="middle">IdP에 한 번 로그인, 서버마다 백채널 요청</text>
+
+    <rect class="d-warn" x="435" y="74" width="120" height="52" rx="10"/>
+    <text x="495" y="105" font-size="13.5" font-weight="600" text-anchor="middle">IdP</text>
+    <rect class="d-acc" x="435" y="200" width="120" height="60" rx="10"/>
+    <text x="495" y="235" font-size="13.5" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+
+    <path class="d-dash" d="M480,200 L480,128" marker-end="url(#f1w)"/>
+    <text class="d-w" x="466" y="170" font-size="12.5" font-weight="600" text-anchor="end">①</text>
+    <path class="d-line" d="M510,128 L510,198" marker-end="url(#f1m)"/>
+    <path class="d-line" d="M520,198 L520,128" marker-end="url(#f1m)"/>
+    <text class="d-m" x="528" y="168" font-size="11.5">ID-JAG</text>
+
+    <rect class="d-box" x="660" y="74" width="130" height="52" rx="10"/>
+    <text x="725" y="105" font-size="13.5" text-anchor="middle">MCP 서버 A</text>
+    <rect class="d-box" x="660" y="164" width="130" height="52" rx="10"/>
+    <text x="725" y="195" font-size="13.5" text-anchor="middle">MCP 서버 B</text>
+    <rect class="d-box" x="660" y="254" width="130" height="52" rx="10"/>
+    <text x="725" y="285" font-size="13.5" text-anchor="middle">MCP 서버 C</text>
+
+    <path class="d-line" d="M555,214 L658,104" marker-end="url(#f1m)"/>
+    <path class="d-line" d="M555,230 L658,192" marker-end="url(#f1m)"/>
+    <path class="d-line" d="M555,246 L658,278" marker-end="url(#f1m)"/>
+  </svg>
+  </div>
+  <figcaption>그림 1. 점선은 브라우저를 여는 대화형 로그인이고, 실선은 백채널 요청이다. 서버 상자는 MCP 서버와 그 MCP 인가 서버를 함께 나타낸다. 오른쪽에서 브라우저를 여는 것은 ① 한 번뿐이다.</figcaption>
+</figure>
+
+<h2 id="s2">2. ID-JAG 한눈에 보기<span class="lvl l1">초급</span></h2>
+<p>ID-JAG 흐름은 세 단계로 나뉜다.</p>
+<ol>
+  <li><b>SSO</b>: 사용자가 MCP 클라이언트에서 IdP에 로그인하고, MCP 클라이언트는 ID token을 받는다.</li>
+  <li><b>token exchange</b>: MCP 클라이언트가 ID token을 IdP에 내고 서버 A용 ID-JAG를 받는다.</li>
+  <li><b>JWT bearer grant</b>: MCP 클라이언트가 ID-JAG를 서버 A의 MCP 인가 서버에 내면, 인가 서버가 access token을 준다.</li>
+</ol>
+<p>대화형 로그인은 1단계에만 있고, 2단계와 3단계는 백채널 요청이다. 서버 B와 C에는 2단계와 3단계만 반복하면 된다.</p>
+
+<div class="box">
+  <span class="label">비유</span>
+  <p>회사 건물 출입에 비유하면 다음과 같다.</p>
+  <ul>
+    <li>사원증은 ID token이고, 직원은 출근할 때 사원증을 한 번 받는다.</li>
+    <li>안내 데스크는 IdP다. 사원증을 보고 B동 방문증을 써 주는데, 이 방문증이 ID-JAG다.</li>
+    <li>B동 경비실은 MCP 인가 서버다. 방문증을 확인하고 B동 출입 카드를 주는데, 이 카드가 access token이다.</li>
+    <li>방문증에는 B동 이름과 짧은 유효 시간이 적혀 있어서 C동에서는 쓸 수 없다.</li>
+  </ul>
+  <p>안내 데스크는 회사 규칙도 확인하는데, 이 직원이 B동에 들어가도 되는지를 정하는 것이 IdP의 정책이다.</p>
+</div>
+
+<h3>이름 풀이</h3>
+<div class="tbl"><table>
+<tr><th>부분</th><th>뜻</th></tr>
+<tr><td>Identity Assertion</td><td>사용자가 IdP에 로그인했다는 증명을 근거로 한다.</td></tr>
+<tr><td>JWT</td><td>형식은 IdP가 서명한 JWT다.</td></tr>
+<tr><td>Authorization Grant</td><td>access token을 받을 때 내는 허가의 근거다. authorization code도 같은 종류다.</td></tr>
+</table></div>
+<p>정리하면 ID-JAG는 authorization code 자리에 들어가는 서명된 JWT다. authorization code는 브라우저를 거쳐 오지만, ID-JAG는 IdP가 백채널로 준다.</p>
+
+<h3>사용자가 보는 변화</h3>
+<div class="tbl"><table>
+<tr><th>항목</th><th>기본 흐름</th><th>ID-JAG</th></tr>
+<tr><td>브라우저 로그인</td><td>MCP 서버마다</td><td>IdP에 한 번</td></tr>
+<tr><td>동의 화면</td><td>MCP 서버마다</td><td>없다. IdP 정책이 대신한다.</td></tr>
+<tr><td>허용을 정하는 쪽</td><td>사용자</td><td>관리자(IdP 정책)</td></tr>
+<tr><td>서버별 access token</td><td>있다</td><td>있다</td></tr>
+</table></div>
+<div class="box warn">
+  <p>동의 화면이 없다는 점이 가장 큰 차이다. 사용자 대신 관리자가 허용 범위를 정하기 때문에, ID-JAG는 기업 IdP가 있는 환경에 맞는 방식이다.</p>
+</div>
+
+<h2 id="s3">3. 등장인물과 신뢰 관계<span class="lvl l1">초급</span></h2>
+<p>같은 역할을 문서마다 다른 이름으로 부르기 때문에, 아래 표로 이름을 맞춰 둔다.</p>
+<div class="tbl"><table>
+<tr><th>이 문서의 이름</th><th>IETF 초안</th><th>Okta 문서</th><th>예</th></tr>
+<tr><td>MCP 클라이언트</td><td>Client</td><td>requesting app</td><td>에이전트, IDE</td></tr>
+<tr><td>IdP</td><td>IdP Authorization Server</td><td>IdP</td><td>Okta, PingFederate</td></tr>
+<tr><td>MCP 인가 서버</td><td>Resource Authorization Server</td><td>resource authorization server</td><td>fastmcp OAuthProxy</td></tr>
+<tr><td>MCP 서버</td><td>Resource Server</td><td>resource app</td><td>MCP endpoint</td></tr>
+</table></div>
+<p>ID-JAG가 동작하려면 다음 세 신뢰 관계가 미리 있어야 한다.</p>
+<ol>
+  <li>MCP 클라이언트는 IdP에 등록된 앱이라서 IdP가 이 클라이언트를 인증할 수 있다.</li>
+  <li>MCP 인가 서버는 IdP를 신뢰하고, IdP의 issuer와 JWKS를 설정으로 가진다.</li>
+  <li>IdP는 MCP 클라이언트와 MCP 인가 서버의 연결을 안다. 이 연결은 관리자가 정책으로 만든다.</li>
+</ol>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 820 290" width="820" role="img" aria-label="IdP, MCP 클라이언트, MCP 인가 서버 사이의 세 신뢰 관계를 삼각형으로 나타낸 그림">
+    <rect class="d-warn" x="320" y="20" width="180" height="64" rx="10"/>
+    <text x="410" y="48" font-size="15" font-weight="600" text-anchor="middle">IdP</text>
+    <text class="d-m" x="410" y="70" font-size="12" text-anchor="middle">정책을 가진다</text>
+
+    <rect class="d-acc" x="50" y="200" width="190" height="64" rx="10"/>
+    <text x="145" y="228" font-size="15" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <text class="d-m" x="145" y="250" font-size="12" text-anchor="middle">ID token을 가진다</text>
+
+    <rect class="d-box" x="580" y="200" width="190" height="64" rx="10"/>
+    <text x="675" y="228" font-size="15" font-weight="600" text-anchor="middle">MCP 인가 서버</text>
+    <text class="d-m" x="675" y="250" font-size="12" text-anchor="middle">IdP의 JWKS로 검증한다</text>
+
+    <path class="d-line" d="M200,200 L345,84"/>
+    <text x="258" y="132" font-size="13" text-anchor="end">① IdP에 등록된 앱</text>
+
+    <path class="d-line" d="M620,200 L475,84"/>
+    <text x="562" y="132" font-size="13">② issuer와 JWKS를 신뢰</text>
+
+    <path class="d-dash" d="M240,232 L580,232"/>
+    <text x="410" y="222" font-size="13" text-anchor="middle">③ IdP 정책이 이 연결을 허용</text>
+    <text class="d-m" x="410" y="252" font-size="12" text-anchor="middle">IdP는 이 연결의 client_id도 안다</text>
+  </svg>
+  </div>
+  <figcaption>그림 2. 실선 두 개는 IdP를 중심으로 한 신뢰다. 점선은 클라이언트와 인가 서버가 직접 맺은 관계가 아니라 IdP 정책이 만든 연결이다.</figcaption>
+</figure>
+<p>세 관계는 모두 관리자가 미리 만든다. 그래서 처음 보는 MCP 서버에는 ID-JAG를 쓸 수 없는데, IdP가 그 서버의 인가 서버를 모르기 때문이다.</p>
+
+<h2 id="s4">4. 1단계: SSO<span class="lvl l2">중급</span></h2>
+<p>MCP 클라이언트는 IdP의 OIDC 로그인으로 사용자를 인증하는데, 이 흐름은 일반 authorization code 흐름과 같다. 로그인이 끝나면 MCP 클라이언트는 다음 값을 받는다.</p>
+<div class="tbl"><table>
+<tr><th>값</th><th>쓰임</th></tr>
+<tr><td>ID token</td><td>2단계의 subject token이다. <code>aud</code>는 IdP에 등록된 MCP 클라이언트의 client_id다.</td></tr>
+<tr><td>refresh token</td><td>선택이다. ID token이 만료된 뒤 새 ID-JAG를 받을 때 subject token으로 쓴다. IdP에 따라 <code>offline_access</code> scope가 필요하다.</td></tr>
+<tr><td>access token</td><td>IdP 자체 API용이다. MCP 서버에는 쓰지 않는다.</td></tr>
+</table></div>
+<p>SAML로 로그인하는 클라이언트도 있는데, 이런 클라이언트는 SAML assertion을 IdP의 refresh token으로 바꾼 뒤 2단계로 간다.</p>
+<div class="box warn">
+  <p>MCP 클라이언트는 ID token을 MCP 서버에 보내면 안 된다. ID token의 <code>aud</code>는 MCP 클라이언트이므로 MCP 서버는 이 값을 거부해야 한다(<a href="04-issuer-audience-jwks-uri.html#s4">4편 4장</a>).</p>
+</div>
+<p>IdP는 이 단계에서 MFA 같은 로그인 규칙을 적용하고, 2단계와 3단계에서는 사용자가 아무것도 하지 않는다.</p>
+
+<h2 id="s5">5. 2단계: token exchange<span class="lvl l2">중급</span></h2>
+<p>MCP 클라이언트는 IdP의 token endpoint에 다음 요청을 보낸다. 예시의 주소와 값은 설명용이다.</p>
+<pre><code>POST /oauth2/token HTTP/1.1
+Host: idp.example.com
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+&amp;requested_token_type=urn:ietf:params:oauth:token-type:id-jag
+&amp;audience=https://mcp-a.example.com
+&amp;resource=https://mcp-a.example.com/mcp
+&amp;scope=calendar.read
+&amp;subject_token=eyJraWQiOiJzMTZ0cVNt...
+&amp;subject_token_type=urn:ietf:params:oauth:token-type:id_token
+&amp;client_id=agent-app
+&amp;client_secret=...</code></pre>
+<div class="tbl"><table>
+<tr><th>파라미터</th><th>필수 여부</th><th>값과 뜻</th></tr>
+<tr><td><code>grant_type</code></td><td>필수</td><td>token exchange를 뜻하는 URN</td></tr>
+<tr><td><code>requested_token_type</code></td><td>필수</td><td><code>urn:ietf:params:oauth:token-type:id-jag</code>. ID-JAG를 달라는 뜻이다.</td></tr>
+<tr><td><code>audience</code></td><td>필수</td><td>MCP 인가 서버의 issuer 식별자. 값은 하나만 넣는다.</td></tr>
+<tr><td><code>resource</code></td><td>권장</td><td>MCP 서버의 resource 식별자. MCP 확장 스펙은 이 값을 넣는다면 MCP 서버의 식별자여야 한다고 정한다.</td></tr>
+<tr><td><code>scope</code></td><td>선택</td><td>원하는 scope. IdP 정책이 범위를 줄일 수 있다.</td></tr>
+<tr><td><code>subject_token</code></td><td>필수</td><td>1단계에서 받은 ID token. IdP가 허용하면 refresh token도 된다.</td></tr>
+<tr><td><code>subject_token_type</code></td><td>필수</td><td>subject token의 종류를 뜻하는 URN. <code>id_token</code>, <code>refresh_token</code>, <code>saml2</code> 중 하나다.</td></tr>
+<tr><td><code>client_id</code>, <code>client_secret</code></td><td>필수</td><td>IdP에 등록된 MCP 클라이언트의 자격. IdP는 클라이언트를 반드시 인증한다.</td></tr>
+</table></div>
+
+<h3>IdP의 처리 순서</h3>
+<p>IdP는 다음 순서로 요청을 처리한다(초안 4.3.3절).</p>
+<ol>
+  <li>MCP 클라이언트를 인증한다. 실패하면 <code>invalid_client</code>로 거부한다.</li>
+  <li>subject token이 자기가 발급한 값인지 확인한다.</li>
+  <li>ID token의 <code>aud</code>가 인증한 클라이언트인지 확인한다.</li>
+  <li><code>audience</code>가 하나인지 확인한다.</li>
+  <li><code>audience</code>가 신뢰하는 MCP 인가 서버인지 확인한다.</li>
+  <li>정책을 평가해서 이 사용자가 이 클라이언트로 이 서버를 써도 되는지 본다.</li>
+  <li>허용한 scope와 resource를 담아 ID-JAG를 서명한다.</li>
+</ol>
+
+<h3>응답</h3>
+<pre><code>HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: no-store
+
+{
+  "issued_token_type": "urn:ietf:params:oauth:token-type:id-jag",
+  "access_token": "eyJ0eXAiOiJvYXV0aC1pZC1qYWcrand0Ii...",
+  "token_type": "N_A",
+  "scope": "calendar.read",
+  "expires_in": 300
+}</code></pre>
+<p><code>issued_token_type</code>은 받은 값이 ID-JAG라는 뜻이다. ID-JAG 값이 <code>access_token</code> 필드에 들어 있는 것은 RFC 8693의 응답 형식이 이 필드 이름을 쓰기 때문이다. <code>token_type</code>은 <code>N_A</code>인데, 이 값으로 API를 부를 수 없다는 뜻이다.</p>
+<div class="box warn">
+  <p>필드 이름이 <code>access_token</code>이어도 ID-JAG는 access token이 아니므로, MCP 클라이언트는 이 값을 MCP 서버의 <code>Authorization</code> 헤더에 넣으면 안 된다.</p>
+</div>
+
+<h3>오류</h3>
+<div class="tbl"><table>
+<tr><th>오류</th><th>뜻</th></tr>
+<tr><td><code>invalid_client</code></td><td>MCP 클라이언트 인증에 실패했다.</td></tr>
+<tr><td><code>invalid_request</code></td><td>요청 형식이 틀렸다. <code>audience</code>가 둘 이상인 경우도 여기에 든다. 초안 -06부터는 잘못된 subject token도 이 오류다.</td></tr>
+<tr><td><code>invalid_target</code></td><td><code>audience</code>가 IdP가 신뢰하지 않는 MCP 인가 서버다.</td></tr>
+<tr><td><code>access_denied</code></td><td>정책이 이 사용자나 클라이언트에게 그 서버를 허용하지 않았다.</td></tr>
+<tr><td><code>insufficient_user_authentication</code></td><td>더 강한 로그인이 필요하다. 10.6절에서 다룬다.</td></tr>
+</table></div>
+
+<h2 id="s6">6. ID-JAG의 구조<span class="lvl l2">중급</span></h2>
+<p>ID-JAG를 디코딩하면 다음과 같다. 값은 설명용이다.</p>
+<pre><code>// header
+{ "typ": "oauth-id-jag+jwt", "alg": "RS256", "kid": "idp-key-1" }
+
+// payload
+{
+  "iss": "https://idp.example.com",
+  "sub": "00u1abcd",
+  "aud": "https://mcp-a.example.com",
+  "resource": "https://mcp-a.example.com/mcp",
+  "client_id": "agent-at-mcp-a",
+  "scope": "calendar.read",
+  "jti": "9e43f81b64a33f20",
+  "iat": 1794000000,
+  "exp": 1794000300,
+  "email": "user@example.com"
+}</code></pre>
+<p>IETF 초안 3.1절은 claim을 다음과 같이 정한다.</p>
+<div class="tbl"><table>
+<tr><th>claim</th><th>필수 여부</th><th>뜻</th></tr>
+<tr><td><code>typ</code> (헤더)</td><td>필수</td><td><code>oauth-id-jag+jwt</code>. 다른 JWT와 구분하는 값이다.</td></tr>
+<tr><td><code>iss</code></td><td>필수</td><td>IdP의 issuer 식별자</td></tr>
+<tr><td><code>sub</code></td><td>필수</td><td>사용자 식별자. IdP가 MCP 인가 서버 단위로 고른다(10.7절).</td></tr>
+<tr><td><code>aud</code></td><td>필수</td><td>MCP 인가 서버의 issuer 식별자</td></tr>
+<tr><td><code>client_id</code></td><td>필수</td><td>MCP 인가 서버에 등록된 MCP 클라이언트의 client_id. IdP에서 쓰는 client_id와 다를 수 있다.</td></tr>
+<tr><td><code>jti</code></td><td>필수</td><td>이 ID-JAG의 고유 ID. replay를 막는 데 쓴다.</td></tr>
+<tr><td><code>iat</code>, <code>exp</code></td><td>필수</td><td>발급 시각과 만료 시각</td></tr>
+<tr><td><code>resource</code></td><td>선택</td><td>MCP 서버의 resource 식별자</td></tr>
+<tr><td><code>scope</code></td><td>선택</td><td>IdP가 허용한 scope</td></tr>
+<tr><td><code>email</code>, <code>aud_sub</code></td><td>선택</td><td>계정 연결에 쓰는 값. 초안은 둘 중 하나 이상을 넣기를 권장한다.</td></tr>
+<tr><td><code>tenant</code>, <code>aud_tenant</code></td><td>선택</td><td>여러 테넌트를 쓰는 IdP나 MCP 인가 서버가 쓰는 값</td></tr>
+<tr><td><code>auth_time</code>, <code>acr</code>, <code>amr</code></td><td>선택</td><td>로그인 시각과 로그인 방법</td></tr>
+</table></div>
+<p>이 가운데 중요한 claim은 <code>aud</code>와 <code>client_id</code>다. <code>aud</code>는 이 ID-JAG를 받을 MCP 인가 서버를 정하고, <code>client_id</code>는 이 ID-JAG를 낼 클라이언트를 정한다.</p>
+
+<h3>세 JWT 비교</h3>
+<p>1단계부터 3단계까지 JWT 세 개가 나오는데, 겉모습은 비슷하지만 받는 쪽이 다르다.</p>
+<div class="tbl"><table>
+<tr><th>항목</th><th>ID token</th><th>ID-JAG</th><th>access token</th></tr>
+<tr><td>발급자</td><td>IdP</td><td>IdP</td><td>MCP 인가 서버</td></tr>
+<tr><td><code>aud</code></td><td>MCP 클라이언트</td><td>MCP 인가 서버</td><td>MCP 서버</td></tr>
+<tr><td>받는 쪽</td><td>MCP 클라이언트</td><td>MCP 인가 서버</td><td>MCP 서버</td></tr>
+<tr><td>쓰임</td><td>로그인 증명</td><td>access token 요청의 근거</td><td>MCP 요청</td></tr>
+<tr><td>수명</td><td>IdP 설정을 따른다</td><td>짧다. 초안 예시는 300초다.</td><td>MCP 인가 서버 설정을 따른다</td></tr>
+</table></div>
+<p>받는 쪽은 <code>typ</code>와 <code>aud</code>로 종류를 구분해야 한다. 이 검사가 없으면 한 종류의 JWT를 다른 종류처럼 낼 가능성이 있다.</p>
+
+<h2 id="s7">7. 3단계: JWT bearer grant<span class="lvl l2">중급</span></h2>
+<p>MCP 클라이언트는 ID-JAG를 MCP 인가 서버의 token endpoint에 낸다.</p>
+<pre><code>POST /token HTTP/1.1
+Host: mcp-a.example.com
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer
+&amp;assertion=eyJ0eXAiOiJvYXV0aC1pZC1qYWcrand0Ii...
+&amp;client_id=agent-at-mcp-a
+&amp;client_secret=...
+&amp;resource=https://mcp-a.example.com/mcp</code></pre>
+<p>ID-JAG는 <code>assertion</code> 파라미터에 넣고, 요청은 authorization code를 교환하는 token endpoint와 같은 주소로 보낸다.</p>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 840 600" width="840" role="img" aria-label="브라우저, MCP 클라이언트, IdP, MCP 인가 서버, MCP 서버 다섯 참여자 사이의 ID-JAG 전체 순서도">
+    <defs>
+      <marker id="f3m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+      <marker id="f3w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="d-head-w" d="M0,0 L10,5 L0,10 z"/></marker>
+    </defs>
+
+    <rect class="d-band" x="8" y="66" width="824" height="200" rx="8"/>
+    <rect class="d-band" x="8" y="276" width="824" height="104" rx="8"/>
+    <rect class="d-band" x="8" y="390" width="824" height="104" rx="8"/>
+    <rect class="d-band" x="8" y="504" width="824" height="84" rx="8"/>
+    <text class="d-a" x="16" y="84" font-size="12" font-weight="700">1단계 SSO</text>
+    <text class="d-a" x="16" y="294" font-size="12" font-weight="700">2단계</text>
+    <text class="d-a" x="16" y="408" font-size="12" font-weight="700">3단계</text>
+    <text class="d-a" x="16" y="522" font-size="12" font-weight="700">사용</text>
+
+    <rect class="d-box" x="20" y="12" width="110" height="40" rx="8"/>
+    <text x="75" y="37" font-size="13" font-weight="600" text-anchor="middle">브라우저</text>
+    <rect class="d-acc" x="170" y="12" width="130" height="40" rx="8"/>
+    <text x="235" y="37" font-size="13" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <rect class="d-warn" x="345" y="12" width="110" height="40" rx="8"/>
+    <text x="400" y="37" font-size="13" font-weight="600" text-anchor="middle">IdP</text>
+    <rect class="d-box" x="510" y="12" width="140" height="40" rx="8"/>
+    <text x="580" y="37" font-size="13" font-weight="600" text-anchor="middle">MCP 인가 서버</text>
+    <rect class="d-box" x="690" y="12" width="120" height="40" rx="8"/>
+    <text x="750" y="37" font-size="13" font-weight="600" text-anchor="middle">MCP 서버</text>
+
+    <path class="d-life" d="M75,52 L75,590"/>
+    <path class="d-life" d="M235,52 L235,590"/>
+    <path class="d-life" d="M400,52 L400,590"/>
+    <path class="d-life" d="M580,52 L580,590"/>
+    <path class="d-life" d="M750,52 L750,590"/>
+
+    <path class="d-dash" d="M235,108 L77,108" marker-end="url(#f3w)"/>
+    <text x="155" y="101" font-size="12" text-anchor="middle">IdP 로그인으로 보낸다</text>
+    <path class="d-dash" d="M75,138 L398,138" marker-end="url(#f3w)"/>
+    <text x="318" y="131" font-size="12" text-anchor="middle">사용자 로그인 (MFA 포함)</text>
+    <path class="d-dash" d="M400,168 L77,168" marker-end="url(#f3w)"/>
+    <text x="318" y="161" font-size="12" text-anchor="middle">authorization code</text>
+    <path class="d-dash" d="M75,196 L233,196" marker-end="url(#f3w)"/>
+    <text x="155" y="189" font-size="12" text-anchor="middle">code 전달</text>
+    <path class="d-line" d="M235,226 L398,226" marker-end="url(#f3m)"/>
+    <text x="318" y="219" font-size="12" text-anchor="middle">code로 토큰 요청</text>
+    <path class="d-line" d="M400,254 L237,254" marker-end="url(#f3m)"/>
+    <text x="318" y="247" font-size="12" text-anchor="middle">ID token, refresh token</text>
+
+    <path class="d-line" d="M235,312 L398,312" marker-end="url(#f3m)"/>
+    <text x="318" y="305" font-size="12" text-anchor="middle">token exchange</text>
+    <text class="d-m" x="408" y="338" font-size="11.5">정책 평가</text>
+    <path class="d-line" d="M400,364 L237,364" marker-end="url(#f3m)"/>
+    <text x="318" y="357" font-size="12" text-anchor="middle">ID-JAG (aud = A)</text>
+
+    <path class="d-line" d="M235,426 L578,426" marker-end="url(#f3m)"/>
+    <text x="408" y="419" font-size="12" text-anchor="middle">jwt-bearer grant (ID-JAG)</text>
+    <text class="d-m" x="588" y="452" font-size="11.5">ID-JAG 검증</text>
+    <path class="d-line" d="M580,478 L237,478" marker-end="url(#f3m)"/>
+    <text x="408" y="471" font-size="12" text-anchor="middle">access token</text>
+
+    <path class="d-line" d="M235,540 L748,540" marker-end="url(#f3m)"/>
+    <text x="492" y="533" font-size="12" text-anchor="middle">MCP 요청 + access token</text>
+    <path class="d-line" d="M750,570 L237,570" marker-end="url(#f3m)"/>
+    <text x="492" y="563" font-size="12" text-anchor="middle">응답</text>
+  </svg>
+  </div>
+  <figcaption>그림 3. 전체 순서. 점선은 브라우저를 거치는 요청이고, 실선은 백채널 요청이다. 서버 B와 C에는 2단계부터 반복하고, 이때 브라우저는 쓰지 않는다.</figcaption>
+</figure>
+
+<h3>MCP 인가 서버의 검증 순서</h3>
+<p>MCP 인가 서버는 다음 순서로 ID-JAG를 검증한다(초안 4.4.1절). 5번과 8번은 초안이 선택으로 둔 단계다.</p>
+<ol>
+  <li>헤더의 <code>typ</code>가 <code>oauth-id-jag+jwt</code>인지 확인한다.</li>
+  <li><code>iss</code>가 신뢰하는 IdP인지 확인한다. 아니면 <code>invalid_grant</code>로 거부한다.</li>
+  <li>IdP의 JWKS로 서명을 검증한다. 허용한 알고리즘만 쓴다.</li>
+  <li><code>aud</code>가 자기 issuer 식별자인지 확인한다.</li>
+  <li><code>exp</code>를 확인한다. 수명이 정책보다 길면 거부한다.</li>
+  <li>요청한 클라이언트를 인증하고 <code>client_id</code>와 같은지 확인한다.</li>
+  <li><code>resource</code>가 자기가 맡은 MCP 서버인지 확인한다.</li>
+  <li><code>jti</code>를 기록한다. 같은 값이 다시 오면 거부한다.</li>
+  <li><code>sub</code>로 사용자를 찾는다.</li>
+  <li>허용할 scope를 정하고 access token을 발급한다.</li>
+</ol>
+<p>서명을 먼저 검증하는 이유는 4편과 같은데, 서명이 맞아야 claim의 내용을 믿을 수 있기 때문이다.</p>
+
+<h3>응답과 refresh token</h3>
+<pre><code>HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: no-store
+
+{
+  "token_type": "Bearer",
+  "access_token": "eyJhbGciOiJIUzI1NiIs...",
+  "expires_in": 300,
+  "scope": "calendar.read"
+}</code></pre>
+<p>MCP 인가 서버는 원칙적으로 refresh token을 주지 않고, 초안도 이를 SHOULD NOT으로 정한다. ID-JAG가 refresh token의 역할을 대신하기 때문이다.</p>
+<p>access token이 만료되면 MCP 클라이언트는 다음 순서로 새 값을 받는다.</p>
+<ol>
+  <li>가진 ID token이나 IdP refresh token으로 2단계를 다시 한다.</li>
+  <li>새 ID-JAG로 3단계를 다시 한다.</li>
+  <li>subject token도 모두 만료됐다면 사용자를 다시 로그인시킨다.</li>
+</ol>
+<p>이 구조에서는 IdP가 세션의 수명을 정한다. 반대로 MCP 인가 서버가 refresh token을 주면 IdP가 세션을 끊어도 접근이 남는다.</p>
+
+<h2 id="s8">8. discovery와 metadata<span class="lvl l2">중급</span></h2>
+<p>각 참여자는 metadata로 ID-JAG 지원을 알린다.</p>
+<div class="tbl"><table>
+<tr><th>누가</th><th>어디에</th><th>필드와 값</th></tr>
+<tr><td>MCP 인가 서버</td><td>인가 서버 metadata (RFC 8414)</td><td><code>grant_types_supported</code>에 jwt-bearer grant URN을 넣는다. <code>authorization_grant_profiles_supported</code>에 <code>urn:ietf:params:oauth:grant-profile:id-jag</code>를 넣는다.</td></tr>
+<tr><td>IdP</td><td>IdP metadata</td><td><code>identity_chaining_requested_token_types_supported</code>에 <code>urn:ietf:params:oauth:token-type:id-jag</code>를 넣는다. 서명 알고리즘 목록 <code>id_jag_signing_alg_values_supported</code>는 선택이다.</td></tr>
+<tr><td>MCP 클라이언트</td><td>DCR 요청이나 CIMD</td><td><code>authorization_grant_profiles_supported</code>에 ID-JAG profile을 넣는다.</td></tr>
+</table></div>
+<p>MCP 인가 서버가 grant type과 profile을 따로 알리는 것은 jwt-bearer grant가 ID-JAG가 아닌 용도에도 쓰이기 때문이다. profile을 알린 서버도 아무 IdP나 받지는 않고, 어떤 IdP와 클라이언트를 받을지는 MCP 인가 서버의 설정이 정한다.</p>
+
+<h3>MCP 확장</h3>
+<p>MCP는 이 흐름을 공식 확장으로 정했고, 확장 이름은 Enterprise-Managed Authorization이다.</p>
+<ul>
+  <li>확장 식별자는 <code>io.modelcontextprotocol/enterprise-managed-authorization</code>이다.</li>
+  <li>SEP-990에서 시작했고, 2026-07-28 판이 stable 단계다.</li>
+  <li>MCP 클라이언트는 요청의 <code>_meta</code>에 이 확장을 지원한다고 적는다.</li>
+  <li>MCP 서버는 인가 metadata에 이 확장을 요구한다고 적는다.</li>
+</ul>
+<pre><code>{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "...",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/clientCapabilities": {
+        "extensions": {
+          "io.modelcontextprotocol/enterprise-managed-authorization": {}
+        }
+      }
+    }
+  }
+}</code></pre>
+<p>MCP 서버가 이 확장을 요구하면 MCP 클라이언트는 사용자를 authorize endpoint로 보내지 않아야 하고, 대신 2단계와 3단계를 한다.</p>
+
+<h3>MCP 인가 서버를 고르는 방법</h3>
+<p>기본 MCP 흐름에서 MCP 클라이언트는 MCP 서버가 알려 준 인가 서버를 따른다. MCP Python SDK의 ID-JAG 클라이언트는 이와 다르게 MCP 인가 서버의 issuer를 설정으로 받는다(13장).</p>
+<p>그래서 MCP 서버가 다른 인가 서버를 알려 줘도 SDK는 ID-JAG와 비밀 값을 그쪽으로 보내지 않는다. 악성 MCP 서버가 ID-JAG를 가로채는 것을 막는 설계다.</p>
+
+<h2 id="s9">9. 다른 방식과 비교<span class="lvl l2">중급</span></h2>
+<div class="tbl"><table>
+<tr><th>방식</th><th>사용자가 하는 일</th><th>허용을 정하는 쪽</th><th>맞는 상황</th></tr>
+<tr><td>서버별 authorization code</td><td>서버마다 브라우저 로그인과 동의</td><td>사용자</td><td>개인 사용자, 기업 IdP가 없는 환경</td></tr>
+<tr><td>서버 사이 access token 공유</td><td>한 번 로그인</td><td>정하는 쪽이 없다</td><td>쓰면 안 된다. audience 규칙을 어긴다.</td></tr>
+<tr><td>ID-JAG</td><td>IdP에 한 번 로그인</td><td>관리자(IdP 정책)</td><td>기업 IdP가 있는 환경</td></tr>
+<tr><td>게이트웨이와 token exchange</td><td>게이트웨이에 한 번 로그인</td><td>게이트웨이</td><td>MCP 서버를 한 주소로 묶는 환경</td></tr>
+<tr><td>client credentials</td><td>없음</td><td>관리자</td><td>사용자가 없는 서버 간 호출</td></tr>
+</table></div>
+<p>Okta 문서는 ID-JAG가 맞지 않는 상황도 적어 두었는데, 사용자 없이 도는 에이전트, 배치 작업, IdP가 없는 앱이 그런 상황이다.</p>
+
+<h3>게이트웨이 방식과의 차이</h3>
+<p>게이트웨이 방식은 MCP 서버 여러 개를 한 MCP 주소 뒤에 두고, MCP 클라이언트는 게이트웨이 하나에만 로그인한다. 게이트웨이가 뒤쪽 서버마다 토큰을 바꿔서 보낸다. 이 방식은 IdP의 ID-JAG 기능이 필요 없지만, 게이트웨이가 모든 접근의 관문이 된다.</p>
+<p>ID-JAG는 MCP 서버의 구성을 그대로 두고, 대신 IdP가 서버마다 접근을 정한다.</p>
+
+<h2 id="s10">10. 보안 설계<span class="lvl l3">고급</span></h2>
+<p>ID-JAG는 누가 발급했는지, 누가 낼 수 있는지, 어디에 쓸 수 있는지의 세 가지를 하나의 서명으로 묶는다.</p>
+
+<h3>10.1 받는 쪽 묶기: aud와 resource</h3>
+<p><code>aud</code>는 MCP 인가 서버를 정하고, <code>resource</code>는 그 인가 서버가 맡은 MCP 서버를 정한다. 초안 9.4절은 한 ID-JAG를 다른 MCP 인가 서버에 다시 쓰지 못하게 하고, MCP 확장 스펙은 access token도 <code>resource</code>의 MCP 서버로 묶으라고 요구한다.</p>
+
+<h3>10.2 내는 쪽 묶기: client_id와 클라이언트 인증</h3>
+<p><code>client_id</code> claim은 ID-JAG를 낼 수 있는 클라이언트를 정하고, MCP 인가 서버는 요청한 클라이언트를 인증한 뒤 이 값과 비교한다. 클라이언트 인증이 없으면 훔친 ID-JAG를 누구나 낼 수 있어서, 초안 4.4절은 다음 둘 중 하나를 요구한다.</p>
+<ul>
+  <li>클라이언트 인증. MCP 클라이언트가 confidential client여야 한다.</li>
+  <li>sender-constrained ID-JAG. IdP가 <code>cnf</code> claim에 DPoP 키(<code>jkt</code>)나 mTLS 인증서(<code>x5t#S256</code>)를 묶는다.</li>
+</ul>
+<p>MCP 인가 서버는 둘 다 없는 요청을 <code>invalid_client</code>로 거부해야 한다.</p>
+
+<h3>10.3 replay와 수명</h3>
+<p>ID-JAG는 수명이 짧고, 초안과 MCP 확장 스펙의 예시 수명은 300초다. MCP 인가 서버는 <code>jti</code>를 기록해서 같은 ID-JAG를 한 번만 받을 수 있는데, 수명이 짧으면 기록해 둘 <code>jti</code>도 적다.</p>
+
+<h3>10.4 typ로 종류 구분하기</h3>
+<p>ID token과 ID-JAG는 같은 IdP가 같은 키로 서명할 수 있어서 서명만으로는 둘을 구분하지 못한다. <code>typ</code> 검사가 없으면 공격자가 ID token을 ID-JAG처럼 낼 가능성이 있다. <code>aud</code> 검사도 이 공격을 막지만, <code>typ</code>는 종류 자체를 한 번 더 막는다.</p>
+
+<h3>10.5 subject token 보관</h3>
+<p>MCP 클라이언트가 가진 ID token과 IdP refresh token은 가치가 크다. 이 값이 있으면 허용된 모든 MCP 서버의 ID-JAG를 받을 수 있기 때문이다. 초안 9.2절은 MCP 클라이언트에게 다음을 권한다.</p>
+<ul>
+  <li>저장할 때 암호화한다.</li>
+  <li>클라이언트의 비밀 값과 따로 둔다.</li>
+  <li>로그에 남기지 않는다.</li>
+  <li>사용자 세션 단위로 두고, 필요가 없어지면 버린다.</li>
+  <li>ID-JAG를 캐시하지 않고 필요할 때 새로 받는다.</li>
+</ul>
+
+<h3 id="s10-6">10.6 step-up 인증</h3>
+<p>민감한 MCP 서버에는 더 강한 로그인을 요구할 수 있다. 이때 IdP가 2단계에서 <code>insufficient_user_authentication</code> 오류를 주면, MCP 클라이언트는 사용자를 다시 로그인시킨 뒤 2단계를 다시 한다.</p>
+
+<h3 id="s10-7">10.7 사용자 식별</h3>
+<p>IdP는 <code>sub</code>를 MCP 인가 서버 단위로 고르기 때문에, 같은 사용자는 어느 클라이언트가 요청해도 같은 <code>sub</code>를 받는다. 그래서 ID-JAG의 <code>sub</code>는 MCP 클라이언트가 받은 ID token의 <code>sub</code>와 다를 수 있는데, 서비스마다 다른 식별자(pairwise)를 주는 IdP가 그런 경우다.</p>
+<p>MCP 인가 서버는 <code>sub</code>를 주 식별자로 써야 하고, <code>email</code>은 기존 계정과 처음 연결할 때만 보조로 쓴다.</p>
+
+<h3>10.8 아직 정해지지 않은 부분</h3>
+<p>MCP 확장 스펙의 보안 검토(ext-auth PR #12)는 다음 빈 곳을 지적했다.</p>
+<ul>
+  <li>이미 발급한 access token과 ID-JAG를 취소하는 방법을 정하지 않았다.</li>
+  <li>서버마다 scope 이름이 겹칠 수 있다.</li>
+  <li>ID-JAG replay를 막는 대책이 더 필요하다.</li>
+</ul>
+<p>IdP 정책은 연결 단위로 동작하고, IdP는 MCP 요청 자체를 보지 못한다. 그래서 tool 단위 검사는 MCP 서버가 따로 해야 한다.</p>
+
+<h2 id="s11">11. 운영 고려 사항<span class="lvl l3">고급</span></h2>
+
+<h3>11.1 재교환 비용</h3>
+<p>refresh token이 없으므로 access token이 만료될 때마다 IdP에 한 번, MCP 인가 서버에 한 번씩 요청이 두 번 생긴다. 예를 들어 access token 수명이 5분이면 서버 하나에 한 시간에 12번 재교환하고, 서버 3개를 2시간 쓰면 ID-JAG를 72개 받는다.</p>
+
+<h3>11.2 IdP의 발급 한도</h3>
+<p>IdP는 ID-JAG 발급에 한도나 요금을 둘 수 있다. MCP 공식 문서의 지원 표에 따르면 Okta는 Okta SSO 기본 기능으로 ID-JAG를 발급하지만, 사용자 한 명, resource app 하나에 월 250개까지다. 그보다 많이 쓰려면 Okta for AI Agents가 필요하다.</p>
+<p>access token 수명이 5분이면 한 서버를 한 달에 약 20시간만 연속으로 쓸 수 있는데, 250을 12로 나누면 약 20.8이기 때문이다. access token 수명을 늘리면 발급 수가 줄지만, IdP에서 접근을 막아도 그 수명 동안은 접근이 남는다.</p>
+<div class="box warn">
+  <p>한도와 요금은 벤더 정책이라 바뀔 수 있으므로, 도입 전에 IdP의 계약 조건을 다시 확인해야 한다.</p>
+</div>
+
+<h3>11.3 서버 인스턴스가 여러 개일 때</h3>
+<p>MCP 인가 서버가 <code>jti</code> 기록을 프로세스 메모리에 두면 인스턴스끼리 기록을 나누지 않아서, 같은 ID-JAG가 인스턴스마다 한 번씩 통과할 가능성이 있다. ID-JAG의 수명이 짧으면 이 위험이 있는 기간도 짧지만, 위험을 없애려면 <code>jti</code> 기록을 Redis 같은 공유 저장소에 둬야 한다.</p>
+
+<h3>11.4 client_id 대응 관리</h3>
+<p>ID-JAG의 <code>client_id</code>는 MCP 인가 서버에 등록된 값이라서, IdP가 이 값을 알아야 ID-JAG를 만들 수 있다. 초안 5절은 두 방법을 든다.</p>
+<ul>
+  <li>관리자가 클라이언트별, MCP 인가 서버별 client_id 대응을 IdP에 미리 등록한다.</li>
+  <li>CIMD를 쓴다. client_id가 클라이언트 metadata 문서의 URL이라서 모든 서버에서 같은 값이다.</li>
+</ul>
+<p>DCR로 서버마다 무작위 client_id를 받는 클라이언트에는 첫 번째 방법을 쓰기 어려운데, IdP가 그 값을 미리 알 수 없기 때문이다.</p>
+
+<h3>11.5 MCP 인가 서버 등록</h3>
+<p>IdP는 신뢰하는 MCP 인가 서버만 <code>audience</code>로 받기 때문에, 관리자는 MCP 인가 서버를 IdP에 하나씩 등록해야 한다. MCP 서버를 자주 새로 만드는 환경에서는 이 등록이 운영 부담이 되므로 등록을 자동화하는 방법이 필요하다(14장).</p>
+
+<h2 id="s12">12. 실무 적용: fastmcp 서버<span class="lvl l3">고급</span></h2>
+<p>fastmcp 4.0 이상의 OAuthProxy에는 ID-JAG를 받는 기능이 있는데, 아직 beta 단계다. 이 장의 내용은 fastmcp 4.0.3 소스를 읽고 확인했다.</p>
+<pre><code>from fastmcp.server.auth import OAuthProxy, IdentityAssertion
+
+auth = OAuthProxy(
+    ...,  # upstream IdP 설정은 그대로 둔다
+    identity_assertion=IdentityAssertion(
+        trusted_issuers=["https://idp.example.com"],
+        access_token_expiry_seconds=300,
+    ),
+)</code></pre>
+<p>이 설정을 넣으면 OAuthProxy의 token endpoint가 JWT bearer grant도 받고, 기존 authorization code 흐름과 동의 화면은 그대로 남는다.</p>
+<div class="tbl"><table>
+<tr><th>항목</th><th>동작</th><th>근거</th></tr>
+<tr><td>metadata</td><td><code>grant_types_supported</code>에 jwt-bearer를 넣고, <code>authorization_grant_profiles_supported</code>에 ID-JAG profile을 넣는다.</td><td><code>proxy.py:2513</code>, MCP SDK <code>routes.py:164</code></td></tr>
+<tr><td>typ</td><td><code>oauth-id-jag+jwt</code>가 아니면 거부한다.</td><td><code>identity_assertion.py:359</code></td></tr>
+<tr><td>iss</td><td><code>trusted_issuers</code>에 있어야 한다. JWKS 주소는 OIDC discovery로 찾는다.</td><td><code>identity_assertion.py:372</code></td></tr>
+<tr><td>aud</td><td>기본값은 자기 issuer다. 끝에 <code>/</code>가 있는 값과 없는 값을 모두 받는다.</td><td><code>identity_assertion.py:220</code></td></tr>
+<tr><td>수명</td><td><code>exp</code>와 <code>iat</code>의 차이가 300초를 넘으면 거부한다. 시계 오차는 30초까지 허용한다.</td><td><code>identity_assertion.py:207</code></td></tr>
+<tr><td>client_id</td><td>요청한 클라이언트의 client_id와 같아야 한다.</td><td><code>identity_assertion.py:424</code></td></tr>
+<tr><td>resource</td><td>서버에 resource URL이 설정돼 있으면 <code>resource</code> claim이 필수다.</td><td><code>identity_assertion.py:429</code></td></tr>
+<tr><td>jti</td><td>같은 <code>jti</code>는 만료 전까지 거부한다. 기록은 프로세스 메모리에 둔다.</td><td><code>identity_assertion.py:455</code>, <code>:201</code></td></tr>
+<tr><td>scope</td><td>ID-JAG의 scope가 기준이다. 요청의 <code>scope</code>는 범위를 줄이기만 한다.</td><td><code>proxy.py:1577</code></td></tr>
+<tr><td>access token</td><td>기본 수명은 300초다. refresh token은 주지 않는다.</td><td><code>identity_assertion.py:132</code>, <code>proxy.py:1623</code></td></tr>
+<tr><td>토큰 검증</td><td>ID-JAG로 받은 access token은 upstream 토큰 없이 그 자체로 검증한다.</td><td><code>proxy.py:2159</code></td></tr>
+<tr><td>취소</td><td>취소한 access token의 <code>jti</code>를 프로세스 메모리에 둔다.</td><td><code>proxy.py:2339</code></td></tr>
+</table></div>
+<p>파일 경로의 기준은 <code>fastmcp/server/auth/</code>이고, <code>proxy.py</code>는 그 아래 <code>oauth_proxy/</code>에 있다.</p>
+
+<h3>클라이언트 인증</h3>
+<p>fastmcp 프록시에 등록된 클라이언트는 모두 public client이고, 프록시는 클라이언트의 비밀 값을 저장하지 않는다. 그래서 JWT bearer grant에서도 client_id만 확인하고, 클라이언트가 비밀 값을 보내도 검사하지 않는다(<code>auth.py:83</code>, MCP SDK <code>client_auth.py:92</code>).</p>
+<p>fastmcp는 신뢰하는 IdP가 서명한 ID-JAG를 인가의 근거로 본다. 반면 초안 4.4절은 클라이언트 인증이나 sender-constrained ID-JAG를 요구하므로, 도입 전에 이 차이를 검토해야 한다.</p>
+
+<h3>등록된 클라이언트와 grant type</h3>
+<p>OAuthProxy는 DCR로 등록한 클라이언트에 jwt-bearer grant를 자동으로 더한다(<code>proxy.py:1053</code>). upstream IdP 앱의 client_id로 오는 클라이언트도 받는데, 이때 프록시는 등록 없이 클라이언트 정보를 만들고 jwt-bearer grant를 넣는다(<code>proxy.py:955</code>).</p>
+
+<h2 id="s13">13. 실무 적용: MCP SDK 클라이언트<span class="lvl l3">고급</span></h2>
+<p>MCP Python SDK 2.2.0에는 3단계를 맡는 클라이언트가 있고, 이름은 <code>IdentityAssertionOAuthProvider</code>다. fastmcp 4.0.3의 클라이언트 모듈에는 이런 기능이 없다.</p>
+<pre><code>from mcp.client.auth.extensions.identity_assertion import (
+    IdentityAssertionOAuthProvider,
+)
+
+async def fetch_id_jag(audience: str, resource: str) -> str:
+    # 2단계: IdP에 token exchange를 보내고 ID-JAG를 돌려준다
+    return await idp.exchange_for_id_jag(
+        subject_token=user_id_token, audience=audience, resource=resource
+    )
+
+auth = IdentityAssertionOAuthProvider(
+    server_url="https://mcp-a.example.com/mcp",
+    storage=token_storage,
+    client_id="agent-at-mcp-a",
+    client_secret="...",
+    issuer="https://mcp-a.example.com",
+    assertion_provider=fetch_id_jag,
+)</code></pre>
+<p><code>idp.exchange_for_id_jag</code>는 설명용 이름이고, SDK에 없는 함수다.</p>
+<div class="tbl"><table>
+<tr><th>특징</th><th>내용</th></tr>
+<tr><td>맡는 범위</td><td>3단계만 맡는다. 1단계와 2단계는 <code>assertion_provider</code> 콜백이 맡는다.</td></tr>
+<tr><td>인가 서버 선택</td><td><code>issuer</code>를 설정으로 받는다. Protected Resource Metadata와 DCR을 쓰지 않는다.</td></tr>
+<tr><td>클라이언트 종류</td><td><code>client_secret</code>이 필수다. confidential client만 지원한다.</td></tr>
+<tr><td>재교환 시점</td><td>401 응답을 받으면 새 ID-JAG로 다시 교환한다. 403 <code>insufficient_scope</code>를 받으면 scope를 더해서 교환한다.</td></tr>
+<tr><td>토큰 보관</td><td>받은 access token을 <code>storage</code>에 저장한다.</td></tr>
+</table></div>
+<p>SDK 문서는 2단계가 배포 환경마다 다르다고 설명한다. 그래서 SDK는 2단계를 만들지 않고, 2단계 요청은 MCP 클라이언트가 직접 구현해야 한다. 이 SDK 클라이언트를 fastmcp 프록시에 붙이면 SDK가 보내는 <code>client_secret</code>은 검사되지 않는다(12장).</p>
+
+<h2 id="s14">14. 실무 적용: 우리 플랫폼<span class="lvl l3">고급</span></h2>
+<p>이 장은 우리 플랫폼에 ID-JAG를 넣는다고 가정하고 정리한 내용이고, 정해진 설계가 아니라 추천이다. 코드 근거는 2026-11-12에 받은 core와 MCP 런타임의 코드다. 14.3절 5번 조건과 그 관련 내용은 2026-11-18에 더했는데, 근거는 그때의 MCP 런타임 코드다.</p>
+
+<h3>14.1 역할 대응</h3>
+<div class="tbl"><table>
+<tr><th>역할</th><th>우리 구성 요소</th></tr>
+<tr><td>IdP</td><td>Okta</td></tr>
+<tr><td>MCP 클라이언트</td><td>플랫폼 에이전트(core). 외부 MCP 클라이언트도 이 역할을 할 수 있다.</td></tr>
+<tr><td>MCP 인가 서버</td><td>MCP 서버마다 들어 있는 fastmcp OAuthProxy</td></tr>
+<tr><td>MCP 서버</td><td>같은 런타임의 MCP endpoint</td></tr>
+</table></div>
+
+<h3>14.2 지금 구조와 달라지는 점</h3>
+<p>core는 토큰을 사용자와 서버 URL의 조합으로 저장하는데, 이 저장 방식은 그대로 쓸 수 있다. 새로 필요한 것은 사용자별 subject token 하나다. core가 사용자의 Okta refresh token을 한 번 받아 두고, 서버별 access token은 이 값으로 ID-JAG를 받아서 얻는다.</p>
+<div class="box key">
+  <p>ID-JAG에서 공유하는 것은 사용자의 로그인이고, 서버별 access token은 공유하지 않는다. 이 점에서 "사용자 키로 토큰 하나를 여러 서버에 쓰는 방식"과 다르다. 그 방식의 문제는 <a href="06-platform-auth-flow.html#s7">6편 7장</a>에서 다룬다.</p>
+</div>
+
+<h3>14.3 전제 조건</h3>
+<p>ID-JAG를 넣으려면 다음 다섯 조건이 필요하다.</p>
+<ol>
+  <li>core가 사용자의 Okta identity assertion을 가져야 한다. 플랫폼 로그인 IdP가 Okta가 아니면 사용자는 Okta에 한 번 따로 로그인해야 한다.</li>
+  <li>관리자가 Okta에서 ID-JAG 발급을 켜고, MCP 인가 서버마다 연결과 정책을 만들어야 한다.</li>
+  <li>MCP 런타임이 OAuthProxy에 <code>identity_assertion</code> 설정을 넘겨야 하는데, 지금 런타임에는 이 설정이 없다.</li>
+  <li>core가 2단계 요청과 3단계 클라이언트를 붙여야 한다.</li>
+  <li>토큰 전달을 쓰는 MCP 서버는 backend API에 보낼 토큰을 따로 얻어야 한다. ID-JAG로 발급한 access token에는 upstream 토큰이 없기 때문이다.</li>
+</ol>
+<div class="box warn">
+  <p>지금 흐름에서 MCP 런타임은 backend API를 부를 때 Authorization 헤더에 upstream 토큰을 넣는다. 이 토큰 전달은 backend가 Bearer 인증을 쓰고 토큰 전달 설정이 켜졌을 때만 일어난다.</p>
+  <p>fastmcp는 ID-JAG로 발급한 access token을 검증할 때 upstream 토큰을 찾지 않고, 받은 토큰을 그대로 돌려준다(<code>proxy.py:2159</code>). 그래서 MCP 런타임은 backend API에 OAuthProxy가 서명한 토큰을 보내게 되고, IdP가 발급한 토큰을 검증하는 backend API는 이 토큰을 거부할 가능성이 높다.</p>
+  <p>이 내용은 코드를 읽은 결과이고, 실행해서 확인하지는 않았다. backend 토큰을 얻는 방법의 후보는 <a href="06-platform-auth-flow.html#s9">6편 9장</a>에 있다.</p>
+</div>
+
+<h3>14.4 정해야 할 것과 추천</h3>
+<div class="tbl"><table>
+<tr><th>항목</th><th>추천</th><th>이유</th></tr>
+<tr><td>위임 scope</td><td>처음에는 ID-JAG로 받은 토큰에 위임 scope를 주지 않는다. IdP가 준 scope를 위임 scope로 인정할 규칙은 나중에 따로 정한다.</td><td>지금 런타임은 동의 화면을 거친 토큰만 위임 scope를 인정한다. ID-JAG 토큰에는 이 표시가 없으므로 scope가 걸린 tool은 막힌다. 동의 없이 tool이 열리지 않으므로 안전한 기본값이다.</td></tr>
+<tr><td>audience</td><td>스펙대로 MCP 인가 서버마다 자기 issuer를 쓴다.</td><td>fastmcp에는 공통 audience 설정(<code>IdentityAssertion.audience</code>)도 있다. 공통 값을 쓰면 서버 구분을 <code>resource</code> claim 하나에 맡긴다. 초안 9.4절은 한 ID-JAG를 다른 인가 서버에 쓰지 못하게 한다.</td></tr>
+<tr><td>client_id</td><td>플랫폼 에이전트용 고정 client_id를 정한다. CIMD URL을 먼저 검토한다.</td><td>DCR의 무작위 client_id는 IdP가 미리 알 수 없다. CIMD URL은 모든 서버에서 같은 값이다. CIMD 클라이언트는 <code>private_key_jwt</code>로 인증하므로 12장의 클라이언트 인증 차이도 줄일 가능성이 있다.</td></tr>
+<tr><td>access token 수명</td><td>Okta 한도와 접근 차단 지연 사이에서 정한다.</td><td>5분이면 한도에 빨리 닿는다(11.2절). 수명이 길면 IdP에서 막은 접근이 늦게 끊긴다.</td></tr>
+<tr><td>jti 기록</td><td>인스턴스가 둘 이상이면 공유 저장소를 검토한다.</td><td>fastmcp는 <code>jti</code>를 프로세스 메모리에 둔다(11.3절).</td></tr>
+<tr><td>기존 흐름</td><td>authorization code 흐름과 동의 화면을 그대로 둔다.</td><td>ID-JAG를 지원하지 않는 외부 MCP 클라이언트가 많을 가능성이 있다. 두 흐름은 한 OAuthProxy에서 함께 동작한다.</td></tr>
+<tr><td>backend 토큰</td><td>처음에는 토큰 전달을 쓰지 않는 MCP 서버에만 ID-JAG를 켠다. 토큰 전달을 쓰는 서버는 authorization code 흐름만 쓴다.</td><td>토큰 전달을 쓰지 않는 서버는 backend API에 upstream 토큰을 보내지 않는다. 그래서 ID-JAG 토큰만으로 동작한다. 토큰 전달을 쓰는 서버가 backend 토큰을 얻는 방법은 아직 정하지 않았다(14.3절 5번).</td></tr>
+</table></div>
+
+<h3>14.5 PoC 순서 추천</h3>
+<p>검증은 다음 순서를 추천한다. 가짜 IdP를 쓰면 Okta 설정 없이 1번부터 6번까지 확인할 수 있다.</p>
+<ol>
+  <li>RSA 키로 ID-JAG를 서명하는 가짜 IdP를 만들고, JWKS와 discovery 문서도 공개한다.</li>
+  <li>런타임 OAuthProxy에 <code>identity_assertion</code>을 켜고 MCP 서버 세 개를 띄운다.</li>
+  <li>core 쪽에 2단계 요청과 <code>IdentityAssertionOAuthProvider</code>를 붙이고, 로그인 한 번으로 세 서버를 쓰는지 본다.</li>
+  <li>다른 서버의 <code>aud</code>, 이미 쓴 <code>jti</code>, 다른 <code>client_id</code>, 다른 <code>resource</code>를 넣어 거부 사례를 확인한다.</li>
+  <li>위임 scope가 걸린 tool이 어떻게 보이는지 확인한다.</li>
+  <li>토큰 전달을 쓰는 MCP 서버에서 ID-JAG 토큰으로 tool을 부르고, backend API가 받는 Authorization 헤더 값을 확인한다.</li>
+  <li>Okta 테스트 org에서 ID-JAG 발급 설정과 한도를 확인한다.</li>
+</ol>
+
+<h2 id="s15">15. 자가 점검 문제</h2>
+<p>먼저 답을 생각해 본 다음 펼쳐서 확인한다.</p>
+<details><summary>Q1. MCP 서버 세 개가 같은 Okta를 쓴다. 기본 흐름에서 브라우저 로그인은 몇 번 일어나나? 그 이유는?</summary>
+<p>세 번 일어난다. MCP 서버마다 자기 MCP 인가 서버가 있고, access token은 서버마다 따로 발급되기 때문이다. Okta 세션이 남아 있으면 비밀번호 입력은 한 번으로 끝날 수도 있지만, 브라우저 이동과 동의 화면은 세 번 반복된다.</p></details>
+<details><summary>Q2. ID-JAG의 <code>aud</code>에는 무엇이 들어가나? MCP 서버의 주소인가?</summary>
+<p>MCP 인가 서버의 issuer 식별자가 들어가고, MCP 서버의 resource 식별자는 <code>resource</code> claim에 들어간다.</p></details>
+<details><summary>Q3. token exchange 응답의 <code>token_type</code>이 <code>N_A</code>인 이유는?</summary>
+<p>ID-JAG는 access token이 아니기 때문이다. ID-JAG는 3단계에서 access token을 받는 근거로만 쓰고, 이 값으로 MCP 서버를 부를 수는 없다.</p></details>
+<details><summary>Q4. MCP 클라이언트가 1단계에서 받은 ID token을 MCP 서버에 직접 보냈다. 무슨 일이 생겨야 정상인가?</summary>
+<p>MCP 서버가 거부해야 정상이다. ID token의 <code>aud</code>는 MCP 클라이언트이고, ID token은 2단계의 subject token으로 IdP에만 보내는 값이다.</p></details>
+<details><summary>Q5. 공격자가 클라이언트 X의 ID-JAG를 훔쳤다. 공격자는 자기 클라이언트 Y의 자격으로 MCP 인가 서버에 이 값을 냈다. 결과는?</summary>
+<p>거부된다. ID-JAG의 <code>client_id</code>는 X인데 인증된 클라이언트는 Y라서, MCP 인가 서버가 <code>invalid_grant</code>로 거부한다.</p></details>
+<details><summary>Q6. 서버 A용 ID-JAG를 서버 B의 MCP 인가 서버에 냈다. 결과는?</summary>
+<p>거부된다. ID-JAG의 <code>aud</code>는 A의 issuer 식별자라서, B의 MCP 인가 서버는 <code>aud</code>가 자기 issuer가 아닌 이 값을 받지 않는다.</p></details>
+<details><summary>Q7. access token이 만료됐다. MCP 인가 서버는 refresh token을 주지 않았다. MCP 클라이언트는 어떻게 해야 하나?</summary>
+<p>가진 ID token이나 IdP refresh token으로 2단계를 다시 하고, 그다음 새 ID-JAG로 3단계를 다시 해야 한다. subject token도 모두 만료됐다면 사용자를 다시 로그인시킨다.</p></details>
+<details><summary>Q8. 관리자가 Okta에서 한 사용자의 MCP 서버 접근을 막았다. 이미 발급된 access token은 어떻게 되나?</summary>
+<p>만료될 때까지 쓸 수 있다. fastmcp의 기본 수명은 300초이고, 그 뒤에는 IdP가 새 ID-JAG를 거부하므로 접근이 끊긴다.</p></details>
+<details><summary>Q9. fastmcp MCP 서버를 인스턴스 세 개로 띄웠다. 공격자가 같은 ID-JAG를 짧은 시간에 세 번 냈다. 몇 번 통과할 가능성이 있나?</summary>
+<p>세 번까지 통과할 가능성이 있다. fastmcp는 <code>jti</code> 기록을 프로세스 메모리에 두기 때문에, 요청이 인스턴스마다 한 번씩 가면 각 인스턴스가 처음 보는 <code>jti</code>로 판단한다.</p></details>
+<details><summary>Q10. 우리 런타임에서 <code>identity_assertion</code>만 켜면 위임 scope가 걸린 tool을 쓸 수 있나?</summary>
+<p>코드를 읽은 결과로는 쓸 수 없다. 런타임은 동의 화면을 거친 토큰에만 위임 scope를 인정하는데, ID-JAG로 받은 토큰에는 그 표시가 없어서 위임 scope가 비어 있다.</p></details>
+<details><summary>Q11. Okta 한도가 사용자 한 명, resource app 하나에 월 250개다. access token 수명은 5분이다. 한 서버를 한 달에 몇 시간 연속으로 쓸 수 있나?</summary>
+<p>약 20시간이다. 5분 수명이면 한 시간에 ID-JAG를 12개 받는다. 250을 12로 나누면 약 20.8이다.</p></details>
+<details><summary>Q12. 토큰 전달을 쓰는 MCP 서버에서 ID-JAG로 받은 access token으로 tool을 불렀다. backend API는 어떤 토큰을 받나?</summary>
+<p>코드를 읽은 결과로는 OAuthProxy가 서명한 access token을 받는다. ID-JAG로 받은 토큰에는 upstream 토큰이 없기 때문이다. IdP가 발급한 토큰을 검증하는 backend API는 이 토큰을 거부할 가능성이 높다.</p></details>
+
+<h2 id="s16">16. 참고 자료</h2>
+<ul>
+  <li>IETF draft-ietf-oauth-identity-assertion-authz-grant-06 (2026-10-31). 주로 3.1절, 4.3절, 4.4절, 5절을 읽었다. 7절부터 9절까지도 참고했다.</li>
+  <li>MCP Enterprise-Managed Authorization 확장, 2026-07-28 판. modelcontextprotocol/ext-auth 저장소.</li>
+  <li>MCP 문서 "Enterprise-Managed Authorization". 흐름 그림과 구현 지원 표.</li>
+  <li>SEP-990 "Enable Enterprise IdP Policy Controls during MCP OAuth flows".</li>
+  <li>modelcontextprotocol/ext-auth PR #12. 확장 스펙의 보안 검토.</li>
+  <li>RFC 8693, OAuth 2.0 Token Exchange.</li>
+  <li>RFC 7523, JWT Profile for OAuth 2.0 Client Authentication and Authorization Grants.</li>
+  <li>RFC 8707, Resource Indicators for OAuth 2.0.</li>
+  <li>RFC 9728, OAuth 2.0 Protected Resource Metadata.</li>
+  <li>RFC 8414, OAuth 2.0 Authorization Server Metadata.</li>
+  <li>Okta 개발자 문서 "Cross App Access (XAA)".</li>
+  <li>fastmcp 4.0.3 소스: <code>server/auth/identity_assertion.py</code>, <code>server/auth/oauth_proxy/proxy.py</code>, <code>server/auth/auth.py</code>.</li>
+  <li>MCP Python SDK 2.2.0 소스: <code>mcp/client/auth/extensions/identity_assertion.py</code>, <code>mcp/server/auth/routes.py</code>, <code>mcp/server/auth/middleware/client_auth.py</code>.</li>
+  <li>우리 코드: core의 토큰 저장 코드, MCP 런타임의 위임 scope 검증 코드와 backend API 호출 코드.</li>
+</ul>
+<div class="box warn" id="unchecked">
+  <p>2026-11-12에 IETF 초안 -06, MCP 확장 스펙, MCP 문서, Okta XAA 개념 문서를 읽었다. fastmcp와 MCP SDK의 동작은 소스를 읽고 확인했고, 코드를 실행해서 확인하지는 않았다.</p>
+  <p>다음 내용은 원문과 대조하지 않았거나 2차 자료에서 왔다.</p>
+  <ul>
+    <li>Okta의 월 250개 한도와 Okta for AI Agents 조건. MCP 문서의 표에서 옮겼고, Okta 요금 문서와 대조하지 않았다.</li>
+    <li>Okta가 외부 MCP 인가 서버용 ID-JAG의 <code>client_id</code>를 어떻게 정하는지</li>
+    <li>초안 9절의 각 항. 요약본으로 읽었고 문구를 하나씩 대조하지 않았다.</li>
+    <li>ext-auth PR #12의 지적. 검토 의견이며 스펙 본문이 아니다.</li>
+    <li>fastmcp에서 CIMD 클라이언트가 ID-JAG 요청 때 <code>private_key_jwt</code>로 인증되는지</li>
+    <li>ID-JAG를 지원하는 MCP 클라이언트의 수. MCP 문서의 client matrix를 확인하지 않았다.</li>
+    <li>토큰 전달을 쓰는 서버에서 backend API가 실제로 받는 헤더 값. 코드를 읽고 판단했고, 실행해서 확인하지는 않았다.</li>
+  </ul>
+  <p>예시 JSON과 HTTP 요청의 값은 설명용으로 만든 값이다.</p>
+</div>
+<p>다음 학습은 <a href="06-platform-auth-flow.html">06편 "우리 플랫폼의 MCP 인증 흐름"</a>이다.</p>
+
+<nav class="pager">
+<a class="prev" href="04-issuer-audience-jwks-uri.html"><span class="k">이전 글</span><span class="t">issuer, audience, jwks_uri</span></a>
+<a class="next" href="06-platform-auth-flow.html"><span class="k">다음 글</span><span class="t">우리 플랫폼의 MCP 인증 흐름</span></a>
+</nav>
+
+<footer>2026-11-12 작성, 2026-11-18 보완. 라이브러리 근거는 fastmcp 4.0.3과 MCP Python SDK 2.2.0 소스이고, 우리 코드는 core와 MCP 런타임을 읽었다.</footer>
+</div>
+</body>
+</html>

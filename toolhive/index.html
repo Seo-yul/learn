@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ToolHive 학습 목차</title>
+<link rel="stylesheet" href="../assets/learn.css">
+</head>
+<body>
+<div class="masthead"><div class="bar"><a class="brand" href="../index.html">learn</a><span class="crumb">ToolHive</span></div></div>
+<div class="wrap">
+<header>
+  <h1>ToolHive 학습 목차</h1>
+  <p>ToolHive를 기초부터 내부 구조까지 공부하는 학습 자료이고, 마지막 편에서는 ToolHive를 우리 MCP 플랫폼과 비교한다.</p>
+  <p>기준 버전은 ToolHive v0.63.0(2026-11-06)이다. 각 편은 2026-10-14에 v0.53.0 소스와 같은 날의 공식 문서를 근거로 썼고, 2026-11-07에 v0.63.0 소스 기준으로 갱신했는데, 갱신한 내용은 각 편 머리말의 "v0.63.0 갱신 요약" 상자에 있다. 두 버전 사이의 변경은 공개 릴리스 노트(v0.54.0부터 v0.63.0까지)와 인용한 파일의 diff로 확인했다.</p>
+</header>
+
+<div class="box warn">
+  <p>용어집의 뜻은 그 문서 안에서만 유효하지만, 시리즈 전체에서 뜻을 고정한 용어도 있다. "proxy"는 ToolHive가 MCP 서버 앞에 붙이는 프로세스만 뜻하고, "backend"는 vMCP가 묶는 MCP 서버만 뜻한다. "런타임"은 혼자 쓰지 않고 "컨테이너 런타임"으로만 쓴다.</p>
+  <p>proxy와 이름이 비슷한 것은 따로 부른다. 네트워크 격리에서 나가는 연결을 거르는 컨테이너는 "egress proxy"이고, <code>thv proxy stdio</code> 명령이 여는 연결은 "StdioBridge"다. proxy 안에서 stdio 컨테이너와 HTTP를 잇는 구현은 "stdio 변환기"라고 부른다(02편 용어집).</p>
+  <p>"registry"는 ToolHive가 읽는 목록이다. 대부분의 편은 이 목록의 MCP 서버 항목만 다루지만, 같은 목록에 skill과 plugin 항목도 들어 있다(04편 2.2절, 09편 5장). 컨테이너 이미지를 두는 곳은 registry가 아니라 "이미지 저장소"라고 부른다.</p>
+  <p>"API 서버"는 <code>thv serve</code>가 여는 서버다(01편, 02편). 10편에서는 우리 MCP 서버가 부르는 서버를 "REST API 서버"라고 따로 부른다.</p>
+</div>
+
+<h2>읽는 순서</h2>
+<p>번호 순서대로 읽기를 권한다. 뒤 문서는 앞 문서의 용어와 구조를 안다고 가정하고 쓰였기 때문이다. 다만 목적에 따라 다음처럼 줄여 읽어도 된다.</p>
+<ul>
+  <li>ToolHive를 처음 본다면 01편과 02편을 먼저 읽는다.</li>
+  <li>operator를 만드는 사람이라면 01편, 02편, 07편, 10편을 먼저 읽는다.</li>
+  <li>보안을 보는 사람이라면 03편과 05편을 먼저 읽는다.</li>
+</ul>
+
+<h2>문서 목록</h2>
+<div class="tbl"><table>
+<tr><th>번호</th><th>문서</th><th>다루는 내용</th><th>수준</th></tr>
+<tr><td>01</td><td><a href="01-overview-first-run.html">ToolHive 개요와 첫 실행</a></td><td>ToolHive가 푸는 문제, 구성 요소 지도, 배포 모드, 첫 실행</td><td>기초</td></tr>
+<tr><td>02</td><td><a href="02-run-model-proxy.html">실행 모델: workload, transport, proxy</a></td><td>workload 상태, RunConfig, transport별 proxy 구현, 원격 서버, protocol build</td><td>중급</td></tr>
+<tr><td>03</td><td><a href="03-isolation-secret.html">격리와 secret, 공급망 보안</a></td><td>위협 모델, 권한 프로필, 네트워크 격리, 컨테이너 보안 기본값, secret, 이미지 검증</td><td>심층</td></tr>
+<tr><td>04</td><td><a href="04-registry-group-client.html">registry, 그룹, 클라이언트 설정</a></td><td>registry 형식, registry server, 그룹, 클라이언트 설정 편집, tool 사용자화</td><td>중급</td></tr>
+<tr><td>05</td><td><a href="05-authn-authz.html">인증과 인가</a></td><td>access token 검증, 내장 인가 서버, 나가는 인증, 위임, Cedar 인가</td><td>심층</td></tr>
+<tr><td>06</td><td><a href="06-observability-operations.html">관측, 감사, 사용 제한</a></td><td>middleware 순서, trace와 metric, 감사 로그, 사용 제한, webhook</td><td>중급</td></tr>
+<tr><td>07</td><td><a href="07-kubernetes-operator.html">Kubernetes operator</a></td><td>controller, CRD 카탈로그, MCPServer reconcile, proxy가 만드는 StatefulSet, 운영</td><td>심층</td></tr>
+<tr><td>08</td><td><a href="08-vmcp.html">vMCP와 optimizer</a></td><td>backend 발견, 집계와 이름 충돌, 세션과 확장 한계, composite tool, optimizer</td><td>심층</td></tr>
+<tr><td>09</td><td><a href="09-skill-plugin.html">skill과 plugin</a></td><td>skill 배포 흐름, lock file과 신뢰 모델, AI plugin 수명 주기</td><td>중급</td></tr>
+<tr><td>10</td><td><a href="10-platform-comparison.html">우리 MCP 플랫폼과 비교</a></td><td>구성 요소 대응, Kubernetes 객체 비교, 인증과 관측의 차이, 추천</td><td>심층</td></tr>
+</table></div>
+
+<h2>문서와 코드가 다른 곳</h2>
+<p>이 시리즈는 문서와 코드가 다르면 코드를 따랐다. 여기서 문서는 공식 문서 사이트와 저장소 안의 설계 문서(<code>docs/arch</code>)를 함께 뜻한다. 아래 차이는 2026-10-14에 v0.53.0 코드로 찾았고, 2026-11-07에 v0.63.0 코드와 다시 읽은 공식 문서로 재확인했다. 재확인 결과는 모두 그대로였고, 갱신하면서 찾은 차이 두 개를 표 끝에 더했다. 근거는 각 편 본문과 참고 자료 상자에 있다.</p>
+<div class="tbl"><table>
+<tr><th>주제</th><th>문서의 설명</th><th>v0.63.0 코드</th><th>편</th></tr>
+<tr><td>기본 권한 프로필</td><td>설계 문서 02, 05: <code>none</code></td><td>registry 항목의 프로필. 항목이 없으면 <code>network</code></td><td>01, 03</td></tr>
+<tr><td>thv run의 기본 transport</td><td>공식 문서 run-mcp-servers: stdio</td><td>flag와 registry 정보가 없으면 streamable HTTP. Kubernetes MCPServer는 CRD 기본값이 stdio다(source <code>cmd/thv-operator/api/v1beta1/mcpserver_types.go:241</code>).</td><td>02</td></tr>
+<tr><td>컨테이너가 끝났을 때</td><td>설계 문서 08: stopped</td><td>starting으로 바꾸고 자동으로 다시 시작한다(최대 10회).</td><td>02</td></tr>
+<tr><td>Docker 보안 옵션</td><td>설계 문서 05: <code>no-new-privileges</code></td><td><code>label:disable</code>만 넣는다.</td><td>03</td></tr>
+<tr><td>파일 권한만 적은 프로필</td><td>공식 문서 custom-permissions: <code>--isolate-network</code>를 주면 네트워크가 막힌다.</td><td>network 블록이 없으면 Squid는 모두 허용하고, Envoy는 모두 막는다.</td><td>03</td></tr>
+<tr><td>그룹 명령의 <code>--client</code> flag</td><td>공식 문서 group-management: 있다.</td><td>없다. 클라이언트 이름은 위치 인자다.</td><td>04</td></tr>
+<tr><td>skill과 plugin 설치 대상</td><td>공식 문서 CLI 안내: 처음 찾은 클라이언트</td><td>감지된 지원 클라이언트 전부</td><td>09</td></tr>
+<tr><td><code>--otel-service-name</code> 기본값</td><td>저장소 문서 <code>docs/observability.md</code>: <code>toolhive-mcp-proxy</code></td><td>CLI는 <code>thv-&lt;이름&gt;</code>다. operator는 MCPServer 이름을 쓴다(source <code>cmd/thv-operator/controllers/mcpserver_runconfig.go:179</code>).</td><td>06</td></tr>
+<tr><td>webhook이 도는 시점</td><td>공식 문서 webhooks: tool 호출마다</td><td>해석한 MCP POST 요청마다</td><td>06</td></tr>
+<tr><td>registry server에서 claim이 없는 registry</td><td>공식 문서 guides-registry/configuration: 인증한 사용자 모두에게 열린다.</td><td>인가를 켜면 super-admin만 본다.</td><td>04</td></tr>
+<tr><td>Kubernetes 내보내기</td><td>설계 문서 01: 계획 단계</td><td><code>thv export --format k8s</code>가 있다.</td><td>01</td></tr>
+<tr><td>MCPServer <code>spec.resources</code>의 대상</td><td>CRD 필드 설명: MCP 서버 컨테이너</td><td>proxy 컨테이너에 넣는다.</td><td>07</td></tr>
+<tr><td>upstream access token이 JWT가 아닐 때의 Cedar 판정</td><td>공식 문서 cedar-policies: 거부</td><td>요청 JWT의 claim으로 판정한다.</td><td>05</td></tr>
+<tr><td>webhook의 <code>ignore</code> 실패 정책</td><td>공식 문서 webhooks: 오류가 나면 허용한다.</td><td>webhook 호출 전에 ToolHive 자체 오류(본문 인코딩, 요청 생성, HMAC secret 해석)가 나면 정책과 관계없이 거부한다. validating은 403, mutating은 500이다(v0.63.0에서 추가).</td><td>06</td></tr>
+<tr><td>Homebrew 설치 방식</td><td>공식 설치 문서: <code>brew install thv</code> 명령만 적는다.</td><td>v0.55.1부터 tap이 thv를 cask로 배포한다. 명령은 같다.</td><td>01</td></tr>
+</table></div>
+
+<h2>관련 문서</h2>
+<ul>
+  <li><a href="../oauth/index.html">OAuth 학습 목차</a>: 05편과 10편이 OAuth 기초로 참조한다.</li>
+  <li><a href="vs-agentgateway.html">ToolHive와 agentgateway 비교</a>: MCP gateway와 AI gateway의 차이를 따로 정리했다.</li>
+</ul>
+
+<footer>2026-10-14 작성, 2026-11-07 갱신. 기준: ToolHive v0.63.0. 공식 문서는 2026-10-13 사본을 바탕으로 했고 일부 페이지는 2026-11-07에 다시 읽었다.</footer>
+</div>
+</body>
+</html>

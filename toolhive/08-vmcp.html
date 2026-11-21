@@ -1,0 +1,945 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vMCP와 optimizer</title>
+<link rel="stylesheet" href="../assets/learn.css">
+</head>
+<body>
+<div class="masthead"><div class="bar"><a class="brand" href="../index.html">learn</a><span class="crumb"><a href="index.html">ToolHive</a></span></div></div>
+<div class="wrap">
+
+<header>
+  <h1>vMCP와 optimizer</h1>
+  <p class="kicker">ToolHive 학습 08편 · 2026-10-14 작성</p>
+  <p>이 문서는 여러 MCP 서버를 endpoint 하나로 묶는 vMCP를 다룬다. backend 발견, 집계, 요청 처리, 세션을 차례로 보고, composite tool과 optimizer, code mode도 소스 기준으로 설명한다. 인증의 세부 흐름은 <a href="05-authn-authz.html">05편</a>에서 다룬다.</p>
+  <p>기준 버전은 ToolHive v0.63.0(2026-11-06)이다. 2026-10-14에 v0.53.0 기준으로 썼다가 2026-11-07에 v0.63.0 기준으로 갱신했고, 공식 문서도 2026-11-07 상태를 읽었다. ToolHive는 자주 바뀌므로 실제로 쓰기 전에 공식 문서를 다시 확인해야 한다.</p>
+</header>
+
+<div class="box key">
+  <span class="label">한 문장 요약</span>
+  <p>vMCP는 MCPGroup에 속한 MCP 서버를 backend로 모아 endpoint 하나로 내놓고, 이름 충돌을 정리한 라우팅 테이블로 호출을 backend에 보낸다. optimizer를 켜면 tool 목록 대신 <code>find_tool</code>과 <code>call_tool</code> 두 개만 보여 준다.</p>
+</div>
+
+<div class="box key">
+  <span class="label">v0.63.0 갱신 요약</span>
+  <ul>
+  <li>요청 파이프라인에 loopback Host 검사와 세션 소유자 검사가 들어가서, 다른 identity가 세션 ID를 쓰면 404를 받는다(6장, 7장).</li>
+  <li>Cedar 판정이 tool의 backend ID를 함께 받게 되어 backend 단위 permit과 forbid를 쓸 수 있다(6장).</li>
+  <li>vMCP 안의 decorator가 돌려주는 URL elicitation 응답을 Modern 클라이언트에게 <code>input_required</code>로 주고, 선언하지 않은 capability의 <code>-32021</code>은 HTTP 400으로 보낸다(5장, 8장).</li>
+  <li>클라이언트가 끝낸 세션은 바로 닫고, POST가 TTL 동안 없는 세션의 pod 복사본도 거둔다(7장).</li>
+  <li>elicitation의 <code>skip_remaining</code>이 남은 step을 건너뛰고 workflow를 성공으로 끝낸다(8장).</li>
+  <li>내장 인가 서버에 그룹 기반 upstream filter와 TLS listener가 생겼다(6장).</li>
+  <li>backend의 phase가 변해도 vMCP pod의 rollout이 일어나지 않고, resource URI의 template 대조에는 2,048바이트 상한이 생겼다(5장, 7장, 11장).</li>
+  </ul>
+</div>
+
+<nav class="toc">
+  <b>목차</b>
+  <ol>
+    <li><a href="#s0">용어집</a></li>
+    <li><a href="#s1">vMCP가 필요한 이유와 위치</a></li>
+    <li><a href="#s2">backend 발견</a></li>
+    <li><a href="#s3">health check와 장애 처리</a></li>
+    <li><a href="#s4">집계 파이프라인과 이름 충돌</a></li>
+    <li><a href="#s5">제공하는 capability와 MCP 개정판</a></li>
+    <li><a href="#s6">요청 처리 파이프라인과 두 경계 인증</a></li>
+    <li><a href="#s7">세션과 확장 한계</a></li>
+    <li><a href="#s8">composite tool과 MRTR</a></li>
+    <li><a href="#s9">optimizer</a></li>
+    <li><a href="#s10">code mode</a></li>
+    <li><a href="#s11">로컬 CLI와 Kubernetes 배포</a></li>
+    <li><a href="#sQ">자가 점검 문제</a></li>
+    <li><a href="#sR">참고 자료</a></li>
+  </ol>
+</nav>
+
+<h2 id="s0">0. 용어집</h2>
+<p>이 문서는 아래 용어를 아래 뜻으로만 쓴다.</p>
+<div class="tbl"><table>
+<tr><th>용어</th><th>이 문서에서의 뜻</th></tr>
+<tr><td>vMCP</td><td>Virtual MCP Server. 여러 backend를 endpoint 하나로 묶는 ToolHive 구성 요소.</td></tr>
+<tr><td>backend</td><td>vMCP가 묶는 MCP 서버 하나. MCPServer, MCPRemoteProxy, MCPServerEntry 중 하나로 정의한다.</td></tr>
+<tr><td>그룹</td><td>ToolHive 그룹. Kubernetes kind는 <code>MCPGroup</code>이다.</td></tr>
+<tr><td>capability</td><td>MCP 서버가 내놓는 항목. tool, resource, resource template, prompt를 말한다. 일반 단어 "기능"과 구분하려고 영어로 쓴다.</td></tr>
+<tr><td>집계</td><td>backend의 capability를 모아 이름 충돌을 정리하는 과정. 결과는 목록 하나다.</td></tr>
+<tr><td>이름 충돌</td><td>둘 이상의 backend가 같은 이름의 tool을 내놓는 상황.</td></tr>
+<tr><td>노출</td><td>capability가 <code>tools/list</code> 같은 목록 응답에 나타나는 것. 코드는 advertise라고 부른다.</td></tr>
+<tr><td>라우팅 테이블</td><td>노출 이름을 backend와 원래 이름에 대응시키는 표. 숨긴 tool도 들어 있다.</td></tr>
+<tr><td>동적 발견 (discovered)</td><td>vMCP가 실행 중에 Kubernetes API로 그룹의 backend를 찾는 방식.</td></tr>
+<tr><td>정적 목록 (inline)</td><td>설정 파일에 backend URL을 직접 적는 방식.</td></tr>
+<tr><td>backend 목록</td><td>vMCP가 메모리에 두는 현재 backend 목록. 코드 이름은 <code>DynamicRegistry</code>다. 이 시리즈의 registry와 다르다.</td></tr>
+<tr><td>health 상태</td><td>backend 상태 값 다섯 가지. healthy, degraded, unhealthy, unauthenticated, unknown.</td></tr>
+<tr><td>core</td><td>vMCP의 도메인 객체(<code>pkg/vmcp/core</code>). 집계, 라우팅, 인가 판정을 맡는다.</td></tr>
+<tr><td>core 인가 판정</td><td>core가 Cedar 판정 하나로 목록과 호출을 함께 거르는 일. 코드는 admission이라고 부른다. Kubernetes의 admission과 다르다.</td></tr>
+<tr><td>vMCP 세션</td><td>MCP 클라이언트와 vMCP 사이의 MCP 세션. proxy가 관리하는 proxy 세션과 다르다.</td></tr>
+<tr><td>Legacy 개정판 / Modern 개정판</td><td>MCP 명세 2025-11-25 판(세션 있음) / 2026-07-28 판(세션 없음). 소스가 쓰는 이름을 따른다.</td></tr>
+<tr><td>들어오는 인증 / 나가는 인증</td><td>MCP 클라이언트에서 vMCP로 오는 인증 / vMCP에서 backend로 가는 인증.</td></tr>
+<tr><td>composite tool</td><td>vMCP 안에서 정의한 tool. 여러 backend tool 호출을 workflow 하나로 묶는다.</td></tr>
+<tr><td>step</td><td>composite tool workflow의 작업 하나. 종류는 tool, elicitation, forEach다.</td></tr>
+<tr><td>elicitation</td><td>서버가 사용자에게 입력을 묻는 MCP 기능.</td></tr>
+<tr><td>URL elicitation 응답</td><td>vMCP 안의 decorator가 호출을 거절하며 돌려주는 응답. 사용자를 URL로 보낸 뒤 호출을 다시 하라는 뜻이다. 코드 이름은 <code>URLElicitationRequiredError</code>다.</td></tr>
+<tr><td>MRTR</td><td>Multi Round-Trip Requests. Modern 개정판에서 서버가 입력을 받는 방식. 서버가 <code>input_required</code> 결과를 주면 클라이언트가 요청을 다시 보낸다.</td></tr>
+<tr><td>optimizer</td><td>tool 목록 대신 메타 tool 두 개(<code>find_tool</code>, <code>call_tool</code>)만 노출하는 vMCP 기능.</td></tr>
+<tr><td>메타 tool</td><td>backend 없이 vMCP가 직접 처리하는 tool. <code>find_tool</code>과 <code>call_tool</code>은 optimizer가, <code>execute_tool_script</code>는 code mode가 노출한다.</td></tr>
+<tr><td>키워드 검색 / 의미 검색</td><td>SQLite FTS5의 BM25 순위 검색 / 임베딩 벡터의 cosine 거리 검색.</td></tr>
+<tr><td>혼합 검색</td><td>키워드 검색과 의미 검색을 함께 돌려 결과를 합치는 검색.</td></tr>
+<tr><td>임베딩</td><td>텍스트를 숫자 벡터로 바꾼 값. TEI 서버나 OpenAI 호환 서비스가 만든다.</td></tr>
+<tr><td>code mode</td><td>에이전트가 Starlark 스크립트 하나로 여러 tool을 호출하는 vMCP 기능.</td></tr>
+<tr><td>LLM 토큰 / access token</td><td>LLM의 텍스트 단위 / 인증 자격 증명. "토큰"만 따로 쓰지 않는다.</td></tr>
+<tr><td>proxy</td><td>ToolHive가 MCP 서버마다 앞에 두는 proxy runner. vMCP를 proxy라고 부르지 않는다.</td></tr>
+</table></div>
+
+<h2 id="s1">1. vMCP가 필요한 이유와 위치</h2>
+<p>MCP 서버가 늘면 MCP 클라이언트가 연결할 endpoint도 늘어난다. 서버마다 인증 설정과 tool 목록이 따로 있고, 이름이 같은 tool이 서로 다른 서버에 있을 가능성도 있다.</p>
+<p>vMCP는 이 문제를 줄이는 ToolHive 구성 요소다. 그룹 하나에 속한 MCP 서버를 backend로 묶어 주므로 MCP 클라이언트는 vMCP의 endpoint 하나에만 연결하면 된다(docs <code>concepts/vmcp</code>). 공식 문서는 vMCP를 ToolHive 플랫폼의 gateway 계층이라고 부른다(docs <code>guides-vmcp/index</code>).</p>
+<p>vMCP는 두 연결 사이에 서 있어서 MCP 클라이언트에게는 MCP 서버이고 backend에게는 MCP 클라이언트다(source <code>docs/arch/10-virtual-mcp-architecture.md</code>). 그래서 두 연결을 따로 관리하고, 인증 방식과 MCP 개정판도 연결마다 따로 정해진다.</p>
+<p>vMCP가 하는 일은 다음과 같다.</p>
+<ul>
+<li>집계: backend의 capability를 모아 목록 하나로 합친다.</li>
+<li>이름 충돌 처리: 같은 이름의 tool을 설정한 전략으로 정리한다.</li>
+<li>두 경계 인증: 들어오는 인증과 나가는 인증을 따로 처리한다.</li>
+<li>composite tool: 여러 backend tool 호출을 workflow 하나로 묶는다.</li>
+<li>optimizer와 code mode: LLM 컨텍스트에 들어가는 tool 정의를 줄인다.</li>
+</ul>
+<p>backend는 세 kind 중 하나로 정의하는데, kind마다 vMCP가 연결하는 곳이 다르다(docs <code>guides-vmcp/backend-discovery</code>).</p>
+<div class="tbl"><table>
+<tr><th>kind</th><th>정의하는 것</th><th>vMCP가 연결하는 곳</th></tr>
+<tr><td><code>MCPServer</code></td><td>ToolHive가 실행하는 MCP 서버 컨테이너</td><td>그 서버 앞 proxy의 Service URL</td></tr>
+<tr><td><code>MCPRemoteProxy</code></td><td>원격 MCP 서버 앞에 둔 proxy pod</td><td>그 proxy의 Service URL</td></tr>
+<tr><td><code>MCPServerEntry</code></td><td>원격 endpoint 선언. pod를 만들지 않는다.</td><td>원격 MCP 서버(<code>remoteUrl</code>)</td></tr>
+</table></div>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 330" width="760" height="330" role="img" aria-label="MCP 클라이언트에서 vMCP를 거쳐 backend로 가는 요청 흐름">
+    <defs><marker id="a8a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+    <marker id="a8aw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head-w" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="d-box" x="16" y="58" width="128" height="52" rx="10"/>
+    <text x="80" y="89" font-size="14" font-weight="600" text-anchor="middle">MCP 클라이언트</text>
+    <rect class="d-acc" x="180" y="20" width="250" height="296" rx="12"/>
+    <text x="305" y="44" font-size="15" font-weight="700" text-anchor="middle">vMCP</text>
+    <rect class="d-box" x="200" y="62" width="210" height="44" rx="8"/>
+    <text x="305" y="89" font-size="13" text-anchor="middle">들어오는 인증</text>
+    <rect class="d-box" x="200" y="120" width="210" height="60" rx="8"/>
+    <text x="305" y="145" font-size="13" font-weight="600" text-anchor="middle">core</text>
+    <text class="d-m" x="305" y="166" font-size="12" text-anchor="middle">집계 · 인가 판정 · 라우팅</text>
+    <rect class="d-box" x="200" y="194" width="210" height="44" rx="8"/>
+    <text x="305" y="221" font-size="13" text-anchor="middle">나가는 인증</text>
+    <rect class="d-box" x="200" y="256" width="210" height="44" rx="8"/>
+    <text x="305" y="283" font-size="13" text-anchor="middle">health monitor</text>
+    <line class="d-line" x1="144" y1="84" x2="198" y2="84" marker-end="url(#a8a)"/>
+    <line class="d-line" x1="305" y1="106" x2="305" y2="118" marker-end="url(#a8a)"/>
+    <line class="d-line" x1="305" y1="180" x2="305" y2="192" marker-end="url(#a8a)"/>
+    <rect class="d-outer" x="460" y="20" width="290" height="296" rx="12"/>
+    <text class="d-m" x="605" y="40" font-size="12" text-anchor="middle">MCPGroup</text>
+    <text class="d-a" x="476" y="62" font-size="12">MCPServer</text>
+    <rect class="d-box" x="476" y="68" width="98" height="40" rx="8"/>
+    <text x="525" y="93" font-size="12" text-anchor="middle">proxy</text>
+    <rect class="d-box" x="604" y="68" width="134" height="40" rx="8"/>
+    <text x="671" y="93" font-size="12" text-anchor="middle">MCP 서버 컨테이너</text>
+    <text class="d-a" x="476" y="144" font-size="12">MCPRemoteProxy</text>
+    <rect class="d-box" x="476" y="150" width="98" height="40" rx="8"/>
+    <text x="525" y="175" font-size="12" text-anchor="middle">proxy</text>
+    <rect class="d-box" x="604" y="150" width="134" height="40" rx="8"/>
+    <text x="671" y="175" font-size="12" text-anchor="middle">원격 MCP 서버</text>
+    <text class="d-a" x="476" y="226" font-size="12">MCPServerEntry</text>
+    <text class="d-m" x="525" y="248" font-size="11" text-anchor="middle">proxy 없음</text>
+    <rect class="d-box" x="604" y="232" width="134" height="40" rx="8"/>
+    <text x="671" y="257" font-size="12" text-anchor="middle">원격 MCP 서버</text>
+    <path class="d-line" d="M410,216 L442,216 L442,88 L474,88" marker-end="url(#a8a)"/>
+    <path class="d-line" d="M442,170 L474,170" marker-end="url(#a8a)"/>
+    <path class="d-line" d="M442,216 L442,256 L602,256" marker-end="url(#a8a)"/>
+    <line class="d-line" x1="574" y1="88" x2="602" y2="88" marker-end="url(#a8a)"/>
+    <line class="d-line" x1="574" y1="170" x2="602" y2="170" marker-end="url(#a8a)"/>
+    <line class="d-dash" x1="410" y1="290" x2="458" y2="290" marker-end="url(#a8aw)"/>
+    <text class="d-w" x="476" y="300" font-size="11">health check (주기적)</text>
+  </svg>
+  </div>
+  <figcaption>그림 1. vMCP는 MCP 클라이언트와 그룹 사이에 서 있고, 나가는 인증을 거친 호출은 backend kind에 따라 proxy나 원격 서버로 간다.</figcaption>
+</figure>
+
+<p>vMCP가 늘 필요한 것은 아니다. 공식 문서는 그런 예로 MCP 서버 하나만 쓰는 경우와 단계가 하나뿐인 작업을 든다(docs <code>concepts/vmcp</code>). proxy와 MCP 서버의 관계는 <a href="02-run-model-proxy.html">02편</a>에서 다룬다.</p>
+
+<h2 id="s2">2. backend 발견</h2>
+<p>vMCP는 backend 목록을 만든 뒤에 집계를 시작하는데, 목록을 만드는 방식은 동적 발견과 정적 목록 두 가지다. Kubernetes에서는 <code>spec.outgoingAuth.source</code> 필드가 방식을 정하고 기본값은 <code>discovered</code>다(source <code>cmd/thv-operator/api/v1beta1/virtualmcpserver_types.go:240</code>).</p>
+<p>필드 이름이 인증을 가리키는 데는 이유가 있는데, 공식 문서는 인증 설정과 backend 출처가 묶여 있다고 설명한다. 동적 발견은 backend가 참조하는 MCPExternalAuthConfig를 찾아 쓰고, 정적 목록은 backend마다 MCPExternalAuthConfig 참조를 <code>outgoingAuth.backends</code>에 적는다(docs <code>guides-vmcp/backend-discovery</code>).</p>
+<div class="tbl"><table>
+<tr><th>항목</th><th>동적 발견 (discovered)</th><th>정적 목록 (inline)</th></tr>
+<tr><td>backend 출처</td><td>실행 중 Kubernetes API 조회</td><td><code>spec.config.backends</code></td></tr>
+<tr><td>vMCP pod의 RBAC</td><td>namespace 읽기와 status 갱신</td><td>status 갱신만</td></tr>
+<tr><td>backend 추가</td><td>그룹에 리소스를 더한다</td><td>vMCP 설정을 고친다</td></tr>
+<tr><td>backend 인증</td><td>backend 리소스가 가리키는 MCPExternalAuthConfig</td><td><code>outgoingAuth.backends</code>에 참조를 적는다</td></tr>
+<tr><td>맞는 경우</td><td>backend가 자주 바뀐다</td><td>권한을 최소로 줄여야 한다</td></tr>
+</table></div>
+
+<h3>2.1 동적 발견의 순서</h3>
+<p>동적 발견에서 vMCP는 다음 순서로 backend를 찾는다(docs <code>guides-vmcp/backend-discovery</code>).</p>
+<ol>
+<li>참조한 MCPGroup이 있는지 확인한다.</li>
+<li>그룹에 속한 MCPServer, MCPRemoteProxy, MCPServerEntry를 조회한다(source <code>pkg/vmcp/workloads/k8s.go:87</code>).</li>
+<li>backend마다 URL, transport, 인증 설정을 꺼낸다.</li>
+<li>backend마다 capability를 묻는데, Legacy backend는 <code>initialize</code> 핸드셰이크를 먼저 거친다.</li>
+<li>결과를 VirtualMCPServer의 status에 기록한다.</li>
+</ol>
+<p>operator는 MCPGroup이 없거나 Ready가 아니면 reconcile을 멈추고(source <code>cmd/thv-operator/controllers/virtualmcpserver_controller.go:1111</code>), 공식 문서는 <code>MCPServersChecked</code> 조건이 <code>True</code>여야 한다고 적는다(docs <code>guides-vmcp/configuration</code>). vMCP 프로세스는 다르게 동작해서, Kubernetes에서 그룹이 없으면 backend 0개로 시작한다(source <code>pkg/vmcp/cli/serve.go:808</code>).</p>
+
+<div class="box warn">
+<p>backend 변경의 반영 방식은 문서와 소스가 다르다. 공식 문서는 동적 발견도 그룹 변경을 자동으로 반영하지 않는다고 적고, 그래서 vMCP pod를 재시작하라고 안내한다(docs <code>guides-vmcp/backend-discovery</code>, 2026-11-07 확인).</p>
+<p>v0.63.0 소스는 다르게 동작한다. <code>source: discovered</code>이면 vMCP가 pod 안에서 informer로 그룹을 지켜보다가(source <code>pkg/vmcp/cli/serve.go:230</code>), backend가 추가되거나 빠지면 backend 목록을 고친다(source <code>pkg/vmcp/k8s/manager.go:52</code>). 운영자는 실제 클러스터에서 이 동작을 확인해야 한다.</p>
+</div>
+
+<h3>2.2 정적 목록</h3>
+<p>정적 목록은 backend의 이름, URL, transport를 설정에 직접 적는 방식이고, transport는 <code>sse</code>나 <code>streamable-http</code>만 받는다(docs <code>guides-vmcp/backend-discovery</code>). 이 방식에서 vMCP pod는 backend를 찾으려고 Kubernetes API를 부르지 않는다.</p>
+<pre><code>apiVersion: toolhive.stacklok.dev/v1beta1
+kind: VirtualMCPServer
+metadata:
+  name: my-vmcp
+  namespace: toolhive-system
+spec:
+  groupRef:
+    name: my-group          # inline에서도 필수. status 보고에 쓴다
+  config:
+    backends:
+      - name: github-mcp
+        url: http://github-mcp.toolhive-system.svc.cluster.local:8080
+        transport: sse
+      - name: fetch-mcp
+        url: http://fetch-mcp.toolhive-system.svc.cluster.local:8080
+        transport: streamable-http
+  incomingAuth:
+    type: anonymous
+  outgoingAuth:
+    source: inline
+    backends:
+      github-mcp:
+        type: externalAuthConfigRef
+        externalAuthConfigRef:
+          name: github-token-config</code></pre>
+
+<h3>2.3 로컬 CLI의 발견</h3>
+<p>로컬 CLI(<code>thv vmcp serve</code>)도 같은 두 방식을 쓴다. 설정 파일에 <code>backends</code>가 있으면 정적 목록을 쓰고, 없으면 로컬 ToolHive 그룹에서 실행 중인 workload를 찾는다(source <code>pkg/vmcp/cli/serve.go:750</code>). 그룹은 <a href="04-registry-group-client.html">04편</a>에서 다룬다.</p>
+
+<h2 id="s3">3. health check와 장애 처리</h2>
+<h3>3.1 health check</h3>
+<p>vMCP의 health monitor는 backend마다 health check를 주기적으로 보낸다. health check는 <code>ListCapabilities</code> 호출이라서 연결부터 capability 조회까지 MCP 통신 전체를 거치고(source <code>pkg/vmcp/health/checker.go:97</code>), Legacy backend면 <code>initialize</code> 핸드셰이크도 포함한다. 응답이 5초를 넘으면 vMCP는 그 backend를 degraded로 본다(source <code>pkg/vmcp/health/monitor.go:227</code>). health check는 MCP를 POST로만 말하고 standalone GET stream은 열지 않으므로, 세션 없는 GET을 거절하는 backend도 healthy로 본다(source <code>pkg/vmcp/client/getreject_realbackend_test.go:79</code>).</p>
+<div class="tbl"><table>
+<tr><th>health 상태</th><th>판정 조건</th><th>CRD status 값</th></tr>
+<tr><td><code>healthy</code></td><td>health check가 5초 안에 성공했다.</td><td><code>ready</code></td></tr>
+<tr><td><code>degraded</code></td><td>성공했으나 5초를 넘었다. 또는 최근에 회복했다.</td><td><code>degraded</code></td></tr>
+<tr><td><code>unhealthy</code></td><td>응답 없음이나 timeout이 <code>unhealthyThreshold</code>번 이어졌다.</td><td><code>unavailable</code></td></tr>
+<tr><td><code>unauthenticated</code></td><td>401이나 403을 받았다. 나가는 인증 설정은 없다.</td><td><code>unauthenticated</code></td></tr>
+<tr><td><code>unknown</code></td><td>아직 결과가 없다. 또는 첫 실패들이 threshold에 못 미쳤다.</td><td><code>unknown</code></td></tr>
+</table></div>
+<p>health check는 사용자 access token 없이 나간다. 그래서 나가는 인증이 있는 backend가 401이나 403을 주면 vMCP는 healthy로 보는데, 인증 계층이 응답했다는 사실을 연결 성공으로 해석하기 때문이다(source <code>pkg/vmcp/health/checker.go:76</code>). unauthenticated는 나가는 인증 설정이 빠졌다는 뜻이고, 이 상태의 backend는 집계에서 빠진다(docs <code>guides-vmcp/backend-discovery</code>). vMCP의 <code>/health</code>는 backend 상태와 관계없이 200을 주고, backend별 상태는 <code>/api/backends/health</code>가 준다(source <code>pkg/vmcp/server/server.go:664</code>). backend의 health나 phase가 바뀌어도 operator는 vMCP pod를 다시 띄우지 않는다(11.2절).</p>
+
+<h3>3.2 circuit breaker와 부분 실패</h3>
+<p>공식 문서는 circuit breaker를 요청 경로의 장치로 설명한다. 실패가 이어지는 backend로 가는 요청을 timeout 전에 거절한다는 설명이고(docs <code>guides-vmcp/failure-handling</code>), 2026-11-07에도 같다. v0.63.0 코드의 동작은 이와 다르다. circuit breaker는 health check 실패만 세고(source <code>pkg/vmcp/health/status.go:326</code>), 열린 동안 vMCP는 그 backend의 health check를 건너뛴다(source <code>pkg/vmcp/health/monitor.go:510</code>). 요청은 간접적으로만 영향을 받는데, backend가 unhealthy가 되면 집계에서 빠지기 때문이다.</p>
+<p>circuit breaker의 상태는 세 가지이고, health monitor는 다음 순서로 상태를 바꾼다(source <code>pkg/vmcp/health/circuit_breaker.go:137</code>).</p>
+<ol>
+<li>closed: health check를 보내면서 연속 실패를 센다.</li>
+<li>open: 연속 실패가 <code>failureThreshold</code>에 이르면 열린다. <code>timeout</code> 동안 health check를 보내지 않는다.</li>
+<li>half-open: <code>timeout</code>이 지나면 시험 health check 하나만 보낸다. 성공하면 closed, 실패하면 다시 open이 된다.</li>
+</ol>
+<p><code>partialFailureMode</code>도 문서와 코드가 다르다. 공식 문서는 <code>fail</code>이면 요청 전체가 실패하고 <code>best_effort</code>면 살아 있는 backend의 결과만 준다고 설명한다. v0.63.0 코드는 이 값을 설정 검사에만 쓰고(source <code>pkg/vmcp/config/validator.go:525</code>), 집계는 값과 관계없이 실패한 backend를 건너뛴다(source <code>pkg/vmcp/aggregator/default_aggregator.go:185</code>). 집계가 오류로 끝나는 것은 모든 backend가 실패할 때뿐이다.</p>
+<div class="tbl"><table>
+<tr><th>필드 (<code>spec.config.operational</code> 아래)</th><th>기본값</th><th>출처</th></tr>
+<tr><td><code>failureHandling.healthCheckInterval</code></td><td>30s</td><td><code>pkg/vmcp/config/defaults.go:21</code></td></tr>
+<tr><td><code>failureHandling.unhealthyThreshold</code></td><td>3</td><td><code>pkg/vmcp/config/defaults.go:25</code></td></tr>
+<tr><td><code>failureHandling.healthCheckTimeout</code></td><td>10s</td><td><code>pkg/vmcp/config/config.go:792</code></td></tr>
+<tr><td><code>failureHandling.partialFailureMode</code></td><td><code>fail</code></td><td><code>pkg/vmcp/config/defaults.go:32</code></td></tr>
+<tr><td><code>failureHandling.circuitBreaker.enabled</code></td><td>false</td><td><code>pkg/vmcp/config/defaults.go:46</code></td></tr>
+<tr><td><code>failureHandling.circuitBreaker.failureThreshold</code></td><td>5</td><td><code>pkg/vmcp/config/defaults.go:39</code></td></tr>
+<tr><td><code>failureHandling.circuitBreaker.timeout</code></td><td>60s</td><td><code>pkg/vmcp/config/defaults.go:43</code></td></tr>
+<tr><td><code>timeouts.default</code></td><td>30s</td><td><code>pkg/vmcp/config/defaults.go:35</code></td></tr>
+</table></div>
+<pre><code>spec:
+  config:
+    operational:
+      failureHandling:
+        healthCheckInterval: 10s
+        unhealthyThreshold: 2
+        healthCheckTimeout: 5s
+        partialFailureMode: best_effort   # v0.63.0 코드는 검사만 한다 (3.2절)
+        circuitBreaker:
+          enabled: true
+          failureThreshold: 3
+          timeout: 30s</code></pre>
+
+<h3>3.3 세션을 열 때의 backend 선택</h3>
+<p>vMCP는 health 상태를 두 곳에서 다른 기준으로 쓴다(source <code>pkg/vmcp/health/policy.go</code>).</p>
+<ul>
+<li>세션을 열 때: unhealthy와 unauthenticated backend만 건너뛰고, degraded와 unknown backend는 연결을 시도한다(<code>policy.go:73</code>).</li>
+<li>집계할 때: healthy와 degraded backend만 넣고, unknown backend는 빠진다(<code>policy.go:18</code>, <code>core_vmcp.go:628</code>).</li>
+</ul>
+<p>세션을 열 때 unknown을 시도하는 이유는 vMCP가 첫 health check가 끝나기 전에도 세션을 열기 때문이다. 이때 unknown을 건너뛰면 세션이 backend 0개에 연결된다(source <code>pkg/vmcp/health/policy.go:73</code>).</p>
+<p>회복한 backend의 처리는 두 문서가 다르게 적는다. 장애 처리 문서는 기존 세션에 붙지 않으니 다시 연결하라고 적는다(2026-11-07 확인). 아키텍처 문서는 health 변화가 생기면 기존 세션의 tool 목록을 다시 만든다고 적는데, optimizer를 끈 경우와 tool에만 해당한다(source <code>docs/arch/10-virtual-mcp-architecture.md</code>). 두 동작의 관계는 이 문서에서 확인하지 못했다.</p>
+
+<h2 id="s4">4. 집계 파이프라인과 이름 충돌</h2>
+<h3>4.1 파이프라인</h3>
+<p>aggregator는 backend 목록을 받아 다음 순서로 집계한다(source <code>pkg/vmcp/aggregator/aggregator.go:38</code>).</p>
+<ol>
+<li>발견: health 상태로 거른 backend 목록을 받는다.</li>
+<li>질의: backend마다 capability를 묻는데, 동시에 최대 10개까지 묻는다(source <code>pkg/vmcp/aggregator/default_aggregator.go:171</code>). 실패한 backend는 로그만 남기고 건너뛴다.</li>
+<li>override 적용: backend별 이름, 설명 변경을 먼저 적용한다(source <code>pkg/vmcp/aggregator/default_aggregator.go:123</code>).</li>
+<li>충돌 처리: 설정한 전략으로 tool 이름을 정한다.</li>
+<li>병합: 라우팅 테이블을 만들고, filter 설정으로 노출 목록을 정한다(source <code>pkg/vmcp/aggregator/default_aggregator.go:705</code>).</li>
+</ol>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 260" width="760" height="260" role="img" aria-label="집계 파이프라인의 다섯 단계와 두 결과">
+    <defs><marker id="a8b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="d-box" x="12" y="36" width="128" height="70" rx="10"/>
+    <text x="76" y="66" font-size="14" font-weight="600" text-anchor="middle">1. 발견</text>
+    <text class="d-m" x="76" y="88" font-size="11" text-anchor="middle">health 상태로 거름</text>
+    <rect class="d-box" x="162" y="36" width="128" height="70" rx="10"/>
+    <text x="226" y="66" font-size="14" font-weight="600" text-anchor="middle">2. 질의</text>
+    <text class="d-m" x="226" y="88" font-size="11" text-anchor="middle">동시 최대 10개</text>
+    <rect class="d-box" x="312" y="36" width="128" height="70" rx="10"/>
+    <text x="376" y="66" font-size="14" font-weight="600" text-anchor="middle">3. override</text>
+    <text class="d-m" x="376" y="88" font-size="11" text-anchor="middle">이름과 설명 변경</text>
+    <rect class="d-acc" x="462" y="36" width="128" height="70" rx="10"/>
+    <text x="526" y="66" font-size="14" font-weight="600" text-anchor="middle">4. 충돌 처리</text>
+    <text class="d-m" x="526" y="88" font-size="11" text-anchor="middle">전략 세 가지</text>
+    <rect class="d-box" x="612" y="36" width="136" height="70" rx="10"/>
+    <text x="680" y="66" font-size="14" font-weight="600" text-anchor="middle">5. 병합</text>
+    <text class="d-m" x="680" y="88" font-size="11" text-anchor="middle">filter 적용</text>
+    <line class="d-line" x1="140" y1="71" x2="160" y2="71" marker-end="url(#a8b)"/>
+    <line class="d-line" x1="290" y1="71" x2="310" y2="71" marker-end="url(#a8b)"/>
+    <line class="d-line" x1="440" y1="71" x2="460" y2="71" marker-end="url(#a8b)"/>
+    <line class="d-line" x1="590" y1="71" x2="610" y2="71" marker-end="url(#a8b)"/>
+    <text class="d-a" x="526" y="128" font-size="11" text-anchor="middle">prefix · priority · manual</text>
+    <path class="d-line" d="M680,106 L680,140 L446,140 L446,160" marker-end="url(#a8b)"/>
+    <line class="d-line" x1="680" y1="140" x2="680" y2="160" marker-end="url(#a8b)"/>
+    <rect class="d-box" x="356" y="162" width="180" height="52" rx="10"/>
+    <text x="446" y="185" font-size="13" font-weight="600" text-anchor="middle">라우팅 테이블</text>
+    <text class="d-m" x="446" y="204" font-size="11" text-anchor="middle">숨긴 tool 포함</text>
+    <rect class="d-ok" x="590" y="162" width="160" height="52" rx="10"/>
+    <text x="670" y="185" font-size="13" font-weight="600" text-anchor="middle">노출 목록</text>
+    <text class="d-m" x="670" y="204" font-size="11" text-anchor="middle">tools/list 응답</text>
+    <text class="d-m" x="446" y="240" font-size="11" text-anchor="middle">composite tool step이 쓴다</text>
+    <text class="d-m" x="670" y="240" font-size="11" text-anchor="middle">MCP 클라이언트가 본다</text>
+  </svg>
+  </div>
+  <figcaption>그림 2. 집계 파이프라인. override는 충돌 처리보다 먼저 적용하고 filter는 병합 단계에서 적용한다. 라우팅 테이블에는 숨긴 tool도 남는다.</figcaption>
+</figure>
+
+<p>집계 결과는 identity별 캐시에 30초 동안 남는다(source <code>pkg/vmcp/server/server.go:97</code>). 캐시 key가 identity, 전달 header, backend 집합을 합친 해시라서 한 호출자의 결과를 다른 호출자에게 주지 않는다. 캐시 항목은 최대 1,024개이고(source <code>pkg/vmcp/aggregator/caching_aggregator.go:25</code>), 이 문서는 이 캐시를 capability 캐시라고 부른다.</p>
+
+<h3>4.2 충돌 처리 전략 세 가지</h3>
+<p>전략은 <code>spec.config.aggregation.conflictResolution</code>으로 정하고 기본값은 <code>prefix</code>다(source <code>pkg/vmcp/config/config.go:503</code>).</p>
+<div class="tbl"><table>
+<tr><th>전략</th><th>동작</th><th>주의할 점</th></tr>
+<tr><td><code>prefix</code> (기본)</td><td>모든 tool 이름 앞에 backend 이름을 붙인다. 기본 형식은 <code>{workload}_</code>다.</td><td>충돌이 없는 tool도 이름이 바뀐다.</td></tr>
+<tr><td><code>priority</code></td><td><code>priorityOrder</code>에서 앞선 backend의 tool만 남긴다.</td><td>목록에 없는 backend가 충돌에 끼면 후보를 모두 뺀다.</td></tr>
+<tr><td><code>manual</code></td><td>충돌한 tool마다 사용자가 이름을 정한다.</td><td>하나라도 빠지면 집계가 오류로 끝난다.</td></tr>
+</table></div>
+<pre><code># prefix: github의 create_issue는 github_create_issue로 노출된다
+spec:
+  config:
+    aggregation:
+      conflictResolution: prefix
+      conflictResolutionConfig:
+        prefixFormat: "{workload}_"     # "{workload}." 이면 github.create_issue
+---
+# priority: github과 jira가 모두 create_issue를 내면 github 것만 남는다
+spec:
+  config:
+    aggregation:
+      conflictResolution: priority
+      conflictResolutionConfig:
+        priorityOrder: ["github", "jira", "slack"]
+---
+# manual: 충돌한 tool마다 override가 있어야 한다
+spec:
+  config:
+    aggregation:
+      conflictResolution: manual
+      tools:
+        - workload: github
+          overrides:
+            create_issue:
+              name: gh_create_issue
+        - workload: jira
+          overrides:
+            create_issue:
+              name: jira_ticket</code></pre>
+<p>priority 전략의 규칙은 엄격하다. 충돌한 backend 중 하나라도 <code>priorityOrder</code>에 없으면 vMCP는 그 이름의 후보를 모두 빼고 ERROR 로그를 남긴다(source <code>pkg/vmcp/aggregator/priority_resolver.go:92</code>). 이유는 Cedar 정책이 노출 이름으로 tool을 가리킨다는 데 있다. 이름을 목록 안의 backend에 넘기면 정책이 다른 backend의 tool에 걸릴 가능성이 있다(docs <code>guides-vmcp/tool-aggregation</code>).</p>
+<p>manual 전략은 override가 빠진 충돌을 오류로 돌려주고(source <code>pkg/vmcp/aggregator/manual_resolver.go:60</code>), 공식 문서는 이때 vMCP가 시작하지 않는다고 적는다.</p>
+
+<h3>4.3 filter와 override</h3>
+<p>충돌 처리와 별도로 tool의 노출을 조정하는 설정이 있다(docs <code>guides-vmcp/tool-aggregation</code>).</p>
+<ul>
+<li><code>tools[].filter</code>: 적은 tool만 노출한다.</li>
+<li><code>tools[].excludeAll</code>: 그 backend의 tool을 모두 숨긴다.</li>
+<li><code>excludeAllTools</code>: 모든 backend의 tool을 숨긴다. composite tool만 노출할 때 쓴다.</li>
+<li><code>defaultToolVisibility: deny</code>: <code>tools</code>에 적지 않은 backend의 tool을 숨긴다. 기본값은 allow처럼 동작한다(source <code>pkg/vmcp/config/config.go:549</code>).</li>
+<li><code>tools[].overrides</code>: tool 이름, 설명, annotation을 바꾼다.</li>
+</ul>
+<p>이 설정은 모두 노출만 바꾸고, 숨긴 tool도 라우팅 테이블에 남는다. 그래서 composite tool step이 숨긴 tool을 호출하면 vMCP는 그 호출을 backend로 보내지만, MCP 클라이언트가 숨긴 tool을 직접 부르면 unknown-tool 오류를 받는다(docs <code>guides-vmcp/tool-aggregation</code>). resource와 prompt에는 영향을 주지 않고, 호출자별 접근 제어는 Cedar 정책이 맡는다.</p>
+<pre><code>spec:
+  config:
+    aggregation:
+      defaultToolVisibility: deny     # 목록에 없는 backend의 tool은 숨긴다
+      tools:
+        - workload: github
+          filter: ["create_issue", "list_issues"]
+          overrides:
+            create_issue:
+              description: "엔지니어링 팀 저장소에 GitHub 이슈를 만든다"
+        - workload: jira
+          excludeAll: true            # composite tool에서만 쓴다</code></pre>
+
+<h3>4.4 resource와 prompt의 처리</h3>
+<p>resource와 prompt는 tool 전략과 따로 처리한다(source <code>pkg/vmcp/aggregator/capability_conflicts.go</code>).</p>
+<ul>
+<li>prompt: 기본으로 모든 prompt 이름 앞에 backend 접두사를 붙이고, priority 전략이면 <code>priorityOrder</code>에 있는 backend만 원래 이름을 쓴다.</li>
+<li>resource URI와 resource template: 이름을 바꾸지 않는다. 같은 URI가 여럿이면 backend ID 정렬에서 앞선 backend 하나만 남긴다.</li>
+<li>잘못된 항목: resource URI가 URL로 파싱되지 않으면 vMCP는 그 resource 하나만 버리고, 크기 한도를 넘는 resource template도 그 하나만 버린다. 다른 capability는 그대로 넣는다(source <code>pkg/vmcp/client/client.go:1458</code>).</li>
+<li>manual 전략: tool에만 적용한다.</li>
+</ul>
+
+<h3>4.5 이름 되돌리기</h3>
+<p>MCP 클라이언트가 <code>github_create_issue</code>를 부르면 vMCP는 라우팅 테이블에서 backend를 찾고, backend에는 원래 이름 <code>create_issue</code>로 호출을 보낸다(source <code>docs/arch/10-virtual-mcp-architecture.md</code>). 그래서 backend는 이름이 바뀐 사실을 모른다.</p>
+
+<h2 id="s5">5. 제공하는 capability와 MCP 개정판</h2>
+<h3>5.1 capability</h3>
+<p>vMCP는 tool 말고도 여러 capability를 제공한다. 모든 capability가 core를 거치므로 <code>tools/list</code>를 거르는 core 인가 판정이 읽기와 호출에도 똑같이 적용된다(source <code>docs/arch/10-virtual-mcp-architecture.md</code>).</p>
+<div class="tbl"><table>
+<tr><th>capability</th><th>MCP 메서드</th><th>제공 수준</th></tr>
+<tr><td>tool</td><td><code>tools/list</code>, <code>tools/call</code></td><td>제공한다. backend의 <code>list_changed</code> 알림은 추가와 삭제를 모두 전한다.</td></tr>
+<tr><td>resource</td><td><code>resources/list</code>, <code>resources/read</code></td><td>제공한다. <code>list_changed</code>는 추가만 전한다.</td></tr>
+<tr><td>resource template</td><td><code>resources/templates/list</code></td><td>제공한다. 읽기는 resource 경로로 간다.</td></tr>
+<tr><td>prompt</td><td><code>prompts/list</code>, <code>prompts/get</code></td><td>제공한다. <code>list_changed</code>는 추가만 전한다.</td></tr>
+<tr><td>completion</td><td><code>completion/complete</code></td><td>제공한다. 경로를 못 찾으면 빈 결과를 준다.</td></tr>
+<tr><td>구독</td><td><code>resources/subscribe</code>, <code>subscriptions/listen</code></td><td>수락 응답만 준다. 변경 알림은 보내지 않는다.</td></tr>
+</table></div>
+<p><code>list_changed</code> 전달은 Legacy backend에만 적용한다. vMCP는 Legacy backend와 세션마다 지속 연결을 열고, 이 연결로 backend가 보내는 알림을 받는다.</p>
+<p>resource URI에는 길이 상한이 있어서 2,048바이트를 넘는 URI는 resource template과 대조하지 않는다. 이때 읽기와 구독은 not found, completion은 빈 결과를 받는다. 정확히 일치하는 resource나 template 문자열은 길이와 관계없이 찾는다(source <code>pkg/vmcp/types.go:682</code>).</p>
+
+<h3>5.2 MCP 개정판 분류</h3>
+<p>MCP 명세는 2026-07-28 판에서 세션과 <code>initialize</code> 핸드셰이크를 없앴다. 소스는 2025-11-25 판을 Legacy, 2026-07-28 판을 Modern이라고 부르고, vMCP는 두 판을 동시에 지원한다(source <code>docs/arch/10-virtual-mcp-architecture.md</code>). transport의 세부 내용은 <a href="02-run-model-proxy.html">02편</a>에서 다룬다.</p>
+<p>클라이언트 쪽은 요청마다 판을 분류하고, backend 쪽은 backend마다 한 번 확인해서 결과를 캐시에 둔다. vMCP는 다음 순서로 backend의 판을 정한다(source <code>pkg/vmcp/client/client.go:1192</code>).</p>
+<ol>
+<li>transport가 SSE인 backend는 바로 Legacy로 정한다.</li>
+<li>나머지 backend에는 <code>server/discover</code>를 POST로 보낸다.</li>
+<li>응답의 <code>supportedVersions</code>에 <code>2026-07-28</code>이 정확히 있으면 Modern으로 정한다.</li>
+<li>401, 403, 5xx, timeout이면 판단 근거가 없으므로 이번 호출만 Legacy로 처리하고 캐시에 두지 않는다.</li>
+<li>그 밖의 응답이면 Legacy로 정한다.</li>
+</ol>
+<p>캐시가 틀리면 vMCP가 스스로 고친다. 판이 맞지 않아 실패한 호출은 다시 확인한 뒤 재시도하는데, 이미 실행됐을 가능성이 있는 요청은 다시 보내지 않는다. 확인한 판은 VirtualMCPServer의 <code>status.discoveredBackends[].mcpRevision</code>에 나온다.</p>
+
+<h3>5.3 Modern 클라이언트를 받는 조건</h3>
+<p>vMCP는 Modern 클라이언트를 조건부로 받는다. 켜진 기능 중 Modern 경로가 처리하지 못하는 기능이 있으면 Modern을 끄는데, v0.63.0에서 이 목록에 든 기능은 optimizer 하나다(source <code>pkg/vmcp/server/modern_gate.go:49</code>).</p>
+<ul>
+<li>Modern을 끄면 <code>server/discover</code> 응답에서 Modern 판이 빠지고, go-sdk 클라이언트는 이 응답을 보고 Legacy로 연결한다.</li>
+<li>그 밖의 Modern 요청은 HTTP 400과 <code>-32022</code> 오류를 받는다.</li>
+<li>Legacy 요청은 영향을 받지 않는다.</li>
+</ul>
+<p>backend가 호출 도중에 보내는 elicitation과 sampling은 Modern 연결로 전달하지 않는다. 예외는 vMCP 자신이 만드는 URL elicitation 응답 하나이고, 이 한계는 8.3절의 MRTR과 함께 설명한다.</p>
+
+<h2 id="s6">6. 요청 처리 파이프라인과 두 경계 인증</h2>
+<h3>6.1 middleware 순서</h3>
+<p>MCP 요청 하나는 HTTP middleware를 거쳐 core에 닿는다. 순서는 <code>Server.Handler</code> 함수가 정하고(source <code>pkg/vmcp/server/server.go:629</code>), 실행 순서는 그 함수 안의 주석에 적혀 있다(<code>server.go:703</code>). vMCP는 MCP 요청을 다음 순서로 처리한다.</p>
+<ol>
+<li>recovery: panic을 잡아 HTTP 500을 돌려준다.</li>
+<li>body 크기 제한: 너무 큰 요청 body를 413으로 거절한다.</li>
+<li>WriteTimeout: backend 작업 중에는 쓰기 제한 시간을 멈추고, SSE 연결은 길게 둔다.</li>
+<li>Accept header 검사: <code>Accept: text/event-stream</code>이 없는 GET을 거절한다.</li>
+<li>header 전달 준비: <code>passthroughHeaders</code>에 적은 header를 backend 호출용으로 담아 둔다.</li>
+<li>audit: 설정한 경우 결과를 기록하고, 인증 실패 401도 기록한다.</li>
+<li>들어오는 인증: 자격 증명을 확인하고 MCP 메시지를 파싱한다.</li>
+<li>telemetry: 설정한 경우 OpenTelemetry 계측을 붙인다.</li>
+<li>loopback Host 검사: loopback 연결의 Host header가 loopback 이름이 아니면 403을 줘서 DNS rebinding을 막는다(source <code>pkg/vmcp/server/loopback_host_guard.go:66</code>).</li>
+<li>개정판 분류: Modern 요청은 core로 바로 보내고 Legacy 요청은 MCP SDK로 보낸다.</li>
+<li>세션 소유자 검사: Legacy 요청에만 동작한다. 세션을 만든 identity가 아닌 호출자가 그 세션 ID를 쓰면 404를 준다(source <code>pkg/vmcp/server/session_ownership.go:47</code>).</li>
+<li>인가 gate: Cedar 정책이 있을 때 Legacy 요청에 동작하고, 거부한 호출을 HTTP 403으로 끝낸다. 소유자 검사가 먼저이므로 남의 세션에서는 403 대신 404를 받는다. Modern 요청은 core로 가는 dispatch가 같은 판정을 한다(source <code>pkg/vmcp/server/modern_dispatch.go:509</code>).</li>
+<li>core: core 인가 판정, 라우팅, 나가는 인증, backend 호출을 처리한다.</li>
+</ol>
+<p>아키텍처 문서의 middleware 표에는 discovery와 authorization 행이 아직 있는데, 표 아래 주석은 이 행들이 Serve 경로에서 독립 middleware가 아니라고 적는다. v0.63.0 코드 주석은 세 계층을 지웠다고 적고(source <code>pkg/vmcp/server/server.go:721</code>), 그 세 계층은 authz, annotation-enrichment, discovery다. 이 문서는 코드를 따랐다. rate limit은 middleware가 아니라 core를 감싸는 decorator이고 <code>tools/call</code>만 센다. 관측과 사용 제한은 <a href="06-observability-operations.html">06편</a>에서 다룬다.</p>
+
+<h3>6.2 core 인가 판정</h3>
+<p>core 인가 판정은 Cedar 판정 하나를 목록과 호출에 함께 쓴다(source <code>pkg/vmcp/core/core_checks.go</code>). 그래서 목록에는 보이는데 호출은 막히는 어긋남이 생기지 않는다.</p>
+<ul>
+<li>인가 gate는 <code>tools/call</code>, <code>resources/read</code>, <code>prompts/get</code>을 미리 판정한다(source <code>pkg/vmcp/server/call_gate.go</code>).</li>
+<li>거부 응답은 HTTP 403과 JSON-RPC 코드 403이다. 메시지는 대상 이름을 밝히지 않는다.</li>
+<li>기본 거부 정책이면 정책이 거른 tool과 없는 tool이 같은 403을 받으므로, 거부 응답으로 tool의 존재를 알아낼 수 없다.</li>
+<li>authorizer가 오류를 내면 거부로 처리한다.</li>
+<li>Cedar 판정은 tool의 backend ID를 함께 받으므로, 정책은 <code>Backend::"&lt;id&gt;"</code>로 backend 단위 permit이나 forbid를 쓸 수 있다(source <code>pkg/vmcp/core/admission.go:165</code>).</li>
+<li>composite tool은 backend가 없다. backend 단위 permit은 composite tool을 허용하지 않고 backend 단위 forbid도 막지 않는다. composite tool의 step은 core 인가 판정을 따로 받지 않기 때문이다(source <code>docs/arch/10-virtual-mcp-architecture.md</code>).</li>
+<li>정규형이 아닌 resource URI는 정책을 보기 전에 거부한다(source <code>pkg/vmcp/core/admission.go:230</code>).</li>
+</ul>
+
+<h3>6.3 두 경계 인증</h3>
+<p>vMCP는 인증을 두 경계에서 따로 처리한다. 들어오는 인증은 MCP 클라이언트를 확인하는 단계로 OIDC나 anonymous 방식을 쓰고, 나가는 인증은 vMCP가 backend에 자격 증명을 내미는 방식이다. 나가는 인증의 전략은 <code>unauthenticated</code>, <code>header_injection</code>, <code>token_exchange</code>, <code>upstream_inject</code>, <code>aws_sts</code>, <code>xaa</code>이고(source <code>pkg/vmcp/auth/types/types.go:26</code>), <code>obo</code>는 오픈소스 빌드에서 오류만 돌려준다. vMCP는 교환한 access token을 캐시에 둔다(source <code>pkg/vmcp/cache</code>). 공식 문서는 IdP에서 사용자를 막으면 모든 backend 접근이 끊긴다고 설명한다(docs <code>concepts/vmcp</code>). 전략별 흐름과 내장 인가 서버는 <a href="05-authn-authz.html">05편</a>에서 다룬다.</p>
+<p>v0.63.0에서 두 경계에 더해진 것은 세 가지다. 첫째, 들어오는 OIDC 설정이 CA ConfigMap을 참조하면 operator가 그 참조를 검사하고 결과를 <code>CABundleRefValidated</code> 조건에 적는다(source <code>cmd/thv-operator/controllers/virtualmcpserver_cabundle.go:30</code>). 둘째, <code>spec.authServerUpstreamFilter</code>는 내장 인가 서버의 upstream provider가 둘 이상일 때 쓰는 설정으로, 첫 provider가 준 그룹 claim으로 사용자가 거칠 나머지 provider를 줄인다. 첫 provider는 늘 거친다. 이 filter는 로그인에서 모을 자격 증명만 정하고, backend와 tool의 인가는 Cedar가 맡는다(source <code>cmd/thv-operator/api/v1beta1/virtualmcpserver_types.go:136</code>). 셋째, 내장 인가 서버의 TLS listener를 켜면 vMCP가 그 listener도 함께 시작하는데, listener 포트가 vMCP 포트와 겹치면 시작을 거부한다(source <code>pkg/vmcp/cli/serve.go:689</code>).</p>
+
+<h2 id="s7">7. 세션과 확장 한계</h2>
+<h3>7.1 vMCP 세션</h3>
+<p>Legacy 클라이언트는 <code>initialize</code>로 vMCP 세션을 연다. 세션을 등록할 때 vMCP는 호출자 identity로 capability를 집계하고, Legacy backend와는 세션마다 지속 연결을 연다(source <code>docs/arch/10-virtual-mcp-architecture.md</code>). Modern 클라이언트는 세션이 없고, vMCP도 Modern 요청의 상태를 저장하지 않는다.</p>
+<p>세션은 만든 identity의 <code>iss</code>와 <code>sub</code>에 묶여서, 다른 identity가 그 세션 ID로 요청하면 vMCP는 404를 준다. 소유자는 저장소에서 읽으므로 어느 replica에서도 같은 판정이 나온다(source <code>pkg/vmcp/server/session_ownership.go:47</code>).</p>
+
+<h3>7.2 고정된 한계</h3>
+<div class="tbl"><table>
+<tr><th>한계</th><th>값</th><th>바꾸는 방법</th><th>출처</th></tr>
+<tr><td>pod당 세션 캐시</td><td>1,000개 (LRU)</td><td>없음 (내부 필드)</td><td><code>pkg/vmcp/server/sessionmanager/factory.go:37</code></td></tr>
+<tr><td>vMCP 세션 TTL</td><td>30분 (마지막 사용 기준)</td><td>CLI <code>--session-ttl</code>. CRD 필드는 없다.</td><td><code>pkg/vmcp/server/server.go:83</code></td></tr>
+<tr><td>proxy 세션 TTL</td><td>2시간</td><td>없음</td><td><code>pkg/transport/session/proxy_session.go:27</code></td></tr>
+<tr><td>capability 캐시</td><td>30초, 최대 1,024개</td><td>없음</td><td><code>pkg/vmcp/server/server.go:97</code></td></tr>
+<tr><td>resource URI의 template 대조 상한</td><td>2,048바이트</td><td>없음</td><td><code>pkg/vmcp/types.go:682</code></td></tr>
+<tr><td>Redis timeout</td><td>dial 5초, read 3초, write 3초</td><td>CRD에 없음</td><td><code>docs/arch/13-vmcp-scalability.md</code></td></tr>
+<tr><td>forEach 반복</td><td>기본 100회, 상한 1,000회</td><td><code>maxIterations</code></td><td><code>pkg/vmcp/config/composite_validation.go:251</code></td></tr>
+</table></div>
+<p>세션 캐시가 차면 vMCP는 가장 오래 쓰지 않은 세션을 내보내면서 그 세션의 backend 연결을 닫고, 그 세션에서 처리 중이던 요청은 실패한다(source <code>docs/arch/13-vmcp-scalability.md</code>). Redis 세션 저장소가 있으면 vMCP는 같은 세션 ID의 다음 요청에서 세션을 다시 만드는데, 이때 저장된 메타데이터로 세션을 다시 만드는 함수가 <code>RestoreSession</code>이다. 공식 문서는 Redis가 없으면 내보낸 세션을 잃는다고 적는다(docs <code>guides-vmcp/scaling-and-performance</code>, 2026-11-07 확인).</p>
+<p>세션이 끝나는 길은 두 가지가 더 있다. 클라이언트가 DELETE로 세션을 끝내면 vMCP는 저장소의 기록을 지우고 그 pod의 세션 항목도 바로 지우므로, backend 연결이 LRU 내보내기를 기다리지 않고 닫힌다(source <code>pkg/vmcp/server/sessionmanager/session_manager.go:594</code>). 또 transport는 POST가 세션 TTL 동안 없는 세션의 pod 복사본을 거두는데, 열어 둔 GET stream만으로는 활동으로 치지 않는다. 저장소의 기록은 그대로 두므로 TTL 안에 돌아온 클라이언트는 세션을 다시 받는다(source <code>pkg/vmcp/server/server.go:648</code>).</p>
+
+<h3>7.3 Redis 세션 저장소</h3>
+<p>replica가 둘 이상이면 Redis 세션 저장소가 필요하다. 세션 메타데이터가 Redis에 있으면 어느 pod든 세션을 다시 만들지만, Redis가 없으면 다른 replica로 간 요청은 실패한다(docs <code>guides-vmcp/scaling-and-performance</code>). operator는 이때 <code>SessionStorageWarning</code> 조건을 걸고 replica 수는 그대로 적용한다(source <code>cmd/thv-operator/controllers/virtualmcpserver_controller.go:659</code>).</p>
+<pre><code>spec:
+  replicas: 3
+  sessionStorage:
+    provider: redis
+    address: redis.toolhive-system.svc.cluster.local:6379
+    db: 0
+    keyPrefix: vmcp-sessions
+    passwordRef:
+      name: redis-password
+      key: password</code></pre>
+<ul>
+<li>만료: vMCP는 세션을 읽을 때마다 <code>GETEX</code>로 만료 시간을 다시 건다(source <code>pkg/transport/session/storage_redis.go:160</code>). TTL 안에 요청이 오면 세션은 계속 유지되고 최대 수명은 없다.</li>
+<li>identity 바인딩: 세션 메타데이터에 <code>iss</code>와 <code>sub</code>를 이은 값이 평문으로 들어간다(source <code>pkg/vmcp/session/binding/binding.go:23</code>). 자격 증명은 아니지만 개인을 식별하는 정보다.</li>
+<li>보호: 운영자는 Redis에 ACL이나 비밀번호를 걸고, NetworkPolicy로 접근 경로도 좁혀야 한다.</li>
+<li>TLS: <code>spec.sessionStorage.tls</code>를 적지 않으면 vMCP는 Redis 연결을 암호화하지 않는다. operator 전체의 기본 Redis는 Helm 값 <code>operator.defaultRedis.tls</code>로 TLS를 켜지만, 명시한 <code>sessionStorage</code>는 이 기본값을 물려받지 않는다(source <code>docs/arch/13-vmcp-scalability.md</code>).</li>
+<li>크기: 공식 문서는 세션 하나를 10~50KB로 어림한다. fleet 전체 세션 상한은 replica 수 곱하기 1,000이다.</li>
+</ul>
+
+<h3>7.4 sessionAffinity와 file descriptor</h3>
+<p>VirtualMCPServer Service의 <code>sessionAffinity</code> 기본값은 <code>ClientIP</code>다(source <code>cmd/thv-operator/api/v1beta1/virtualmcpserver_types.go:73</code>). 클라이언트가 NAT 뒤에 있으면 모든 요청의 출발 IP가 같아서 모든 세션이 pod 하나로 몰린다(docs <code>guides-vmcp/scaling-and-performance</code>). 상태가 없는 backend만 쓰면 <code>None</code>이 낫고, 상태가 있는 backend는 수직 확장을 먼저 고려해야 한다.</p>
+<p>호출 도중 elicitation과 sampling을 쓰는 구성도 affinity가 필요하다. 클라이언트로 가는 요청은 그 클라이언트의 SSE stream을 가진 replica만 전달하기 때문이다(source <code>docs/arch/10-virtual-mcp-architecture.md</code>).</p>
+<p>backend 연결 하나는 file descriptor 하나를 쓰므로 필요한 수는 대략 동시 세션 수 곱하기 세션당 backend 수다. Linux의 기본 <code>nofile</code> soft limit은 보통 1,024라서(source <code>docs/arch/13-vmcp-scalability.md</code>), 세션 1,000개에 닿기 전에 이 한계에 먼저 닿을 가능성이 있다.</p>
+
+<h3>7.5 pod가 갑자기 종료될 때</h3>
+<p>pod가 갑자기 종료되면 처리 중이던 tool 호출은 응답 없이 사라진다. Redis가 있어도 브라우저 세션, DB 트랜잭션, 열린 파일 같은 backend 쪽 상태는 돌아오지 않는다(docs <code>guides-vmcp/scaling-and-performance</code>). 그래서 외부 상태를 바꾸는 tool을 부르는 쪽은 재시도와 멱등성 장치를 갖춰야 한다.</p>
+
+<h2 id="s8">8. composite tool과 MRTR</h2>
+<h3>8.1 정의 위치와 실행 모델</h3>
+<p>composite tool은 vMCP 안에서 정의하는 tool이다. MCP 클라이언트에게는 tool 하나로 보이고, 호출을 받으면 vMCP가 step을 실행한다(docs <code>guides-vmcp/composite-tools</code>).</p>
+<p>정의는 두 곳에 둘 수 있다. 권장 방식은 별도 리소스 <code>VirtualMCPCompositeToolDefinition</code>으로, VirtualMCPServer가 <code>spec.config.compositeToolRefs</code>로 같은 namespace의 정의를 참조한다. 짧은 실험에는 <code>spec.config.compositeTools</code>에 바로 적는다.</p>
+<p>step의 <code>dependsOn</code>은 DAG를 이룬다. 실행기는 위상 정렬로 step을 레벨로 나누고 같은 레벨의 step은 동시에 실행하는데, 다음 레벨은 앞 레벨의 step이 모두 끝나야 시작한다(source <code>pkg/vmcp/composer/dag_executor.go:63</code>). 동시에 실행하는 step은 최대 10개다(source <code>pkg/vmcp/composer/dag_executor.go:19</code>).</p>
+
+<figure class="fig">
+  <div class="scroll">
+  <svg viewBox="0 0 760 270" width="760" height="270" role="img" aria-label="composite tool step의 실행 레벨">
+    <defs><marker id="a8c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+    <marker id="a8cw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head-w" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <text class="d-m" x="115" y="30" font-size="12" text-anchor="middle">레벨 0 (동시 실행)</text>
+    <text class="d-m" x="385" y="30" font-size="12" text-anchor="middle">레벨 1</text>
+    <text class="d-m" x="655" y="30" font-size="12" text-anchor="middle">레벨 2</text>
+    <rect class="d-outer" x="18" y="40" width="194" height="186" rx="10"/>
+    <rect class="d-box" x="30" y="52" width="170" height="44" rx="8"/>
+    <text x="115" y="79" font-size="13" text-anchor="middle">get_logs</text>
+    <rect class="d-box" x="30" y="112" width="170" height="44" rx="8"/>
+    <text x="115" y="139" font-size="13" text-anchor="middle">get_metrics</text>
+    <rect class="d-box" x="30" y="172" width="170" height="44" rx="8"/>
+    <text x="115" y="199" font-size="13" text-anchor="middle">get_alerts</text>
+    <line class="d-line" x1="200" y1="74" x2="250" y2="74"/>
+    <line class="d-line" x1="200" y1="134" x2="250" y2="134"/>
+    <line class="d-line" x1="200" y1="194" x2="250" y2="194"/>
+    <line class="d-line" x1="250" y1="74" x2="250" y2="194"/>
+    <line class="d-line" x1="250" y1="134" x2="298" y2="134" marker-end="url(#a8c)"/>
+    <rect class="d-warn" x="300" y="106" width="170" height="56" rx="8"/>
+    <text x="385" y="130" font-size="13" font-weight="600" text-anchor="middle">approval</text>
+    <text class="d-w" x="385" y="150" font-size="11" text-anchor="middle">elicitation step</text>
+    <line class="d-line" x1="470" y1="134" x2="568" y2="134" marker-end="url(#a8c)"/>
+    <text class="d-a" x="519" y="124" font-size="11" text-anchor="middle">accept</text>
+    <rect class="d-ok" x="570" y="106" width="170" height="56" rx="8"/>
+    <text x="655" y="130" font-size="13" font-weight="600" text-anchor="middle">create_issue</text>
+    <text class="d-m" x="655" y="150" font-size="11" text-anchor="middle">condition 확인</text>
+    <line class="d-dash" x1="385" y1="162" x2="385" y2="200" marker-end="url(#a8cw)"/>
+    <text class="d-w" x="385" y="218" font-size="11" text-anchor="middle">decline, cancel</text>
+    <text class="d-w" x="385" y="234" font-size="11" text-anchor="middle">기본 처리는 abort</text>
+    <text class="d-m" x="655" y="200" font-size="11" text-anchor="middle">condition이 거짓이면</text>
+    <text class="d-m" x="655" y="216" font-size="11" text-anchor="middle">건너뛴다</text>
+  </svg>
+  </div>
+  <figcaption>그림 3. 아래 YAML 예의 실행 레벨. 레벨 0의 세 step은 동시에 실행하고, approval은 세 step이 모두 끝나야 시작한다.</figcaption>
+</figure>
+
+<p>아래 예는 그림 3의 workflow이고, tool 이름은 설명용 예다.</p>
+<pre><code>apiVersion: toolhive.stacklok.dev/v1beta1
+kind: VirtualMCPCompositeToolDefinition
+metadata:
+  name: investigate-incident
+  namespace: toolhive-system
+spec:
+  name: investigate_incident          # 클라이언트에게 보이는 tool 이름
+  description: 장애 자료를 모으고 승인을 받은 뒤 이슈를 만든다
+  timeout: 30m
+  parameters:                         # JSON Schema
+    type: object
+    properties:
+      incident_id:
+        type: string
+    required: [incident_id]
+  steps:
+    - id: get_logs
+      tool: logging.search_logs       # workload.원래이름 형식
+      arguments:
+        query: "incident_id={{.params.incident_id}}"
+    - id: get_metrics
+      tool: monitoring_get_metrics    # 노출 이름 형식
+      arguments:
+        filter: error_rate
+    - id: get_alerts
+      tool: pagerduty_list_alerts
+      arguments:
+        incident: "{{.params.incident_id}}"
+    - id: approval
+      type: elicitation
+      message: "incident {{.params.incident_id}} 이슈를 만들까?"
+      schema:
+        type: object
+        properties: {}
+      timeout: 5m
+      onDecline:
+        action: continue
+      onCancel:
+        action: continue
+      dependsOn: [get_logs, get_metrics, get_alerts]
+    - id: create_issue
+      tool: github_create_issue
+      arguments:
+        title: "Incident {{.params.incident_id}}"
+        body: "{{json .steps.get_logs.output}}"
+      condition: '{{eq .steps.approval.output.action "accept"}}'
+      dependsOn: [approval]
+      onError:
+        action: retry
+        retryCount: 3</code></pre>
+
+<h3>8.2 step, 파라미터, 결과</h3>
+<p>step의 <code>tool</code> 값은 두 형식을 받는다. 하나는 충돌 처리 뒤의 노출 이름이고 다른 하나는 <code>workload.원래이름</code> 형식인데(source <code>pkg/vmcp/router/session_router.go:91</code>), 두 번째 형식은 충돌 전략을 바꿔도 그대로 동작한다.</p>
+<p><code>arguments</code>, <code>condition</code>, <code>output</code> 값에는 Go template 식을 쓴다. <code>.params</code>는 입력 파라미터이고 <code>.steps.ID.output</code>은 앞 step의 결과이며, <code>json</code>, <code>fromJson</code>, <code>quote</code> 함수도 쓴다(source <code>docs/operator/composite-tools-quick-reference.md</code>). 많은 MCP 서버는 결과를 JSON 문자열로 <code>text</code> 필드에 담는데, 이때는 <code>fromJson</code>으로 풀어야 한다.</p>
+<ul>
+<li><code>parameters</code>: JSON Schema로 입력을 정의한다.</li>
+<li><code>output</code>: 없으면 마지막으로 끝난 step의 결과를 돌려준다. 있으면 property마다 <code>type</code>과 <code>value</code> 식을 적고, vMCP가 문자열 결과를 선언한 type으로 바꾼다.</li>
+<li><code>defaultResults</code>: condition이나 continue로 건너뛰는 step이 대상이다. 뒤 step이나 <code>output</code>이 그 결과를 참조하면 적어야 하고, 빠지면 설정 검사가 실패한다.</li>
+<li><code>annotations</code>: 적지 않으면 step tool의 annotation에서 보수적인 값을 도출한다. 도출한 값보다 안전해 보이는 값을 적으면 그 composite tool은 목록에서 빠진다(source <code>pkg/vmcp/config/config.go:900</code>).</li>
+<li><code>onError.action</code>: <code>abort</code>(기본), <code>continue</code>, <code>retry</code> 중 하나다. 재시도 횟수는 <code>retryCount</code>로 정한다(source <code>pkg/vmcp/config/config.go:1032</code>).</li>
+</ul>
+<div class="tbl"><table>
+<tr><th>항목</th><th>기본값</th><th>상한</th><th>출처</th></tr>
+<tr><td>workflow timeout</td><td>30분</td><td></td><td><code>pkg/vmcp/composer/workflow_engine.go:30</code></td></tr>
+<tr><td>step timeout</td><td>5분</td><td></td><td><code>pkg/vmcp/composer/workflow_engine.go:33</code></td></tr>
+<tr><td>step 수</td><td></td><td>100</td><td><code>pkg/vmcp/composer/workflow_engine.go:37</code></td></tr>
+<tr><td><code>retryCount</code></td><td></td><td>10</td><td><code>pkg/vmcp/composer/workflow_engine.go:41</code></td></tr>
+<tr><td>동시 step</td><td>10</td><td></td><td><code>pkg/vmcp/composer/dag_executor.go:19</code></td></tr>
+<tr><td>forEach <code>maxIterations</code></td><td>100</td><td>1,000</td><td><code>pkg/vmcp/composer/workflow_engine.go:714</code></td></tr>
+<tr><td>forEach <code>maxParallel</code></td><td>10</td><td>50</td><td><code>pkg/vmcp/config/composite_validation.go:320</code></td></tr>
+<tr><td>elicitation timeout</td><td>5분</td><td>10분</td><td><code>pkg/vmcp/composer/elicitation_handler.go:21</code></td></tr>
+</table></div>
+<p>forEach step은 앞 step 결과의 배열을 돌며 안쪽 tool step을 실행한다. 반복은 요청을 받은 pod 하나에서 모두 실행하므로, <code>maxParallel: 50</code>이면 pod 하나가 backend 연결을 50개까지 동시에 연다(docs <code>guides-vmcp/composite-tools</code>).</p>
+<p><code>docs/operator/composite-tools-quick-reference.md</code>에는 <code>failureMode</code>와 <code>maxRetries</code> 필드가 나오지만 v0.63.0의 설정 구조체에는 두 필드가 없다. 이 문서는 구조체의 필드 이름을 따랐다.</p>
+
+<h3>8.3 elicitation과 MRTR</h3>
+<p>elicitation step은 workflow 중간에 사용자에게 입력을 묻는 step으로, <code>message</code>와 <code>schema</code>를 적는다. 사용자의 응답 <code>action</code>은 accept, decline, cancel 중 하나이고, decline과 cancel의 기본 처리는 abort다. <code>onDecline</code>, <code>onCancel</code>에 continue를 적으면 다음 step으로 가는데, 이때 쓰기 step에는 accept를 확인하는 <code>condition</code>을 걸어야 한다(docs <code>guides-vmcp/composite-tools</code>). 세 번째 값 <code>skip_remaining</code>은 남은 step을 건너뛰고 workflow를 성공으로 끝낸다. 이때 elicitation step에 의존하는 step은 실행하지 않고, 건너뛴 step은 <code>defaultResults</code>를 결과로 쓴다(source <code>pkg/vmcp/config/config.go:1048</code>, <code>pkg/vmcp/composer/workflow_engine.go:190</code>).</p>
+<p>v0.63.0에서 composite tool의 elicitation은 Legacy 세션에서만 동작한다. vMCP가 Legacy 세션으로 클라이언트에게 직접 묻기 때문이다. Modern 클라이언트가 이 tool을 부르면 오류를 받는데, capability를 선언하지 않았으면 <code>-32021</code>, 선언했으면 <code>-32603</code>이다(source <code>pkg/vmcp/server/modern_gate.go:37</code>). <code>-32021</code>은 명세대로 HTTP 400으로 나간다(source <code>pkg/vmcp/server/modern_dispatch.go:721</code>).</p>
+<p>Modern 개정판은 서버가 먼저 보내는 요청을 없애고 대신 MRTR을 쓴다. MRTR은 다음 순서로 동작한다(source <code>docs/arch/16-vmcp-mrtr.md</code>).</p>
+<ol>
+<li>서버는 입력이 필요하면 <code>resultType: "input_required"</code> 결과를 돌려준다. 결과에는 <code>inputRequests</code>와 <code>requestState</code>가 들어 있다.</li>
+<li>클라이언트가 사용자에게 입력을 받는다.</li>
+<li>클라이언트가 원래 요청을 새 JSON-RPC id로 다시 보내면서 <code>inputResponses</code>와 받은 <code>requestState</code>를 함께 싣는다.</li>
+<li>서버는 두 요청을 서로 독립된 요청으로 처리하므로, 다시 보낸 요청은 어느 replica든 처리한다.</li>
+</ol>
+<p>v0.63.0의 MRTR 상태는 다음과 같다.</p>
+<ul>
+<li>vMCP는 Modern backend 호출에 빈 <code>clientCapabilities</code>를 선언하므로, 입력이 필요한 Modern backend는 <code>-32021</code> 오류를 낸다.</li>
+<li>Modern backend의 <code>input_required</code> 결과를 typed 오류로 읽는 부분만 들어갔다(source <code>pkg/vmcp/mrtr.go</code>). 설계 문서의 slice 1에 해당한다.</li>
+<li>vMCP 프로세스 안의 decorator가 URL elicitation 응답을 돌려주면 vMCP는 <code>input_required</code> 결과를 만든다. Modern 클라이언트가 <code>elicitation.url</code> capability를 선언했을 때만 그렇고, 선언하지 않았으면 <code>-32021</code>을 HTTP 400으로 준다. Legacy 세션은 URL 없이 <code>isError</code> 결과를 받는다. backend가 보낸 요청은 이 경로를 타지 않는다(source <code>pkg/vmcp/server/modern_dispatch.go:623</code>, <code>pkg/vmcp/conversion/errors.go:34</code>).</li>
+<li>Legacy 클라이언트는 호출 도중의 elicitation과 sampling 요청을 그대로 받는다(source <code>pkg/vmcp/forwarding.go</code>).</li>
+</ul>
+<p>설계 문서는 클라이언트와 backend의 개정판 조합을 네 칸으로 나눈다. 아래 표의 "제안 단계"는 ToolHive가 아직 배포하지 않은 안이다.</p>
+<div class="tbl"><table>
+<tr><th>클라이언트</th><th>backend</th><th>설계 문서의 안</th><th>상태</th></tr>
+<tr><td>Modern</td><td>Modern</td><td>vMCP가 상태 없이 round를 그대로 중계하는 안</td><td>제안 단계 (slice 2, 3)</td></tr>
+<tr><td>Modern</td><td>Legacy</td><td>다리를 만들지 않는다. 지금의 오류 응답을 유지한다.</td><td>설계 결정. 현재 동작과 같다.</td></tr>
+<tr><td>Legacy</td><td>Modern</td><td>vMCP가 요청 하나 안에서 입력을 받아 backend를 다시 부르는 안</td><td>제안 단계 (slice 4)</td></tr>
+<tr><td>Legacy</td><td>Legacy</td><td>기존 서버 요청 전달</td><td>현재 동작</td></tr>
+</table></div>
+<p>composite tool은 vMCP가 상태를 직접 갖는다는 점이 다르다. 설계 문서는 Modern 클라이언트용 workflow 일시 중지를 제안하는데, 중지한 상태는 Redis의 <code>WorkflowStateStore</code>에 두고 클라이언트에게는 128비트 이상의 임의 handle만 주는 안이다. 재개 요청이 오면 handle 소유자의 <code>iss</code>, <code>sub</code>를 확인한다. 이 내용은 slice 5의 제안 단계이고, <code>requestState</code>를 vMCP가 감쌀지도 아직 정하지 않았다(source <code>docs/arch/16-vmcp-mrtr.md</code>).</p>
+
+<h2 id="s9">9. optimizer</h2>
+<h3>9.1 문제와 해법</h3>
+<p>MCP 클라이언트는 연결한 서버의 tool 정의를 LLM 컨텍스트에 넣는데, tool 정의는 이름, 설명, 입력 schema다. tool이 수백 개면 LLM 토큰이 늘어나고, 비슷한 tool 사이에서 선택이 틀릴 가능성도 커진다(docs <code>concepts/tool-optimization</code>).</p>
+<p>optimizer를 켜면 vMCP는 tool 목록 대신 메타 tool 두 개만 노출한다(source <code>pkg/vmcp/optimizer/optimizer.go:7</code>).</p>
+<div class="tbl"><table>
+<tr><th>메타 tool</th><th>입력</th><th>하는 일</th></tr>
+<tr><td><code>find_tool</code></td><td><code>tool_description</code> (필수), <code>tool_keywords</code> (선택)</td><td>세션의 노출 tool 중 관련 tool을 찾아 정의를 돌려준다. <code>token_metrics</code>도 함께 준다.</td></tr>
+<tr><td><code>call_tool</code></td><td><code>tool_name</code>, <code>parameters</code></td><td><code>find_tool</code>이 알려 준 tool을 실행한다.</td></tr>
+</table></div>
+<pre><code>// find_tool 호출의 arguments
+{"tool_description": "GitHub 저장소의 열린 이슈 목록 조회",
+ "tool_keywords": ["list", "issues", "github"]}
+
+// call_tool 호출의 arguments
+{"tool_name": "github_list_issues",
+ "parameters": {"owner": "stacklok", "repo": "toolhive", "state": "open"}}</code></pre>
+<p><code>call_tool</code>의 안쪽 호출은 core를 거치므로 core 인가 판정이 실제 tool 이름으로 다시 판단한다(source <code>pkg/vmcp/server/serve_optimizer.go:22</code>). 다만 v0.63.0은 Cedar 정책과 optimizer를 함께 받지 않아서(9.5절), optimizer를 켜면 이 판정은 늘 허용이다(source <code>pkg/vmcp/core/admission.go:87</code>).</p>
+
+<h3>9.2 검색 방식</h3>
+<p>optimizer는 세션을 등록할 때 그 세션의 노출 tool을 메모리 SQLite에 넣는다. 테이블에는 이름, 설명, 임베딩이 들어가고 FTS5 색인은 Porter 어간 추출을 쓴다(source <code>pkg/vmcp/optimizer/internal/toolstore/schema.sql:34</code>). 검색은 그 세션에 노출된 tool 안에서만 한다.</p>
+<p>optimizer는 <code>find_tool</code> 요청을 다음 순서로 처리한다(source <code>pkg/vmcp/optimizer/internal/toolstore/sqlite_store.go:543</code>).</p>
+<ol>
+<li>키워드 식을 만든다. <code>tool_keywords</code>가 있으면 그 값을 쓰고, 없으면 <code>tool_description</code>의 단어를 쓴다.</li>
+<li>임베딩 서비스가 없으면 키워드 검색만 하고, 결과는 최대 <code>maxToolsToReturn</code>개다.</li>
+<li>임베딩 서비스가 있으면 결과 한도를 비율로 나눈다. 기본값이면 의미 검색 4개, 키워드 검색 4개다(source <code>sqlite_store.go:916</code>).</li>
+<li>두 검색을 동시에 실행한다. 의미 검색은 <code>tool_description</code>을 임베딩한 뒤 cosine 거리를 잰다.</li>
+<li>거리가 <code>semanticDistanceThreshold</code>보다 큰 후보는 버린다.</li>
+<li>의미 검색 결과를 앞에, 키워드 검색 결과를 뒤에 둔 다음, 중복을 빼고 <code>maxToolsToReturn</code>개로 자른다(source <code>sqlite_store.go:821</code>).</li>
+</ol>
+<div class="tbl"><table>
+<tr><th>필드 (<code>spec.config.optimizer</code> 아래)</th><th>기본값</th><th>허용 범위</th><th>출처</th></tr>
+<tr><td><code>maxToolsToReturn</code></td><td>8</td><td>1~50</td><td><code>sqlite_store.go:37</code>, <code>optimizer.go:69</code></td></tr>
+<tr><td><code>hybridSearchSemanticRatio</code></td><td>"0.5"</td><td>0.0~1.0</td><td><code>sqlite_store.go:41</code></td></tr>
+<tr><td><code>semanticDistanceThreshold</code></td><td>"1.0"</td><td>0.0~2.0</td><td><code>sqlite_store.go:46</code></td></tr>
+<tr><td><code>embeddingServiceTimeout</code></td><td>30s</td><td></td><td><code>pkg/vmcp/config/config.go:1135</code></td></tr>
+<tr><td><code>embeddingProvider</code></td><td><code>tei</code></td><td><code>tei</code>, <code>openai</code></td><td><code>pkg/vmcp/config/config.go:1149</code></td></tr>
+</table></div>
+<p>공식 문서는 threshold를 낮추면 정확도가, 높이면 재현율이 오른다고 설명한다. threshold 필터는 개수 제한보다 먼저 적용한다(docs <code>guides-vmcp/optimizer</code>).</p>
+
+<h3>9.3 EmbeddingServer</h3>
+<p>의미 검색에는 임베딩을 만드는 서비스가 필요하다. Kubernetes에서는 EmbeddingServer 리소스가 이 서비스를 띄우는데, operator가 HuggingFace TEI 서버를 StatefulSet으로 만든다(source <code>cmd/thv-operator/controllers/embeddingserver_controller.go:197</code>).</p>
+<ul>
+<li>기본 모델: <code>BAAI/bge-small-en-v1.5</code>(source <code>cmd/thv-operator/api/v1beta1/embeddingserver_types.go:45</code>).</li>
+<li>기본 이미지: <code>ghcr.io/huggingface/text-embeddings-inference:cpu-latest</code>. x86_64 전용이라서 ARM64 노드에는 <code>cpu-arm64-latest</code>를 적어야 한다(docs <code>guides-vmcp/optimizer</code>).</li>
+<li>모델 캐시: <code>modelCache</code>로 PVC를 붙이면 재시작해도 모델을 다시 받지 않는다.</li>
+</ul>
+<p>VirtualMCPServer에 <code>embeddingServerRef</code>를 적으면 operator가 optimizer를 기본값으로 켜고 EmbeddingServer의 URL을 <code>optimizer.embeddingService</code>에 채운다(source <code>cmd/thv-operator/controllers/virtualmcpserver_vmcpconfig.go:162</code>). <code>embeddingService</code>를 직접 적은 상태에서 ref도 있으면 ref의 URL이 이기고, 그 경고는 spec이 바뀐 reconcile에서 한 번만 낸다(source <code>virtualmcpserver_vmcpconfig.go:212</code>). operator는 EmbeddingServer가 준비된 뒤에 vMCP Deployment를 만든다.</p>
+<pre><code>apiVersion: toolhive.stacklok.dev/v1beta1
+kind: EmbeddingServer
+metadata:
+  name: my-embedding
+  namespace: toolhive-system
+spec: {}                      # 기본 모델과 기본 이미지
+---
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: VirtualMCPServer
+metadata:
+  name: my-vmcp
+  namespace: toolhive-system
+spec:
+  groupRef:
+    name: my-group
+  incomingAuth:
+    type: anonymous
+  embeddingServerRef:
+    name: my-embedding        # 이 한 줄로 optimizer가 켜진다
+  config:
+    optimizer:                # 선택. 조정할 때만 적는다
+      maxToolsToReturn: 10
+      hybridSearchSemanticRatio: "0.6"
+      semanticDistanceThreshold: "0.8"</code></pre>
+<p>optimizer는 OpenAI 호환 <code>/embeddings</code> API에서도 임베딩을 받는다. 이때 운영자는 <code>embeddingProvider: openai</code>, <code>embeddingService</code>, <code>embeddingModel</code>을 적어야 하고, API 키는 vmcp 컨테이너의 <code>OPENAI_API_KEY</code> 환경 변수로만 받는다(source <code>pkg/vmcp/optimizer/optimizer.go:41</code>). 이 방식은 <code>embeddingServerRef</code>와 함께 쓰지 못한다(docs <code>guides-vmcp/optimizer</code>).</p>
+
+<h3>9.4 로컬 CLI의 tier</h3>
+<p>로컬 CLI는 optimizer를 네 tier로 나눈다(source <code>docs/arch/vmcp-local.md</code>).</p>
+<div class="tbl"><table>
+<tr><th>tier</th><th>켜는 방법</th><th>검색</th><th>외부 서비스</th></tr>
+<tr><td>0</td><td>없음</td><td>없음. 모든 tool을 노출한다.</td><td>없음</td></tr>
+<tr><td>1</td><td><code>--optimizer</code></td><td>키워드 검색</td><td>없음</td></tr>
+<tr><td>2</td><td><code>--optimizer-embedding</code></td><td>혼합 검색</td><td>ToolHive가 관리하는 TEI 컨테이너</td></tr>
+<tr><td>3</td><td>설정 파일의 <code>optimizer.embeddingService</code></td><td>혼합 검색</td><td>사용자가 관리하는 임베딩 서비스</td></tr>
+</table></div>
+<p>tier 2에서 ToolHive는 TEI 컨테이너 <code>thv-embedding-HASH</code>를 띄우는데, HASH는 모델 이름 SHA-256의 앞 8자다. 컨테이너 런타임(Docker, Podman 등)이 있어야 한다. <code>thv vmcp serve</code>가 끝날 때 ToolHive는 자신이 띄운 컨테이너만 멈추고, 이미 실행 중이던 컨테이너는 다시 쓰되 멈추지 않는다(source <code>pkg/vmcp/cli/embedding_manager.go</code>).</p>
+
+<h3>9.5 제약</h3>
+<ul>
+<li>optimizer를 켠 인스턴스는 Legacy 개정판만 받는다. 메타 tool이 세션 단위이기 때문이다(5.3절).</li>
+<li>v0.63.0 코드는 Cedar 인가 설정과 optimizer를 함께 받지 않아서 <code>server.New</code>가 설정 오류를 돌려준다(source <code>pkg/vmcp/server/server.go:498</code>).</li>
+<li>v1beta1 이행 안내 문서의 v0.15.0 항목은 Cedar가 메타 tool도 거른다고 적지만(docs <code>guides-k8s/migrate-to-v1beta1</code>), 이 내용은 v0.63.0 코드와 맞지 않는다. v0.63.0에서는 둘을 함께 쓰지 못한다.</li>
+<li>backend health가 바뀌어도 기존 세션의 optimizer 색인은 다시 만들지 않는다(source <code>docs/arch/10-virtual-mcp-architecture.md</code>).</li>
+<li>Kubernetes에서 <code>tei</code> provider를 쓰면서 <code>embeddingService</code>를 직접 적지 않았다면 EmbeddingServer가 꼭 있어야 한다. 의미 검색 비율이 0이어도 마찬가지다(docs <code>guides-vmcp/optimizer</code>).</li>
+</ul>
+
+<h3>9.6 절감 효과의 근거</h3>
+<p><code>find_tool</code> 응답의 <code>token_metrics</code>는 추정치로, 전체 tool 정의와 돌려준 tool 정의의 LLM 토큰 수를 비교한다. LLM 토큰 수는 tool 정의 JSON의 바이트 수를 4로 나눈 값이라서(source <code>pkg/vmcp/optimizer/internal/tokencounter/counter.go:42</code>), 실제 tokenizer의 결과와 다를 가능성이 있다.</p>
+<p>Stacklok은 optimizer가 요청당 LLM 토큰을 60~85% 줄인다고 주장하고(docs <code>blog/toolhive-updates/2026-03-09-updates</code>), README는 최대 85%라고 적는다(source <code>README.md:31</code>). 두 수치는 회사의 주장이고 이 문서는 수치를 시험하지 않았다. 공식 튜토리얼은 backend가 둘뿐이면 절감이 거의 없다고 적는다(docs <code>tutorials/mcp-optimizer</code>).</p>
+
+<h2 id="s10">10. code mode</h2>
+<p>code mode를 켜면 vMCP는 메타 tool <code>execute_tool_script</code>를 하나 더 노출한다. 에이전트가 이 tool에 Starlark 스크립트와 선택 입력 <code>data</code>를 보내면 vMCP는 스크립트를 자기 프로세스 안에서 실행하고, 스크립트가 만든 값은 tool 결과 하나로 돌아간다(docs <code>guides-vmcp/code-mode</code>).</p>
+<p>code mode는 기본으로 꺼져 있는데, <code>codeMode.enabled</code>의 기본값이 false이기 때문이다(source <code>pkg/vmcp/config/config.go:1216</code>).</p>
+<pre><code># 에이전트가 보내는 script. deps는 data 인자로 받는다
+results = parallel([
+    lambda d=d: osv_query_vulnerability(package=d["name"], version=d["version"])
+    for d in deps
+])
+vulnerable = [r for r in results if r.get("vulns")]
+return {"checked": len(results), "vulnerable": vulnerable}</code></pre>
+<pre><code>spec:
+  config:
+    codeMode:
+      enabled: true
+      stepLimit: 100000             # Starlark 연산 횟수 한도
+      parallelMaxConcurrency: 10    # parallel()의 동시 실행 수
+      toolCallTimeout: 30s          # 안쪽 tool 호출 하나의 제한 시간</code></pre>
+<p>스크립트 전체의 실행 시간은 1분으로 고정돼 있고, 이 값은 설정으로 바꾸지 못한다(source <code>pkg/vmcp/codemode/decorator.go:34</code>).</p>
+<p>code mode는 호출자의 접근 범위를 넓히지 않는다(source <code>pkg/vmcp/codemode/config.go</code>).</p>
+<ul>
+<li>스크립트가 부르는 tool 목록은 core가 호출자 identity로 거른 목록이다.</li>
+<li>안쪽 호출마다 core 인가 판정을 실제 이름으로 다시 받는다.</li>
+<li><code>execute_tool_script</code> 자체는 Cedar 정책이 아니라 <code>enabled</code> 설정으로 열린다.</li>
+<li>backend가 같은 이름의 tool을 내면 vMCP는 목록 제공을 거부한다. 오류 이름은 <code>ErrReservedToolName</code>이다(source <code>pkg/vmcp/codemode/decorator.go:26</code>).</li>
+<li>스크립트 오류는 <code>isError: true</code>인 tool 결과로 돌아가고, 에이전트는 스크립트를 고쳐 다시 보낸다.</li>
+</ul>
+<div class="tbl"><table>
+<tr><th>원하는 일</th><th>쓰는 기능</th><th>내용을 정하는 쪽</th></tr>
+<tr><td>요청 시점에 여러 tool 호출을 즉석에서 묶는다</td><td>code mode</td><td>에이전트가 요청마다 정한다</td></tr>
+<tr><td>파라미터와 승인 단계가 있는 고정 workflow를 만든다</td><td>composite tool</td><td>운영자가 미리 정한다</td></tr>
+<tr><td>요청마다 노출 tool 수를 줄인다</td><td>optimizer</td><td>운영자는 켜기만 한다</td></tr>
+</table></div>
+<p>code mode와 optimizer는 함께 켜도 된다. optimizer는 <code>execute_tool_script</code>도 다른 tool처럼 색인에 넣는다(docs <code>guides-vmcp/code-mode</code>).</p>
+
+<h2 id="s11">11. 로컬 CLI와 Kubernetes 배포</h2>
+<h3>11.1 로컬 CLI (<code>thv vmcp</code>)</h3>
+<p>아키텍처 문서는 Kubernetes 밖에서 <code>thv vmcp</code>를 권하고, 예전 독립 <code>vmcp</code> 바이너리는 하위 호환용으로 남아 있다(source <code>docs/arch/10-virtual-mcp-architecture.md</code>). 하위 명령은 세 개다.</p>
+<div class="tbl"><table>
+<tr><th>하위 명령</th><th>하는 일</th></tr>
+<tr><td><code>thv vmcp init</code></td><td>실행 중인 그룹에서 시작용 YAML 설정을 만든다.</td></tr>
+<tr><td><code>thv vmcp validate</code></td><td>YAML 설정의 문법과 의미 오류를 검사한다.</td></tr>
+<tr><td><code>thv vmcp serve</code></td><td>vMCP를 실행한다. 기본 주소는 <code>127.0.0.1:4483</code>, endpoint는 <code>/mcp</code>다.</td></tr>
+</table></div>
+<p>quick 모드는 <code>--config</code> 없이 <code>--group</code>만 주는 방식이다. vMCP가 메모리에 설정을 만드는데, 들어오는 인증은 anonymous, 충돌 전략은 prefix다(source <code>pkg/vmcp/cli/serve.go:643</code>). 인증이 없으므로 vMCP는 loopback이 아닌 bind 주소를 거부한다(source <code>pkg/vmcp/cli/serve.go:96</code>).</p>
+<p>vMCP는 loopback으로 들어온 요청의 Host header도 검사해서, Host가 localhost나 loopback IP가 아니면 403을 준다(source <code>pkg/vmcp/server/loopback_host_guard.go:66</code>). reverse proxy가 127.0.0.1로 전달하면서 클라이언트의 Host를 유지하면 403이 나므로, 이런 proxy는 Host를 <code>localhost:4483</code>으로 바꿔야 한다. <code>host.docker.internal</code>로 접속하는 클라이언트도 403을 받는다(source <code>docs/arch/vmcp-local.md</code>).</p>
+<pre><code># quick 모드: 그룹 하나를 바로 묶는다
+thv group create my-group
+thv run --group my-group fetch
+thv run --group my-group github
+thv vmcp serve --group my-group --optimizer
+
+# 설정 파일 모드: 만들고, 고치고, 검사하고, 실행한다
+thv vmcp init --group my-group --output vmcp.yaml
+thv vmcp validate --config vmcp.yaml
+thv vmcp serve --config vmcp.yaml --session-ttl 2h</code></pre>
+<p><code>pkg/vmcp</code>는 Go 라이브러리로도 쓴다. config, aggregator, router, server 등은 Stable이고 optimizer, cli, composer는 Experimental이다(source <code>docs/arch/vmcp-library.md</code>).</p>
+
+<h3>11.2 Kubernetes (VirtualMCPServer)</h3>
+<p>operator는 VirtualMCPServer 하나를 받으면 다음 리소스를 만든다(source <code>cmd/thv-operator/controllers/virtualmcpserver_controller.go:1274</code>).</p>
+<ol>
+<li>RBAC: ServiceAccount, Role, RoleBinding을 만든다.</li>
+<li>HMAC Secret: 세션 바인딩에 쓰는 <code>NAME-hmac-secret</code>을 만든다(source <code>virtualmcpserver_controller.go:1493</code>).</li>
+<li>ConfigMap: <code>NAME-vmcp-config</code>에 vMCP 설정 파일을 담는다. backend의 phase는 여기에 넣지 않으므로 backend health가 바뀌어도 설정 checksum이 그대로이고 pod rollout도 없다(source <code>virtualmcpserver_controller.go:3089</code>).</li>
+<li>Deployment: vmcp 컨테이너가 <code>serve --config=/etc/vmcp-config/config.yaml</code>로 시작한다(source <code>virtualmcpserver_deployment.go:332</code>).</li>
+<li>Service: <code>vmcp-NAME</code>을 4483 포트로 만든다. 종류는 <code>serviceType</code>으로 정하고 기본값은 ClusterIP다.</li>
+</ol>
+<pre><code>apiVersion: toolhive.stacklok.dev/v1beta1
+kind: VirtualMCPServer
+metadata:
+  name: eng-vmcp
+  namespace: toolhive-system
+spec:
+  groupRef:
+    name: engineering-tools
+  incomingAuth:
+    type: oidc
+    oidcConfigRef:
+      name: engineering-oidc
+      audience: https://mcp.example.com/mcp
+  outgoingAuth:
+    source: discovered
+  replicas: 2
+  sessionStorage:
+    provider: redis
+    address: redis.toolhive-system.svc.cluster.local:6379
+    passwordRef:
+      name: redis-password
+      key: password
+  config:
+    aggregation:
+      conflictResolution: prefix
+    operational:
+      failureHandling:
+        partialFailureMode: best_effort   # v0.63.0 코드는 검사만 한다 (3.2절)
+        circuitBreaker:
+          enabled: true
+    compositeToolRefs:
+      - name: investigate-incident</code></pre>
+<div class="tbl"><table>
+<tr><th>항목</th><th>로컬 CLI</th><th>Kubernetes</th></tr>
+<tr><td>실행 형태</td><td>터미널의 foreground 프로세스</td><td>operator가 관리하는 pod</td></tr>
+<tr><td>설정</td><td>CLI flag나 로컬 YAML</td><td>VirtualMCPServer 리소스</td></tr>
+<tr><td>backend 발견</td><td>로컬 ToolHive 그룹</td><td>클러스터의 MCPGroup</td></tr>
+<tr><td>임베딩 서비스</td><td>ToolHive가 관리하는 TEI 컨테이너</td><td>EmbeddingServer 리소스</td></tr>
+<tr><td>맞는 용도</td><td>개발, 개인 평가</td><td>공유, 운영, 여러 사용자</td></tr>
+</table></div>
+<p>operator의 reconcile 구조와 다른 CRD는 <a href="07-kubernetes-operator.html">07편</a>에서 다룬다.</p>
+
+<h2 id="sQ">12. 자가 점검 문제</h2>
+<p>먼저 답을 생각해 본 다음 펼쳐서 확인한다.</p>
+<details><summary>Q1. 기본 설정에서 backend <code>github</code>의 <code>create_issue</code>는 어떤 이름으로 노출되는가? vMCP는 backend를 부를 때 어떤 이름을 쓰는가?</summary>
+<p>기본 전략은 prefix이고 기본 형식은 <code>{workload}_</code>라서 <code>github_create_issue</code>로 노출된다. vMCP는 라우팅 테이블로 backend를 찾고, backend에는 원래 이름 <code>create_issue</code>로 호출을 보낸다.</p></details>
+<details><summary>Q2. <code>priorityOrder: [github, jira]</code>다. <code>slack</code>도 <code>create_issue</code>를 낸다. 결과는 무엇인가? 왜 그렇게 동작하는가?</summary>
+<p>충돌에 목록 밖의 backend <code>slack</code>이 끼었으므로 vMCP는 세 후보를 모두 빼고 ERROR 로그를 남긴다. Cedar 정책은 노출 이름으로 tool을 가리키는데, 이름을 목록 안의 backend에 넘기면 기존 정책이 다른 tool에 붙을 위험이 있기 때문이다.</p></details>
+<details><summary>Q3. <code>filter</code>로 숨긴 tool을 composite tool step이 부를 수 있는가? MCP 클라이언트는 어떤가?</summary>
+<p>composite tool step이 부르면 vMCP는 그 호출을 backend로 보낸다. filter는 노출만 바꾸고 라우팅 테이블에는 tool을 남기기 때문이다. 반면 MCP 클라이언트가 직접 부르면 unknown-tool 오류를 받는다.</p></details>
+<details><summary>Q4. composite tool에 step A, B, C가 있다. A와 B는 의존이 없다. C는 A에만 의존한다. A는 1초, B는 10초 걸린다. C는 언제 시작하는가?</summary>
+<p>v0.63.0 실행기는 레벨 단위로 실행한다. A와 B는 레벨 0이고 C는 레벨 1인데, 레벨 1은 레벨 0의 step이 모두 끝나야 시작한다. 그래서 C는 B가 끝난 뒤, 약 10초 뒤에 시작한다.</p></details>
+<details><summary>Q5. replica 3개로 배포했는데 Redis 세션 저장소를 설정하지 않았다. 무슨 일이 생기는가?</summary>
+<p>operator는 <code>SessionStorageWarning</code> 조건을 걸고 replica 3개를 그대로 띄운다. 세션 메타데이터가 세션을 만든 replica의 메모리에만 있어서, 다른 replica로 간 요청은 실패한다.</p></details>
+<details><summary>Q6. pod 하나에 세션이 1,001번째로 들어오면 어떻게 되는가? Redis가 있을 때와 없을 때를 나눠 답한다.</summary>
+<p>세션 캐시 상한이 1,000개라서 vMCP는 가장 오래 쓰지 않은 세션을 내보내고 그 세션의 backend 연결을 닫는다. 내보낸 세션에서 처리 중이던 요청은 실패한다. Redis가 있으면 그 세션의 다음 요청에서 <code>RestoreSession</code>이 세션을 다시 만든다. 공식 문서는 Redis가 없으면 클라이언트가 세션을 새로 열어야 한다고 적는다.</p></details>
+<details><summary>Q7. optimizer 기본값에서 <code>find_tool</code>은 tool을 최대 몇 개 돌려주는가? 두 검색은 결과를 어떻게 나누는가?</summary>
+<p>최대 8개다. 의미 검색 비율이 0.5이므로 의미 검색과 키워드 검색이 각각 4개 한도로 찾는다. vMCP는 의미 검색 결과를 앞에 두고, 중복을 뺀 뒤 8개로 자른다.</p></details>
+<details><summary>Q8. optimizer를 켠 vMCP에 Modern 개정판을 먼저 시도하는 go-sdk 클라이언트가 연결한다. 어떻게 되는가?</summary>
+<p>optimizer를 켜면 vMCP는 Modern을 끈다. <code>server/discover</code> 응답에 Modern 판이 없으므로 클라이언트는 Legacy로 연결하고, 연결 뒤에는 Legacy 세션으로 <code>find_tool</code>과 <code>call_tool</code>을 쓴다. 그 밖의 Modern 요청은 <code>-32022</code> 오류를 받는다.</p></details>
+<details><summary>Q9. code mode를 켜면 스크립트가 호출자에게 허용되지 않은 tool을 부를 수 있는가?</summary>
+<p>부르지 못한다. 스크립트가 보는 tool 목록은 core가 호출자 identity로 거른 목록이고, 안쪽 호출도 core 인가 판정을 실제 이름으로 다시 받는다. <code>execute_tool_script</code> 자체만 <code>codeMode.enabled</code> 설정으로 열린다.</p></details>
+<details><summary>Q10. Modern 클라이언트가 elicitation step을 가진 composite tool을 부른다. v0.63.0은 무엇을 돌려주는가? MRTR 중계는 지금 동작하는가?</summary>
+<p>v0.63.0은 composite tool의 elicitation을 Legacy 세션으로만 처리하므로 Modern 클라이언트는 오류를 받는다. elicitation capability를 선언하지 않았으면 HTTP 400과 <code>-32021</code>, 선언했으면 <code>-32603</code>이다. backend의 round를 중계하는 MRTR은 지금 동작하지 않고, vMCP 자신이 만드는 URL elicitation 응답만 <code>input_required</code>로 돌려준다. 설계 문서의 slice 2부터 slice 5까지는 제안 단계다.</p></details>
+<details><summary>Q11. 사용자 A가 연 Legacy 세션의 ID를 사용자 B가 자기 access token과 함께 보낸다. vMCP는 무엇을 돌려주는가?</summary>
+<p>404 "Session terminated"를 돌려준다. 세션은 만든 identity의 <code>iss</code>와 <code>sub</code>에 묶여 있고, 세션 소유자 검사가 인가 gate보다 먼저 동작하므로 Cedar 정책과 관계없이 404다. A의 세션은 영향을 받지 않는다.</p></details>
+
+<h2 id="sR">13. 참고 자료</h2>
+<ul>
+  <li>공식 문서 <code>concepts/vmcp</code>, <code>concepts/tool-optimization</code> (https://docs.stacklok.com/toolhive/concepts/vmcp)</li>
+  <li>공식 문서 <code>guides-vmcp/intro</code>, <code>index</code>, <code>backend-discovery</code>, <code>failure-handling</code>, <code>tool-aggregation</code>, <code>configuration</code></li>
+  <li>공식 문서 <code>guides-vmcp/composite-tools</code>, <code>optimizer</code>, <code>code-mode</code>, <code>local-cli</code>, <code>scaling-and-performance</code></li>
+  <li>공식 문서 <code>tutorials/mcp-optimizer</code>, <code>guides-k8s/migrate-to-v1beta1</code>, <code>blog/toolhive-updates/2026-03-09-updates</code></li>
+  <li>공식 문서 <code>reference/crds/virtualmcpserver</code>, <code>virtualmcpcompositetooldefinition</code>, <code>embeddingserver</code></li>
+  <li>toolhive v0.63.0 <code>docs/arch/10-virtual-mcp-architecture.md</code>, <code>13-vmcp-scalability.md</code>, <code>16-vmcp-mrtr.md</code>, <code>vmcp-local.md</code>, <code>vmcp-library.md</code></li>
+  <li>toolhive v0.63.0 <code>docs/operator/composite-tools-quick-reference.md</code>, <code>virtualmcpserver-api.md</code>, <code>virtualmcpserver-kubernetes-guide.md</code></li>
+  <li>toolhive v0.63.0 <code>pkg/vmcp/aggregator</code>, <code>core</code>, <code>server</code>, <code>health</code>, <code>client</code>, <code>router</code>, <code>config</code>, <code>conversion</code></li>
+  <li>toolhive v0.63.0 <code>pkg/vmcp/composer</code>, <code>optimizer</code>, <code>codemode</code>, <code>cli</code>, <code>k8s</code>, <code>mrtr.go</code>, <code>url_elicitation.go</code>, <code>types.go</code></li>
+  <li>toolhive v0.63.0 <code>pkg/vmcp/server/session_ownership.go</code>, <code>loopback_host_guard.go</code>, <code>modern_dispatch.go</code>, <code>sessionmanager/session_manager.go</code></li>
+  <li>toolhive v0.63.0 <code>cmd/thv-operator/api/v1beta1</code>, <code>cmd/thv-operator/controllers/virtualmcpserver_*.go</code>, <code>embeddingserver_controller.go</code></li>
+  <li>v0.54.0부터 v0.63.0까지의 릴리스 노트. 이 문서가 반영한 PR은 다음과 같다. v0.55.0부터 v0.57.0: #6740, #6807, #6833, #6891, #6487, #6520. v0.60.0부터 v0.62.0: #6969, #6975, #7025, #7032. v0.63.0: #6987.</li>
+</ul>
+<div class="box warn" id="unchecked">
+<span class="label">대조한 내용</span>
+<p>v0.63.0 Go 코드와 대조한 항목은 충돌 전략, filter, health 상태, 기본값, 세션 한계, composite tool 한계, optimizer 검색, code mode 한계다. 줄 번호는 v0.63.0 트리(2026-11-06, 커밋 01f96bf)에서 확인했다. 2026-11-07 갱신에서는 v0.53.0과 v0.63.0 사이에 바뀐 인용 파일 13개의 diff를 읽었고, 바뀌지 않은 인용 파일은 줄 번호만 다시 확인했다. 공식 문서는 2026-11-07에 <code>guides-vmcp/failure-handling</code>, <code>backend-discovery</code>, <code>scaling-and-performance</code> 세 쪽을 다시 읽었고, 그 밖의 공식 문서 인용은 2026-10-13에 읽은 docs-website 912bc05 기준이다.</p>
+<span class="label">문서와 코드가 다른 곳</span>
+<p>이 문서는 아래 일곱 곳에서 코드를 따랐다.</p>
+<ul>
+<li>circuit breaker: 공식 문서는 요청을 거절하는 장치로 설명하고 2026-11-07에도 같다. 코드는 health check 실패만 세고 health check만 건너뛴다.</li>
+<li><code>partialFailureMode</code>: 코드는 이 값을 검사만 하고, 집계는 늘 실패한 backend를 건너뛴다. 공식 문서는 2026-11-07에도 <code>fail</code>과 <code>best_effort</code>의 동작 차이를 설명한다.</li>
+<li>동적 발견의 변경 반영: 공식 문서는 2026-11-07에도 재시작이 필요하다고 적지만, 코드는 vMCP pod 안에서 informer로 그룹을 지켜본다.</li>
+<li>optimizer와 Cedar: 코드는 둘을 함께 받지 않는다(<code>server.go:498</code>). v1beta1 이행 안내 문서의 v0.15.0 항목은 Cedar가 메타 tool을 거른다고 적는다. 이 문서는 2026-11-07에 다시 읽지 않았다.</li>
+<li>composite tool 필드: <code>docs/operator</code>의 빠른 참조는 <code>failureMode</code>, <code>maxRetries</code>를 쓰고 v0.63.0 트리에서도 같다. 설정 구조체에는 두 필드가 없다.</li>
+<li>middleware 표: 아키텍처 문서의 표는 v0.63.0에서 14행이 됐고, discovery와 authorization 행과 discovery timeout 15초는 그대로 있다. 코드 주석은 이 세 계층을 지웠다고 적는다(<code>server.go:721</code>).</li>
+<li>capability 캐시: 아키텍처 문서는 Modern 요청이 캐시 없이 backend를 매번 훑는다고 적지만, <code>server.New</code>는 core에 30초 캐시를 감싼다. Modern 경로가 이 캐시를 실제로 쓰는지는 실행으로 확인하지 않았다.</li>
+</ul>
+<span class="label">확인하지 못한 내용</span>
+<p>클러스터나 로컬에서 vMCP를 실행하지 않았다. 회복한 backend가 기존 세션에 붙는지는 두 문서가 다르게 적는다. Redis 세션 크기 10~50KB는 공식 문서의 어림값이고, optimizer의 LLM 토큰 절감률 60~85%와 최대 85%는 회사의 주장이다. MRTR의 slice 2부터 5까지는 설계 문서의 제안이며 배포되지 않았다. 세션 소유자 검사, URL elicitation 응답, <code>skip_remaining</code>의 동작은 코드와 아키텍처 문서로만 확인했다. v0.60.0의 "/health를 마지막 health check 결과로 답한다"는 변경은 proxy의 <code>pkg/healthcheck</code>에 들어갔고, vMCP의 <code>/health</code> 코드는 바뀌지 않았다. v0.57.0의 MCPRemoteProxy pod readiness 분류 변경은 operator의 상태 계산이라서 이 문서는 다루지 않았다.</p>
+</div>
+<p>다음 학습은 <a href="09-skill-plugin.html">09편 "skill과 plugin"</a>이다.</p>
+
+<nav class="pager">
+<a class="prev" href="07-kubernetes-operator.html"><span class="k">이전 글</span><span class="t">Kubernetes operator</span></a>
+<a class="next" href="09-skill-plugin.html"><span class="k">다음 글</span><span class="t">skill과 plugin</span></a>
+</nav>
+
+<footer>2026-10-14 작성, 2026-11-07 갱신. 기준: ToolHive v0.63.0.</footer>
+</div>
+</body>
+</html>
