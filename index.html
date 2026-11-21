@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>learn</title>
+<meta name="description" content="AI Agent와 RAG를 공부하며 정리한 학습 자료">
+<style>
+  :root {
+    --bg: #faf8f3; --fg: #1f1d1a; --muted: #6b665e; --line: #e2ddd2; --card: #ffffff; --accent: #9a4a1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #171614; --fg: #ece8e0; --muted: #a09a8f; --line: #33302b; --card: #1f1e1b; --accent: #e0a070; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Pretendard", "Noto Sans KR", "Segoe UI", sans-serif;
+    line-height: 1.65;
+  }
+  main { max-width: 720px; margin: 0 auto; padding: 56px 16px 80px; }
+  h1 { font-size: 2rem; margin: 0 0 8px; letter-spacing: -0.02em; }
+  .lead { color: var(--muted); margin: 0 0 40px; }
+  h2 { font-size: 0.85rem; color: var(--muted); font-weight: 600; margin: 32px 0 12px; letter-spacing: 0.04em; }
+  ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+  a.card {
+    display: block; padding: 16px 18px; background: var(--card); border: 1px solid var(--line);
+    border-radius: 10px; color: inherit; text-decoration: none;
+  }
+  a.card:hover, a.card:focus-visible { border-color: var(--accent); outline: none; }
+  .title { font-weight: 650; font-size: 1.05rem; }
+  .desc { color: var(--muted); font-size: 0.93rem; margin-top: 2px; }
+  footer { margin-top: 56px; color: var(--muted); font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>learn</h1>
+  <p class="lead">AI Agent와 RAG를 공부하며 정리한 학습 자료다.</p>
+
+  <h2>RAG</h2>
+  <ul>
+    <li><a class="card" href="rag-1.html">
+      <div class="title">RAG 학습 자료 1부</div>
+      <div class="desc">기초부터 검색까지: 임베딩, 청킹, 벡터·키워드·하이브리드 검색, 재순위, 벡터 인덱스</div>
+    </a></li>
+    <li><a class="card" href="rag-2.html">
+      <div class="title">RAG 학습 자료 2부</div>
+      <div class="desc">심화와 실무: 질의 변환, 실패 진단, 운영 주의점, 평가, 심화 기법</div>
+    </a></li>
+  </ul>
+
+  <h2>평가</h2>
+  <ul>
+    <li><a class="card" href="eval-intro.html">
+      <div class="title">Agent 평가(eval) 입문</div>
+      <div class="desc">QA 정답 대조에서 eval 프레임워크까지: 데이터셋, 실행기, 채점기</div>
+    </a></li>
+  </ul>
+
+  <footer>예시 상황은 설명용으로 만든 것이며 실제 측정 사례가 아니다. 도구와 모델의 세부 사항은 공식 문서에서 확인한다.</footer>
+</main>
+</body>
+</html>
