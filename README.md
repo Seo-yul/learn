@@ -2,7 +2,7 @@
 
 AI Agent와 RAG를 공부하며 정리한 학습 자료다. GitHub Pages로 배포한다.
 
-- 사이트: https://seo-yul.github.io/learn/
+- 사이트: https://devops.ai.kr/learn/
 
 | 페이지 | 내용 |
 |---|---|
