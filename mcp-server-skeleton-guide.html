@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP 서버 구현 1부: FastMCP 서버의 기본 구조</title>
+<link rel="stylesheet" href="assets/learn.css">
+</head>
+<body>
+<div class="masthead"><div class="bar"><a class="brand" href="index.html">learn</a><span class="crumb">MCP 서버</span></div></div>
+<div class="wrap">
+
+<header>
+  <h1>MCP 서버 구현 1부: FastMCP 서버의 기본 구조</h1>
+  <p class="kicker">MCP 서버 학습 · 2026-10-02 작성</p>
+  <p>FastMCP로 만든 서버 코드는 규모와 상관없이 같은 구조를 따른다. 그 구조를 부분별로 정리한다.</p>
+</header>
+
+<nav class="toc">
+  <b>목차</b>
+  <ol>
+    <li><a href="#s1">최소 구조</a></li>
+    <li><a href="#s2">서버 파일의 구역 배치</a></li>
+    <li><a href="#s3">프로젝트 디렉터리 구조</a></li>
+    <li><a href="#s4">컴포넌트 세 종류의 등록 방법 비교</a></li>
+    <li><a href="#s5">운영 서버에 추가하는 네 가지</a></li>
+    <li><a href="#s6">개발, 테스트, 실행 순서</a></li>
+    <li><a href="#s7">요약</a></li>
+  </ol>
+</nav>
+
+<h2 id="s1">1. 최소 구조</h2>
+<div class="box key">
+<span class="label">네 단계</span>
+<p>FastMCP 서버는 import, 서버 인스턴스 생성, 데코레이터로 컴포넌트 등록, <code>run()</code> 호출의 네 단계로 이뤄진다. 서버가 커져도 이 순서는 그대로다.</p>
+</div>
+<pre><code># 1. 프레임워크 import
+from fastmcp import FastMCP
+
+# 2. 서버 인스턴스 생성 (이름은 클라이언트에 표시된다)
+mcp = FastMCP("MyServer")
+
+# 3. 컴포넌트 등록 (데코레이터가 함수를 MCP 컴포넌트로 바꾼다)
+@mcp.tool
+def greet(name: str) -> str:
+    """이름을 받아 인사말을 반환한다."""
+    return f"Hello, {name}!"
+
+# 4. 서버 실행 (진입점 가드 안에서 부른다)
+if __name__ == "__main__":
+    mcp.run()</code></pre>
+<div class="tbl"><table>
+<thead><tr><th>단계</th><th>설명</th></tr></thead>
+<tbody>
+<tr><td>인스턴스 생성</td><td><code>FastMCP</code> 객체가 서버의 본체다. tool, resource, prompt를 담는 등록부이고, 실행과 설정과 middleware가 모두 이 객체에 붙는다.</td></tr>
+<tr><td>컴포넌트 등록</td><td>데코레이터가 붙으면 함수가 등록부에 들어가고, 타입 힌트와 docstring에서 스키마가 만들어진다. 등록은 모듈을 import하는 시점에 일어난다.</td></tr>
+<tr><td>진입점 가드</td><td>STDIO 서버는 클라이언트가 자식 프로세스로 실행한다. 가드가 없으면 모듈을 import하기만 해도 서버가 떠서 테스트와 재사용이 어려워진다.</td></tr>
+<tr><td>실행</td><td><code>python server.py</code>나 <code>fastmcp run server.py</code>로 실행한다. 개발할 때는 <code>fastmcp dev inspector server.py</code>로 MCP Inspector 화면을 띄워 직접 호출해 볼 수 있다.</td></tr>
+</tbody></table></div>
+
+<h2 id="s2">2. 서버 파일의 구역 배치</h2>
+<p>서버 파일 하나를 구역으로 나누면 보통 다음 순서가 된다. 위에서 아래로 읽는 순서가 관례다.</p>
+<pre><code># 구역 1. import와 의존성
+from fastmcp import FastMCP, Context
+import httpx                      # 외부 연동용
+
+# 구역 2. 서버 정의 (이름과 instructions)
+mcp = FastMCP(
+    "WeatherService",
+    instructions="날씨 조회 서버. get_forecast로 시작한다.",
+)
+
+# 구역 3. tool: 실행하는 컴포넌트
+@mcp.tool
+async def get_forecast(city: str, days: int = 3) -> dict:
+    """도시의 날씨 예보를 조회한다.
+    이 docstring이 LLM에게 보이는 설명이 된다.
+    """
+    async with httpx.AsyncClient() as client:
+        return { ... }
+
+# 구역 4. resource: 읽기 전용 데이터
+@mcp.resource("config://settings")
+def settings() -> dict:
+    return {"units": "metric"}
+
+@mcp.resource("weather://{city}/current")   # 템플릿: URI의 변수가 인자가 된다
+def current(city: str) -> str:
+    return fetch_now(city)
+
+# 구역 5. prompt: 다시 쓰는 메시지 템플릿
+@mcp.prompt
+def weather_report(city: str) -> str:
+    return f"{city}의 날씨를 분석해 리포트를 작성해줘."
+
+# 구역 6. 진입점
+if __name__ == "__main__":
+    mcp.run()   # STDIO. HTTP는 mcp.run(transport="http", port=8000)</code></pre>
+
+<h2 id="s3">3. 프로젝트 디렉터리 구조</h2>
+<p>PoC나 작은 서버는 파일 하나로 충분하다.</p>
+<pre><code>server.py        # 여기에 전부 둔다
+pyproject.toml   # uv add fastmcp</code></pre>
+<p>파일이 커지면 패키지 구조로 나눈다.</p>
+<pre><code>src/my_server/
+├── __init__.py
+├── server.py      # FastMCP 인스턴스와 조립만 둔다
+├── tools/         # 도메인별 tool 모듈
+│   ├── weather.py
+│   └── search.py
+├── resources.py   # resource 모음
+├── prompts.py     # prompt 모음
+└── middleware.py  # 인증, 로깅</code></pre>
+<p>패키지 구조에서 <code>server.py</code>는 조립만 맡는다.</p>
+<pre><code>from fastmcp import FastMCP
+from .tools import weather, search
+
+mcp = FastMCP("MyServer")
+mcp.mount(weather.mcp, namespace="weather")   # 모듈별 하위 서버를 namespace로 합친다
+mcp.mount(search.mcp, namespace="search")
+
+if __name__ == "__main__":
+    mcp.run(transport="http", port=8000)</code></pre>
+<p>모듈마다 자기 <code>FastMCP</code> 인스턴스를 만들고 루트의 <code>server.py</code>에서 <code>mount()</code>로 합치면, 의존성이 모듈에서 루트로 가는 한 방향으로만 유지된다. namespace를 주면 하위 서버의 tool 이름 앞에 그 이름이 붙는다.</p>
+
+<h2 id="s4">4. 컴포넌트 세 종류의 등록 방법 비교</h2>
+<p>세 종류 모두 데코레이터와 함수로 등록하고, 반환값을 해석하는 방식만 다르다.</p>
+<div class="tbl"><table>
+<thead><tr><th>항목</th><th>tool</th><th>resource</th><th>prompt</th></tr></thead>
+<tbody>
+<tr><td>데코레이터</td><td><code>@mcp.tool</code></td><td><code>@mcp.resource("scheme://uri")</code></td><td><code>@mcp.prompt</code></td></tr>
+<tr><td>함수 인자</td><td>tool의 입력 스키마가 된다</td><td>URI 템플릿의 변수 <code>{id}</code>가 된다</td><td>템플릿을 채우는 변수가 된다</td></tr>
+<tr><td>반환값</td><td>문자열, dict, 이미지가 MCP content로 바뀐다</td><td>문자열이나 bytes가 resource 본문이 된다</td><td>문자열은 user 메시지가 되고, 메시지 목록은 대화가 된다</td></tr>
+<tr><td>async</td><td>지원한다. I/O가 있으면 async로 쓴다</td><td>지원한다</td><td>지원한다</td></tr>
+<tr><td>부르는 쪽</td><td>LLM이 판단해서 호출한다</td><td>클라이언트가 URI로 읽는다</td><td>사용자가 골라서 대화를 시작한다</td></tr>
+</tbody></table></div>
+<div class="box warn">
+<span class="label">docstring의 역할</span>
+<p>LLM은 tool을 고르고 인자를 만들 때 docstring, 타입 힌트, 인자 설명을 그대로 읽는다. 그래서 docstring은 사람이 읽는 문서보다 모델에게 주는 명세에 가깝고, 처음 구조를 잡을 때부터 모델이 잘못 읽지 않도록 써야 한다.</p>
+</div>
+
+<h2 id="s5">5. 운영 서버에 추가하는 네 가지</h2>
+<p>기본 구조는 그대로 두고, 생성자와 middleware 같은 정해진 자리에 기능을 추가한다.</p>
+<pre><code>from fastmcp import FastMCP, Context
+from fastmcp.server.middleware import Middleware, MiddlewareContext
+from fastmcp.server.auth import JWTVerifier
+
+# 1. 인증: 생성자에 넘긴다
+auth = JWTVerifier(jwks_uri="https://idp.example.com/jwks",
+                   issuer="https://idp.example.com")
+mcp = FastMCP("SecureServer", auth=auth)
+
+# 2. middleware: 요청 처리 경로에 끼운다
+class AuditMiddleware(Middleware):
+    async def on_call_tool(self, ctx: MiddlewareContext, call_next):
+        log(f"tool={ctx.message.name}")   # 실행 전 처리
+        return await call_next(ctx)        # 다음 단계로 넘긴다
+
+mcp.add_middleware(AuditMiddleware())
+
+# 3. 추가 HTTP 경로: health check 등
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(req: Request):
+    return PlainTextResponse("OK")
+
+# 4. Context: tool 안에서 서버 기능을 쓴다
+@mcp.tool
+async def long_task(ctx: Context) -> str:
+    await ctx.info("시작")              # 클라이언트로 로그를 보낸다
+    await ctx.report_progress(50, 100)  # 진행률을 알린다
+    return "done"
+
+if __name__ == "__main__":
+    mcp.run(transport="http", host="0.0.0.0", port=8000)</code></pre>
+<div class="tbl"><table>
+<thead><tr><th>기능</th><th>추가하는 자리</th></tr></thead>
+<tbody>
+<tr><td>인증</td><td>생성자의 <code>auth=</code></td></tr>
+<tr><td>요청 가로채기</td><td><code>add_middleware()</code></td></tr>
+<tr><td>MCP 밖의 HTTP 경로</td><td><code>@mcp.custom_route</code></td></tr>
+<tr><td>실행 중에 쓰는 서버 기능</td><td>tool 함수의 <code>Context</code> 인자</td></tr>
+</tbody></table></div>
+<p>tool에 tag를 붙여 노출 범위를 조절할 수도 있다. <code>@mcp.tool(tags={"admin"})</code>으로 tag를 붙이고 <code>mcp.enable(tags={"public"}, only=True)</code>를 부르면 해당 tag가 붙은 컴포넌트만 보인다. 환경이나 권한에 따라 tool을 다르게 보여 줄 때 쓰는 방법이다.</p>
+
+<h2 id="s6">6. 개발, 테스트, 실행 순서</h2>
+<div class="tbl"><table>
+<thead><tr><th>단계</th><th>명령 또는 코드</th><th>목적</th></tr></thead>
+<tbody>
+<tr><td>개발</td><td><code>fastmcp dev inspector server.py</code></td><td>MCP Inspector 화면에서 tool 목록을 보고 직접 호출해 응답을 확인한다</td></tr>
+<tr><td>단위 테스트</td><td><code>async with Client(mcp) as c: await c.call_tool(...)</code></td><td>프로세스를 띄우지 않고 메모리 안에서 서버를 직접 호출한다. pytest와 함께 쓰기 좋다</td></tr>
+<tr><td>실행</td><td><code>fastmcp run server.py</code> 또는 <code>python server.py</code></td><td>기본은 STDIO다. <code>-t http --port 8000</code>을 주면 HTTP로 뜬다</td></tr>
+<tr><td>클라이언트 등록</td><td><code>fastmcp install claude-desktop server.py</code></td><td>Claude Desktop, Cursor 같은 host의 설정 파일에 서버를 등록한다</td></tr>
+</tbody></table></div>
+<p class="note">pytest로 쓴 테스트의 예 · 서버를 띄우지 않는다</p>
+<pre><code>import pytest
+from fastmcp import Client
+from my_server import mcp
+
+@pytest.mark.asyncio
+async def test_greet():
+    async with Client(mcp) as client:      # 메모리 안에서 연결한다
+        result = await client.call_tool("greet", {"name": "World"})
+        assert "Hello, World" in result.content[0].text</code></pre>
+
+<h2 id="s7">7. 요약</h2>
+<ul>
+<li>서버는 import, <code>FastMCP()</code> 인스턴스, 데코레이터 등록, <code>mcp.run()</code>의 네 단계로 이뤄진다.</li>
+<li>파일 안의 순서는 import, 서버 정의, tool, resource, prompt, 진입점이고, 커지면 모듈별 하위 서버를 <code>mount()</code>로 합친다.</li>
+<li>tool, resource, prompt는 모두 데코레이터와 함수와 docstring으로 등록하고, 반환값의 해석만 다르다.</li>
+<li>인증은 생성자에, 요청 가로채기는 middleware에, health check는 <code>custom_route</code>에, 서버 기능은 <code>Context</code>에 둔다.</li>
+<li>테스트는 <code>Client(mcp)</code>로 서버를 띄우지 않고 하고, 눈으로 확인할 때는 <code>fastmcp dev inspector</code>를 쓴다.</li>
+</ul>
+
+<nav class="pager">
+<a class="next" href="mcp-server-practical-deepdive.html"><span class="k">다음 글</span><span class="t">MCP 서버 구현 2부: 운영에서 고려할 것</span></a>
+</nav>
+
+<footer>2026-10-02에 작성했다. 2026-11-23에 클래스 이름, 명령, 함수 인자를 fastmcp 4.0.3 소스와 대조해서 고쳤다.</footer>
+</div>
+</body>
+</html>

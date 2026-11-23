@@ -10,6 +10,8 @@ AI Agent와 그 주변 기술을 공부하며 정리한 학습 자료다. GitHub
 | [eval-intro.html](eval-intro.html) | Agent 평가(eval) 입문 |
 | [oauth/](oauth/index.html) | MCP 서버의 OAuth 6편: role과 scope, JWKS와 introspection, JWT, ID-JAG |
 | [toolhive/](toolhive/index.html) | ToolHive 10편과 agentgateway 비교 |
+| [mcp-server-skeleton-guide.html](mcp-server-skeleton-guide.html), [mcp-server-practical-deepdive.html](mcp-server-practical-deepdive.html) | MCP 서버 구현 1부와 2부: FastMCP 서버의 기본 구조, 운영에서 고려할 것 |
+| [lease-leader-election-guide.html](lease-leader-election-guide.html) | Kubernetes Lease와 리더 선출 |
 | [aws/](aws/eks-access.html) | EKS 클러스터 접속 |
 
 ## 문서 형식
